@@ -11,6 +11,7 @@
 - 无现有 SWAP 时，根据内存自动创建 2 GiB 或 4 GiB SWAP，设置 `swappiness=10`。
 - 通过三个 HTTPS 地理服务依次探测公网出口时区，并启用网络时间同步。
 - 可选彻底清理 3X-UI 服务及已知数据目录。
+- 完整初始化后安装 `vps-init` 快捷命令，随时打开菜单或执行子命令。
 
 ## 支持系统
 
@@ -27,6 +28,13 @@ curl -fsSLO https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/se
 less setup.sh
 chmod +x setup.sh
 sudo ./setup.sh full
+```
+
+初始化成功后可直接使用快捷命令：
+
+```bash
+sudo vps-init
+sudo vps-init status
 ```
 
 需要交互式菜单：
@@ -54,6 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 | `sudo ./setup.sh timezone auto` | 自动探测时区并启用网络时间同步 |
 | `sudo ./setup.sh timezone America/Los_Angeles` | 手动指定 IANA 时区 |
 | `sudo ./setup.sh timezone keep` | 保留当前时区，仅启用网络时间同步 |
+| `sudo ./setup.sh install` | 单独安装或刷新 `vps-init` 快捷命令 |
 | `./setup.sh status` | 查看当前状态 |
 | `sudo ./setup.sh uninstall-3xui` | 交互确认后清理 3X-UI |
 | `sudo ./setup.sh update` | 更新仓库或下载最新脚本 |
@@ -61,6 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 ## 设计与安全说明
 
 - 项目只写入带 `vps-init-suite` 名称的 sysctl、systemd、SWAP 和 iptables 资源，不删除第三方调优文件。
+- 快捷入口为 `/usr/local/bin/vps-init`，实际脚本保存在 `/usr/local/lib/vps-init-suite/setup.sh`。
 - 时区探测依次查询 `ipwho.is`、`ipinfo.io` 和 `ipapi.co`；这些服务会看到 VPS 的公网出口 IP，但脚本不会向其发送其他机器数据。
 - 所有探测请求强制使用 HTTPS，返回值必须存在于本机 IANA 时区数据库中才会应用。
 - 无人值守模式探测失败时会保留当前时区；交互模式提供常用地区、任意 IANA 时区及保留现状选项。

@@ -2,8 +2,12 @@
 
 set -Eeuo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.1"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
+readonly LAUNCHER_NAME="vps-init"
+readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
+readonly INSTALLED_SCRIPT="${INSTALL_DIR}/setup.sh"
+readonly LAUNCHER_PATH="/usr/local/bin/${LAUNCHER_NAME}"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-vps-init-suite.conf"
 readonly SYSCTL_UNIT="/etc/systemd/system/vps-init-suite-sysctl.service"
 readonly SWAP_SYSCTL_FILE="/etc/sysctl.d/99-vps-init-suite-swap.conf"
@@ -85,6 +89,7 @@ show_status() {
 
   printf '%s\n' "------------------------------------------------------------"
   printf 'Version:                 %s\n' "$VERSION"
+  printf 'Shortcut command:        %s\n' "$LAUNCHER_NAME"
   printf 'Congestion control:      %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
   printf 'Default qdisc:           %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
   printf 'TCP Fast Open:           %s (target: 3)\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
@@ -409,6 +414,30 @@ uninstall_3xui() {
   log "3X-UI and its known local data paths were removed."
 }
 
+install_shortcut() {
+  require_root
+  require_supported_os
+  local source_path=${BASH_SOURCE[0]:-}
+  local temporary
+
+  mkdir -p "$INSTALL_DIR" "$(dirname "$LAUNCHER_PATH")"
+  temporary=$(mktemp "${INSTALL_DIR}/setup.sh.XXXXXX")
+
+  if [[ -n "$source_path" && "$source_path" != "bash" && "$source_path" != "/dev/stdin" && -f "$source_path" ]]; then
+    install -m 0755 "$source_path" "$temporary"
+  else
+    apt_install ca-certificates curl
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --silent --show-error --fail \
+      "https://raw.githubusercontent.com/${REPO_SLUG}/main/setup.sh" -o "$temporary"
+    chmod 0755 "$temporary"
+  fi
+
+  bash -n "$temporary"
+  mv -f -- "$temporary" "$INSTALLED_SCRIPT"
+  ln -sfn "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"
+  log "Shortcut installed: sudo ${LAUNCHER_NAME}"
+}
+
 full_init() {
   local timezone=${1:-${VPS_TIMEZONE:-auto}}
   require_root
@@ -417,6 +446,7 @@ full_init() {
   setup_timezone "$timezone"
   setup_swap
   setup_mss clamp
+  install_shortcut
   log "VPS initialization completed."
   show_status
 }
@@ -430,14 +460,23 @@ update_self() {
 
   if [[ -d "$script_dir/.git" ]]; then
     git -C "$script_dir" pull --ff-only
+    if [[ -L "$LAUNCHER_PATH" ]]; then
+      install_shortcut
+    fi
     log "Repository updated. Re-run the command to apply changes."
     return 0
   fi
 
-  local target="${PWD}/setup.sh"
+  local target
+  if [[ $(readlink -f -- "${BASH_SOURCE[0]}") == "$INSTALLED_SCRIPT" ]]; then
+    target="$INSTALLED_SCRIPT"
+  else
+    target="${PWD}/setup.sh"
+  fi
   local temporary
   temporary=$(mktemp)
-  curl -fsSL "https://raw.githubusercontent.com/${REPO_SLUG}/main/setup.sh" -o "$temporary"
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 --silent --show-error --fail --location \
+    "https://raw.githubusercontent.com/${REPO_SLUG}/main/setup.sh" -o "$temporary"
   bash -n "$temporary"
   install -m 0755 "$temporary" "$target"
   rm -f -- "$temporary"
@@ -454,6 +493,7 @@ Commands:
   mss [clamp|1200..1460]   Persist MSS clamping (default: clamp)
   swap                     Create managed 2/4 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
+  install                  Install the 'vps-init' shortcut command
   status                   Show current settings
   uninstall-3xui [--yes]   Permanently remove 3X-UI and known data paths
   update                   Download or pull the latest project version
@@ -482,9 +522,10 @@ menu() {
   6. Auto-detect timezone and enable NTP
   7. Remove 3X-UI
   8. Update this project
+  9. Install/refresh shortcut (vps-init)
   0. Exit
 EOF
-    read -r -p "Select [0-8]: " choice
+    read -r -p "Select [0-9]: " choice
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -494,6 +535,7 @@ EOF
       6) setup_timezone auto; pause_menu ;;
       7) uninstall_3xui; pause_menu ;;
       8) update_self; pause_menu ;;
+      9) install_shortcut; pause_menu ;;
       0) return 0 ;;
       *) warn "Invalid choice."; pause_menu ;;
     esac
@@ -507,6 +549,7 @@ main() {
     mss) setup_mss "${2:-clamp}" ;;
     swap) setup_swap ;;
     timezone) setup_timezone "${2:-auto}" ;;
+    install|shortcut) install_shortcut ;;
     status) show_status ;;
     uninstall-3xui) uninstall_3xui "${2:-}" ;;
     update) update_self ;;
