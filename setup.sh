@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-vps-init-suite.conf"
 readonly SYSCTL_UNIT="/etc/systemd/system/vps-init-suite-sysctl.service"
@@ -145,16 +145,124 @@ EOF
   log "Kernel profile applied and enabled at boot."
 }
 
-setup_timezone() {
-  require_root
-  require_supported_os
-  timedatectl set-timezone Asia/Shanghai
+is_valid_timezone() {
+  local timezone=$1
+  local known_timezones
+  [[ "$timezone" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || return 1
+  known_timezones=$(timedatectl list-timezones 2>/dev/null) || return 1
+  grep -Fxq -- "$timezone" <<<"$known_timezones"
+}
+
+fetch_timezone_text() {
+  local url=$1
+  local response
+  response=$(curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
+    --connect-timeout 3 --max-time 6 --retry 1 "$url" 2>/dev/null) || return 1
+  response=${response//$'\r'/}
+  response=${response//$'\n'/}
+  is_valid_timezone "$response" || return 1
+  printf '%s\n' "$response"
+}
+
+fetch_timezone_json() {
+  local url=$1
+  local filter=$2
+  local response timezone
+  response=$(curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
+    --connect-timeout 3 --max-time 6 --retry 1 "$url" 2>/dev/null) || return 1
+  timezone=$(jq -er "$filter" <<<"$response" 2>/dev/null) || return 1
+  is_valid_timezone "$timezone" || return 1
+  printf '%s\n' "$timezone"
+}
+
+detect_public_timezone() {
+  local timezone
+  if timezone=$(fetch_timezone_json "https://ipwho.is/" '.timezone.id // empty'); then
+    printf '%s\n' "$timezone"
+    return 0
+  fi
+  if timezone=$(fetch_timezone_text "https://ipinfo.io/timezone"); then
+    printf '%s\n' "$timezone"
+    return 0
+  fi
+  if timezone=$(fetch_timezone_text "https://ipapi.co/timezone/"); then
+    printf '%s\n' "$timezone"
+    return 0
+  fi
+  return 1
+}
+
+choose_timezone_interactively() {
+  local choice custom_timezone
+  cat >&2 <<'EOF'
+Automatic timezone detection failed. Select a fallback:
+  1. Keep the current timezone
+  2. UTC
+  3. Asia/Tokyo
+  4. America/Los_Angeles
+  5. America/New_York
+  6. Europe/London
+  7. Asia/Singapore
+  8. Enter another IANA timezone
+EOF
+  read -r -p "Select [1-8]: " choice
+  case "$choice" in
+    1) printf '%s\n' "keep" ;;
+    2) printf '%s\n' "Etc/UTC" ;;
+    3) printf '%s\n' "Asia/Tokyo" ;;
+    4) printf '%s\n' "America/Los_Angeles" ;;
+    5) printf '%s\n' "America/New_York" ;;
+    6) printf '%s\n' "Europe/London" ;;
+    7) printf '%s\n' "Asia/Singapore" ;;
+    8)
+      read -r -p "IANA timezone (for example Europe/Berlin): " custom_timezone
+      is_valid_timezone "$custom_timezone" || die "Unknown IANA timezone: ${custom_timezone}"
+      printf '%s\n' "$custom_timezone"
+      ;;
+    *) printf '%s\n' "keep" ;;
+  esac
+}
+
+enable_network_time() {
   if ! timedatectl set-ntp true 2>/dev/null; then
     apt_install systemd-timesyncd
     systemctl enable --now systemd-timesyncd.service
     timedatectl set-ntp true
   fi
-  log "Timezone set to Asia/Shanghai and network time enabled."
+}
+
+setup_timezone() {
+  require_root
+  require_supported_os
+  local requested=${1:-auto}
+  local timezone
+
+  apt_install ca-certificates curl jq tzdata
+  if [[ "$requested" == "auto" ]]; then
+    warn "Detecting timezone from the VPS public network egress..."
+    if timezone=$(detect_public_timezone); then
+      log "Detected IANA timezone: ${timezone}"
+    elif [[ -t 0 ]]; then
+      timezone=$(choose_timezone_interactively)
+    else
+      timezone="keep"
+      warn "Timezone detection failed in non-interactive mode; keeping the current timezone."
+    fi
+  elif [[ "$requested" == "keep" ]]; then
+    timezone="keep"
+  else
+    timezone=$requested
+    is_valid_timezone "$timezone" || die "Unknown IANA timezone: ${timezone}"
+  fi
+
+  if [[ "$timezone" != "keep" ]]; then
+    timedatectl set-timezone "$timezone"
+    log "Timezone set to ${timezone}."
+  else
+    warn "Keeping the current system timezone."
+  fi
+  enable_network_time
+  log "Network time synchronization enabled. Current local time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 }
 
 setup_swap() {
@@ -302,10 +410,11 @@ uninstall_3xui() {
 }
 
 full_init() {
+  local timezone=${1:-${VPS_TIMEZONE:-auto}}
   require_root
   require_supported_os
   tune_kernel
-  setup_timezone
+  setup_timezone "$timezone"
   setup_swap
   setup_mss clamp
   log "VPS initialization completed."
@@ -340,11 +449,11 @@ usage() {
 Usage: setup.sh <command> [option]
 
 Commands:
-  full                     Apply kernel, timezone, swap, and MSS defaults
+  full [auto|keep|ZONE]    Apply all defaults; auto-detect timezone
   kernel                   Apply BBR, FQ, TFO, and TCP buffer settings
   mss [clamp|1200..1460]   Persist MSS clamping (default: clamp)
   swap                     Create managed 2/4 GiB swap if none exists
-  timezone                 Set Asia/Shanghai and enable network time
+  timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
   status                   Show current settings
   uninstall-3xui [--yes]   Permanently remove 3X-UI and known data paths
   update                   Download or pull the latest project version
@@ -370,7 +479,7 @@ menu() {
   3. MSS clamp-to-PMTU
   4. Fixed MSS 1380
   5. Create swap
-  6. Set timezone and NTP
+  6. Auto-detect timezone and enable NTP
   7. Remove 3X-UI
   8. Update this project
   0. Exit
@@ -382,7 +491,7 @@ EOF
       3) setup_mss clamp; pause_menu ;;
       4) setup_mss 1380; pause_menu ;;
       5) setup_swap; pause_menu ;;
-      6) setup_timezone; pause_menu ;;
+      6) setup_timezone auto; pause_menu ;;
       7) uninstall_3xui; pause_menu ;;
       8) update_self; pause_menu ;;
       0) return 0 ;;
@@ -393,11 +502,11 @@ EOF
 
 main() {
   case "${1:-menu}" in
-    full) full_init ;;
+    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" ;;
     kernel) tune_kernel ;;
     mss) setup_mss "${2:-clamp}" ;;
     swap) setup_swap ;;
-    timezone) setup_timezone ;;
+    timezone) setup_timezone "${2:-auto}" ;;
     status) show_status ;;
     uninstall-3xui) uninstall_3xui "${2:-}" ;;
     update) update_self ;;
@@ -408,4 +517,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -9,7 +9,7 @@
 - 通过独立 systemd 服务固化 sysctl，避免普通重启后失效。
 - 支持 `clamp-to-PMTU` 或固定值 MSS，同时覆盖本机流量和转发流量。
 - 无现有 SWAP 时，根据内存自动创建 2 GiB 或 4 GiB SWAP，设置 `swappiness=10`。
-- 设置 `Asia/Shanghai` 时区并启用网络时间同步。
+- 通过三个 HTTPS 地理服务依次探测公网出口时区，并启用网络时间同步。
 - 可选彻底清理 3X-UI 服务及已知数据目录。
 
 ## 支持系统
@@ -45,12 +45,15 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 
 | 命令 | 说明 |
 | --- | --- |
-| `sudo ./setup.sh full` | 执行完整初始化 |
+| `sudo ./setup.sh full` | 完整初始化，并自动探测公网出口时区 |
+| `sudo ./setup.sh full Asia/Tokyo` | 完整初始化，并显式指定 IANA 时区 |
 | `sudo ./setup.sh kernel` | 仅应用 BBR、FQ、TFO 和 TCP 参数 |
 | `sudo ./setup.sh mss clamp` | 使用路径 MTU 自动钳制 MSS（默认） |
 | `sudo ./setup.sh mss 1380` | 将 MSS 固定为 1380，可使用 1200-1460 |
 | `sudo ./setup.sh swap` | 无现有 SWAP 时创建受管 SWAP |
-| `sudo ./setup.sh timezone` | 设置时区和网络时间同步 |
+| `sudo ./setup.sh timezone auto` | 自动探测时区并启用网络时间同步 |
+| `sudo ./setup.sh timezone America/Los_Angeles` | 手动指定 IANA 时区 |
+| `sudo ./setup.sh timezone keep` | 保留当前时区，仅启用网络时间同步 |
 | `./setup.sh status` | 查看当前状态 |
 | `sudo ./setup.sh uninstall-3xui` | 交互确认后清理 3X-UI |
 | `sudo ./setup.sh update` | 更新仓库或下载最新脚本 |
@@ -58,6 +61,9 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 ## 设计与安全说明
 
 - 项目只写入带 `vps-init-suite` 名称的 sysctl、systemd、SWAP 和 iptables 资源，不删除第三方调优文件。
+- 时区探测依次查询 `ipwho.is`、`ipinfo.io` 和 `ipapi.co`；这些服务会看到 VPS 的公网出口 IP，但脚本不会向其发送其他机器数据。
+- 所有探测请求强制使用 HTTPS，返回值必须存在于本机 IANA 时区数据库中才会应用。
+- 无人值守模式探测失败时会保留当前时区；交互模式提供常用地区、任意 IANA 时区及保留现状选项。
 - 每次重写项目自己的 sysctl 文件前，旧版本都会备份到 `/var/lib/vps-init-suite/backups/`。
 - MSS 使用专用 `VPS_INIT_MSS` 链和注释标记，不保存或覆盖整套防火墙规则。
 - 已存在任何活动 SWAP 时不会修改；磁盘余量不足时不会创建新文件。
@@ -70,7 +76,8 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 
 ```bash
 bash -n setup.sh
-shellcheck setup.sh
+shellcheck setup.sh tests/timezone_test.sh
+bash tests/timezone_test.sh
 ```
 
 ## 许可证

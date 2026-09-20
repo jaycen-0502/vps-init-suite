@@ -15,4 +15,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Run ShellCheck
-        run: shellcheck setup.sh
+        run: shellcheck setup.sh tests/timezone_test.sh
+      - name: Check Bash syntax
+        run: bash -n setup.sh tests/timezone_test.sh
+      - name: Test timezone detection
+        run: bash tests/timezone_test.sh
