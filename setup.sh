@@ -354,7 +354,9 @@ EOF
 }
 
 pause_menu() {
-  [[ -t 0 ]] && read -r -p "Press Enter to return to the menu..." _ || true
+  if [[ -t 0 ]]; then
+    read -r -p "Press Enter to return to the menu..." _ || true
+  fi
 }
 
 menu() {
