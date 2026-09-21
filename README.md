@@ -35,9 +35,11 @@ sudo ./setup.sh full
 初始化成功后可直接使用快捷命令：
 
 ```bash
-sudo vps-init
-sudo vps-init status
+vps-init
+vps-init status
 ```
+
+快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。只读的 `status`、`version`、`help` 不需要 root。
 
 需要交互式菜单：
 

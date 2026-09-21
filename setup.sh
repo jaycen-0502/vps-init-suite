@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly VERSION="1.1.1"
+readonly VERSION="1.2.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -15,6 +15,7 @@ readonly SWAP_FILE="/swapfile-vps-init-suite"
 readonly MSS_CONFIG="/etc/default/vps-init-suite"
 readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
+readonly ROOT_COMMANDS=(full kernel mss swap timezone install uninstall-3xui update)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
   99-network-bbr.conf 99-optimal-proxy.conf 99-sysctl.conf 99-tcp-custom.conf
@@ -45,6 +46,19 @@ trap on_error ERR
 
 require_root() {
   [[ ${EUID} -eq 0 ]] || die "Run this command as root (for example: sudo ./setup.sh full)."
+}
+
+is_root_command() {
+  local command=$1 candidate
+  for candidate in "${ROOT_COMMANDS[@]}"; do
+    [[ "$command" == "$candidate" ]] && return 0
+  done
+  return 1
+}
+
+reexec_as_root() {
+  command -v sudo >/dev/null || die "This command needs root privileges. Install sudo or run as root."
+  exec sudo -E "$INSTALLED_SCRIPT" "$@"
 }
 
 require_supported_os() {
@@ -524,7 +538,7 @@ install_shortcut() {
   bash -n "$temporary"
   mv -f -- "$temporary" "$INSTALLED_SCRIPT"
   ln -sfn "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"
-  log "Shortcut installed: sudo ${LAUNCHER_NAME}"
+  log "Shortcut installed: ${LAUNCHER_NAME} (privileged actions will request sudo automatically)"
 }
 
 full_init() {
@@ -632,6 +646,9 @@ EOF
 }
 
 main() {
+  if [[ ${EUID} -ne 0 ]] && is_root_command "${1:-menu}"; then
+    reexec_as_root "$@"
+  fi
   case "${1:-menu}" in
     full) full_init "${2:-${VPS_TIMEZONE:-auto}}" ;;
     kernel) tune_kernel ;;
