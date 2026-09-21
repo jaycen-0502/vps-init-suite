@@ -15,6 +15,11 @@ readonly SWAP_FILE="/swapfile-vps-init-suite"
 readonly MSS_CONFIG="/etc/default/vps-init-suite"
 readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
+readonly CONFLICT_FILES=(
+  99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
+  99-network-bbr.conf 99-optimal-proxy.conf 99-sysctl.conf 99-tcp-custom.conf
+  99-tfo.conf 99-japan-vps.conf 99-us-vps.conf 99-vps-tuning.conf
+)
 
 if [[ -t 1 ]]; then
   readonly RED=$'\033[31m'
@@ -93,6 +98,10 @@ show_status() {
   printf 'Congestion control:      %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
   printf 'Default qdisc:           %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
   printf 'TCP Fast Open:           %s (target: 3)\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
+  printf 'IPv4 forwarding:         %s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unavailable)"
+  printf 'IPv6 forwarding:         %s\n' "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo unavailable)"
+  printf 'TCP buffer profile:       %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unavailable) bytes"
+  printf 'Swappiness:              %s\n' "$(sysctl -n vm.swappiness 2>/dev/null || echo unavailable)"
   printf 'Timezone:                %s\n' "${timezone:-unavailable}"
   printf 'Swap:                    %s\n' "$swap"
   printf 'MSS policy:              %s\n' "${mss:-configured}"
@@ -109,20 +118,75 @@ tune_kernel() {
     die "This kernel does not expose BBR. Upgrade the kernel before applying this profile."
   fi
 
+  clean_conflicts
+
+  local memory_mb
+  memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog syn_backlog tw_buckets
+  if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
+    profile="low-memory (4 MiB buffers)"
+    rmem_max=4194304
+    wmem_max=4194304
+    rmem_default=131072
+    wmem_default=131072
+    file_max=262144
+    conntrack_max=65536
+    backlog=4096
+    syn_backlog=2048
+    tw_buckets=20000
+  else
+    profile="standard (16 MiB buffers)"
+    rmem_max=16777216
+    wmem_max=16777216
+    rmem_default=262144
+    wmem_default=262144
+    file_max=524288
+    conntrack_max=131072
+    backlog=8192
+    syn_backlog=8192
+    tw_buckets=50000
+  fi
+  log "Detected ${memory_mb} MiB RAM; applying ${profile} profile."
+
   backup_existing "$SYSCTL_FILE"
-  cat >"$SYSCTL_FILE" <<'EOF'
+  cat >"$SYSCTL_FILE" <<EOF
 # Managed by vps-init-suite.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.core.somaxconn = 8192
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_slow_start_after_idle = 0
+net.core.rmem_max = ${rmem_max}
+net.core.wmem_max = ${wmem_max}
+net.core.rmem_default = ${rmem_default}
+net.core.wmem_default = ${wmem_default}
+net.ipv4.tcp_rmem = 4096 87380 ${rmem_max}
+net.ipv4.tcp_wmem = 4096 65536 ${wmem_max}
 net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv6.conf.default.forwarding = 1
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_tw_reuse = 1
+net.core.somaxconn = ${backlog}
+net.core.netdev_max_backlog = ${backlog}
+net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_tw_buckets = ${tw_buckets}
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.ip_local_port_range = 10240 65535
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 5
+net.netfilter.nf_conntrack_max = ${conntrack_max}
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+fs.file-max = ${file_max}
+fs.nr_open = ${file_max}
+vm.swappiness = 10
 EOF
 
   cat >/etc/modules-load.d/vps-init-suite.conf <<'EOF'
@@ -148,6 +212,31 @@ EOF
   systemctl daemon-reload
   systemctl enable vps-init-suite-sysctl.service >/dev/null
   log "Kernel profile applied and enabled at boot."
+}
+
+clean_conflicts() {
+  local filename path
+  local found=0
+  for filename in "${CONFLICT_FILES[@]}"; do
+    path="/etc/sysctl.d/${filename}"
+    if [[ -e "$path" && "$path" != "$SYSCTL_FILE" ]]; then
+      backup_existing "$path"
+      rm -f -- "$path"
+      found=1
+    fi
+  done
+  if (( found )); then
+    warn "Removed known third-party sysctl fragments after backing them up."
+  fi
+}
+
+buffer_profile() {
+  local memory_mb=$1
+  if (( memory_mb < 1500 )); then
+    printf '%s\n' "4"
+  else
+    printf '%s\n' "16"
+  fi
 }
 
 is_valid_timezone() {
