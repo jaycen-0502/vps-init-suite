@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.2.1"
+readonly SCRIPT_VERSION="1.2.2"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -128,6 +128,7 @@ tune_kernel() {
   apt_install kmod procps
 
   modprobe tcp_bbr 2>/dev/null || true
+  modprobe nf_conntrack 2>/dev/null || true
   if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
     die "This kernel does not expose BBR. Upgrade the kernel before applying this profile."
   fi
@@ -136,7 +137,7 @@ tune_kernel() {
 
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
-  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog syn_backlog tw_buckets
+  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog syn_backlog tw_buckets conntrack_config
   if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
     profile="low-memory (4 MiB buffers)"
     rmem_max=4194304
@@ -161,6 +162,14 @@ tune_kernel() {
     tw_buckets=50000
   fi
   log "Detected ${memory_mb} MiB RAM; applying ${profile} profile."
+
+  conntrack_config=""
+  if [[ -e /proc/sys/net/netfilter/nf_conntrack_max && -e /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established ]]; then
+    conntrack_config="net.netfilter.nf_conntrack_max = ${conntrack_max}
+net.netfilter.nf_conntrack_tcp_timeout_established = 600"
+  else
+    warn "nf_conntrack sysctl nodes are unavailable; skipping conntrack limits."
+  fi
 
   backup_existing "$SYSCTL_FILE"
   cat >"$SYSCTL_FILE" <<EOF
@@ -196,8 +205,7 @@ net.ipv4.ip_local_port_range = 10240 65535
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 5
-net.netfilter.nf_conntrack_max = ${conntrack_max}
-net.netfilter.nf_conntrack_tcp_timeout_established = 600
+${conntrack_config}
 fs.file-max = ${file_max}
 fs.nr_open = ${file_max}
 vm.swappiness = 10
