@@ -25,12 +25,31 @@
 
 如果当前提示符是 `root@主机`，不要加 `sudo`。`less` 和 `sudo` 都不是脚本依赖；检查文件可以用 `sed` 或 `cat`：
 
+> 下面的代码块每一行都是一条独立命令，请逐行粘贴并在每行按一次 Enter。不要把多行命令连成一行，否则 `curl` 会把后面的命令误当成 URL。
+
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh
 sed -n '1,260p' setup.sh
 chmod +x setup.sh
 ./setup.sh full
 ```
+
+root 用户也可以使用这一条命令直接下载并执行（不会依赖 `less` 或 `sudo`）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh -o /tmp/vps-init-setup.sh && chmod +x /tmp/vps-init-setup.sh && /tmp/vps-init-setup.sh full
+```
+
+如果之前误把多条命令粘成一行，先删除错误下载文件，再重新逐行执行：
+
+```bash
+rm -f setup.sh
+curl -fsSLO https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh
+chmod +x setup.sh
+./setup.sh full
+```
+
+看到 `curl: (6) Could not resolve host: sed`、`Could not resolve host: chmod` 或下载内容开头是 `<html>` 时，说明命令粘贴方式有误；不要运行该文件。
 
 如果你是普通用户，使用下面的方式；快捷命令对需要特权的操作会自动请求 `sudo`：
 
