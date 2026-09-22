@@ -12,6 +12,7 @@
 - 支持 `clamp-to-PMTU` 或固定值 MSS，同时覆盖本机流量和转发流量。
 - 无现有 SWAP 时，根据内存自动创建 2 GiB 或 4 GiB SWAP，设置 `swappiness=10`。
 - 通过三个 HTTPS 地理服务依次探测公网出口时区，并启用网络时间同步。
+- 优先使用 `systemd-timesyncd`，在 D-Bus/timesyncd 不可用时回退到 chrony 和本地时区软链接。
 - 可选彻底清理 3X-UI 服务及已知数据目录。
 - 完整初始化后安装 `vps-init` 快捷命令，随时打开菜单或执行子命令。
 
@@ -91,6 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 | `sudo ./setup.sh kernel` | 仅应用 BBR、FQ、TFO 和 TCP 参数 |
 | `sudo ./setup.sh mss clamp` | 使用路径 MTU 自动钳制 MSS（默认） |
 | `sudo ./setup.sh mss 1380` | 将 MSS 固定为 1380，可使用 1200-1460 |
+| `sudo ./setup.sh mss dual-fixed` | IPv4 固定 1380、IPv6 固定 1340 |
 | `sudo ./setup.sh swap` | 无现有 SWAP 时创建受管 SWAP |
 | `sudo ./setup.sh timezone auto` | 自动探测时区并启用网络时间同步 |
 | `sudo ./setup.sh timezone America/Los_Angeles` | 手动指定 IANA 时区 |
@@ -113,6 +115,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 - 无人值守模式探测失败时会保留当前时区；交互模式提供常用地区、任意 IANA 时区及保留现状选项。
 - 每次重写项目自己的 sysctl 文件前，旧版本都会备份到 `/var/lib/vps-init-suite/backups/`。
 - MSS 使用专用 `VPS_INIT_MSS` 链和注释标记，不保存或覆盖整套防火墙规则。
+- 完整初始化默认使用 `clamp-to-PMTU`；只有明确执行 `mss dual-fixed` 才会使用 IPv4 1380 / IPv6 1340 固定值。
 - 已存在任何活动 SWAP 时不会修改；磁盘余量不足时不会创建新文件。
 - 3X-UI 清理是不可逆操作，交互模式要求输入 `REMOVE`；自动化必须显式传入 `--yes`。
 - 内核不提供 BBR 时，脚本会停止并提示升级，不会伪装成成功。

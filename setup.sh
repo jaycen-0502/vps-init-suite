@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.2.3"
+readonly SCRIPT_VERSION="1.3.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -340,11 +340,27 @@ EOF
 }
 
 enable_network_time() {
-  if ! timedatectl set-ntp true 2>/dev/null; then
-    apt_install systemd-timesyncd
-    systemctl enable --now systemd-timesyncd.service
-    timedatectl set-ntp true
+  if timedatectl set-ntp true 2>/dev/null; then
+    return 0
   fi
+  if systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1; then
+    warn "D-Bus time control unavailable; systemd-timesyncd enabled directly."
+    return 0
+  fi
+  warn "systemd-timesyncd unavailable; installing chrony fallback."
+  apt_install chrony
+  systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+  systemctl enable --now chrony.service
+}
+
+set_timezone() {
+  local timezone=$1
+  if timedatectl set-timezone "$timezone" 2>/dev/null; then
+    return 0
+  fi
+  ln -snf "/usr/share/zoneinfo/${timezone}" /etc/localtime
+  printf '%s\n' "$timezone" >/etc/timezone
+  warn "timedatectl unavailable; timezone applied with /etc/localtime symlink."
 }
 
 setup_timezone() {
@@ -372,7 +388,7 @@ setup_timezone() {
   fi
 
   if [[ "$timezone" != "keep" ]]; then
-    timedatectl set-timezone "$timezone"
+    set_timezone "$timezone"
     log "Timezone set to ${timezone}."
   else
     warn "Keeping the current system timezone."
@@ -451,8 +467,12 @@ apply_family() {
     return 0
   fi
 
-  if [[ "$MSS_MODE" == "fixed" ]]; then
-    if ! "$binary" -w 5 -t mangle -A VPS_INIT_MSS -j TCPMSS --set-mss "$MSS_VALUE"; then
+  local mss_value="$MSS_VALUE"
+  if [[ "$MSS_MODE" == "dual-fixed" && "$binary" == "ip6tables" ]]; then
+    mss_value="$MSS_VALUE6"
+  fi
+  if [[ "$MSS_MODE" == "fixed" || "$MSS_MODE" == "dual-fixed" ]]; then
+    if ! "$binary" -w 5 -t mangle -A VPS_INIT_MSS -j TCPMSS --set-mss "$mss_value"; then
       printf 'vps-init-suite: cannot add fixed MSS rule with %s; skipping.\n' "$binary" >&2
       return 0
     fi
@@ -483,22 +503,29 @@ setup_mss() {
   require_root
   require_supported_os
   local requested=${1:-clamp}
-  local mode value
+  local mode value value6
 
   if [[ "$requested" == "clamp" ]]; then
     mode="clamp"
     value="1380"
+    value6="1340"
+  elif [[ "$requested" == "dual-fixed" ]]; then
+    mode="dual-fixed"
+    value="1380"
+    value6="1340"
   elif [[ "$requested" =~ ^[0-9]+$ ]] && (( 10#$requested >= 1200 && 10#$requested <= 1460 )); then
     mode="fixed"
     value=$((10#$requested))
+    value6="$value"
   else
-    die "MSS must be 'clamp' or a value from 1200 through 1460."
+    die "MSS must be 'clamp', 'dual-fixed', or a value from 1200 through 1460."
   fi
 
   apt_install iptables
   cat >"$MSS_CONFIG" <<EOF
 MSS_MODE=${mode}
 MSS_VALUE=${value}
+MSS_VALUE6=${value6}
 EOF
   write_mss_helper
 
@@ -525,7 +552,9 @@ EOF
     return 0
   fi
   if iptables -w 5 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
-    if [[ "$mode" == "fixed" ]]; then
+    if [[ "$mode" == "dual-fixed" ]]; then
+      log "Persistent dual-stack MSS policy applied (IPv4 ${value}, IPv6 ${value6})."
+    elif [[ "$mode" == "fixed" ]]; then
       log "Persistent MSS policy applied with fixed value ${value}."
     else
       log "Persistent path-MTU MSS clamping applied."
@@ -630,7 +659,7 @@ Usage: setup.sh <command> [option]
 Commands:
   full [auto|keep|ZONE]    Apply all defaults; auto-detect timezone
   kernel                   Apply BBR, FQ, TFO, and TCP buffer settings
-  mss [clamp|1200..1460]   Persist MSS clamping (default: clamp)
+  mss [clamp|dual-fixed|1200..1460] Persist MSS policy (default: clamp)
   swap                     Create managed 2/4 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
   install                  Install the 'vps-init' shortcut command
