@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.2.2"
+readonly SCRIPT_VERSION="1.2.3"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -436,18 +436,39 @@ apply_family() {
   local chain
   command -v "$binary" >/dev/null || return 0
 
-  "$binary" -w 5 -t mangle -N VPS_INIT_MSS 2>/dev/null || true
-  "$binary" -w 5 -t mangle -F VPS_INIT_MSS
+  if ! "$binary" -w 5 -t mangle -L >/dev/null 2>&1; then
+    printf 'vps-init-suite: %s mangle table unavailable; skipping MSS policy.\n' "$binary" >&2
+    return 0
+  fi
+  if ! "$binary" -w 5 -t mangle -N VPS_INIT_MSS 2>/dev/null; then
+    if ! "$binary" -w 5 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
+      printf 'vps-init-suite: cannot create VPS_INIT_MSS with %s; skipping.\n' "$binary" >&2
+      return 0
+    fi
+  fi
+  if ! "$binary" -w 5 -t mangle -F VPS_INIT_MSS; then
+    printf 'vps-init-suite: cannot update VPS_INIT_MSS with %s; skipping.\n' "$binary" >&2
+    return 0
+  fi
 
   if [[ "$MSS_MODE" == "fixed" ]]; then
-    "$binary" -w 5 -t mangle -A VPS_INIT_MSS -j TCPMSS --set-mss "$MSS_VALUE"
+    if ! "$binary" -w 5 -t mangle -A VPS_INIT_MSS -j TCPMSS --set-mss "$MSS_VALUE"; then
+      printf 'vps-init-suite: cannot add fixed MSS rule with %s; skipping.\n' "$binary" >&2
+      return 0
+    fi
   else
-    "$binary" -w 5 -t mangle -A VPS_INIT_MSS -j TCPMSS --clamp-mss-to-pmtu
+    if ! "$binary" -w 5 -t mangle -A VPS_INIT_MSS -j TCPMSS --clamp-mss-to-pmtu; then
+      printf 'vps-init-suite: cannot add PMTU MSS rule with %s; skipping.\n' "$binary" >&2
+      return 0
+    fi
   fi
 
   for chain in OUTPUT FORWARD; do
     if ! "$binary" -w 5 -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; then
-      "$binary" -w 5 -t mangle -I "$chain" 1 -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS
+      if ! "$binary" -w 5 -t mangle -I "$chain" 1 -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS; then
+        printf 'vps-init-suite: cannot attach MSS rule to %s/%s; skipping.\n' "$binary" "$chain" >&2
+        return 0
+      fi
     fi
   done
 }
@@ -498,11 +519,19 @@ EOF
 
   systemctl daemon-reload
   systemctl enable vps-init-suite-mss.service >/dev/null
-  systemctl restart vps-init-suite-mss.service
-  if [[ "$mode" == "fixed" ]]; then
-    log "Persistent MSS policy applied with fixed value ${value}."
+  if ! systemctl restart vps-init-suite-mss.service; then
+    warn "MSS service could not start; continuing without MSS rules. Check: systemctl status vps-init-suite-mss.service"
+    systemctl disable vps-init-suite-mss.service >/dev/null 2>&1 || true
+    return 0
+  fi
+  if iptables -w 5 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
+    if [[ "$mode" == "fixed" ]]; then
+      log "Persistent MSS policy applied with fixed value ${value}."
+    else
+      log "Persistent path-MTU MSS clamping applied."
+    fi
   else
-    log "Persistent path-MTU MSS clamping applied."
+    warn "iptables mangle is unavailable; MSS policy was skipped."
   fi
 }
 
