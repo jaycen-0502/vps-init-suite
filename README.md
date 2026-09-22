@@ -23,11 +23,18 @@
 
 ## 推荐安装方式
 
-先下载并检查脚本，再以 root 权限执行：
+如果当前提示符是 `root@主机`，不要加 `sudo`。`less` 和 `sudo` 都不是脚本依赖；检查文件可以用 `sed` 或 `cat`：
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh
-less setup.sh
+sed -n '1,260p' setup.sh
+chmod +x setup.sh
+./setup.sh full
+```
+
+如果你是普通用户，使用下面的方式；快捷命令对需要特权的操作会自动请求 `sudo`：
+
+```bash
 chmod +x setup.sh
 sudo ./setup.sh full
 ```
@@ -39,19 +46,22 @@ vps-init
 vps-init status
 ```
 
-快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。只读的 `status`、`version`、`help` 不需要 root。
+快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。只读的 `status`、`version`、`help` 不需要 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
 
 需要交互式菜单：
 
 ```bash
-sudo ./setup.sh menu
+./setup.sh menu                 # 当前是 root
+# 普通用户使用：sudo ./setup.sh menu
 ```
 
 确认脚本内容后，也可以一行执行完整初始化：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh | sudo bash -s -- full
+curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh | bash -s -- full
 ```
+
+上面的管道命令仅适用于当前已经是 root 的会话；普通用户请将末尾改为 `| sudo bash -s -- full`。
 
 ## 命令
 
