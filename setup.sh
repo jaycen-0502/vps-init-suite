@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.4.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -15,7 +15,7 @@ readonly SWAP_FILE="/swapfile-vps-init-suite"
 readonly MSS_CONFIG="/etc/default/vps-init-suite"
 readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
-readonly ROOT_COMMANDS=(full kernel mss swap timezone install uninstall-3xui update)
+readonly ROOT_COMMANDS=(full kernel ipv6 mss swap timezone install uninstall-3xui update)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
   99-network-bbr.conf 99-optimal-proxy.conf 99-sysctl.conf 99-tcp-custom.conf
@@ -114,6 +114,7 @@ show_status() {
   printf 'TCP Fast Open:           %s (target: 3)\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
   printf 'IPv4 forwarding:         %s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unavailable)"
   printf 'IPv6 forwarding:         %s\n' "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo unavailable)"
+  printf 'IPv6 mode:               %s\n' "$(if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == "1" ]]; then printf '%s' enabled; else printf '%s' disabled; fi)"
   printf 'TCP buffer profile:       %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unavailable) bytes"
   printf 'Swappiness:              %s\n' "$(sysctl -n vm.swappiness 2>/dev/null || echo unavailable)"
   printf 'Timezone:                %s\n' "${timezone:-unavailable}"
@@ -127,6 +128,9 @@ tune_kernel() {
   require_supported_os
   apt_install kmod procps
 
+  local ipv6_mode
+  ipv6_mode=$(resolve_ipv6_mode "${1:-}")
+
   modprobe tcp_bbr 2>/dev/null || true
   modprobe nf_conntrack 2>/dev/null || true
   if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
@@ -137,7 +141,7 @@ tune_kernel() {
 
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
-  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog syn_backlog tw_buckets conntrack_config
+  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog syn_backlog tw_buckets conntrack_config ipv6_config
   if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
     profile="low-memory (4 MiB buffers)"
     rmem_max=4194304
@@ -163,6 +167,20 @@ tune_kernel() {
   fi
   log "Detected ${memory_mb} MiB RAM; applying ${profile} profile."
 
+  if [[ "$ipv6_mode" == "on" ]]; then
+    ipv6_config="net.ipv6.conf.all.forwarding = 1
+net.ipv6.conf.default.forwarding = 1
+net.ipv6.conf.all.accept_ra = 2
+net.ipv6.conf.default.accept_ra = 2"
+    log "IPv6 forwarding enabled by user selection."
+  else
+    ipv6_config="net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0
+net.ipv6.conf.all.accept_ra = 1
+net.ipv6.conf.default.accept_ra = 1"
+    warn "IPv6 forwarding disabled (default); normal IPv6 host connectivity remains available."
+  fi
+
   conntrack_config=""
   if [[ -e /proc/sys/net/netfilter/nf_conntrack_max && -e /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established ]]; then
     conntrack_config="net.netfilter.nf_conntrack_max = ${conntrack_max}
@@ -184,8 +202,7 @@ net.core.wmem_default = ${wmem_default}
 net.ipv4.tcp_rmem = 4096 87380 ${rmem_max}
 net.ipv4.tcp_wmem = 4096 65536 ${wmem_max}
 net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-net.ipv6.conf.default.forwarding = 1
+${ipv6_config}
 net.ipv6.conf.all.disable_ipv6 = 0
 net.ipv6.conf.default.disable_ipv6 = 0
 net.ipv6.conf.lo.disable_ipv6 = 0
@@ -259,6 +276,28 @@ buffer_profile() {
   else
     printf '%s\n' "16"
   fi
+}
+
+normalize_ipv6_mode() {
+  case "${1:-}" in
+    on|yes|y|1|enable|enabled) printf '%s\n' "on" ;;
+    off|no|n|0|disable|disabled) printf '%s\n' "off" ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_ipv6_mode() {
+  local requested=${1:-${VPS_IPV6:-}}
+  local answer
+  if [[ -z "$requested" ]]; then
+    if [[ -t 0 ]]; then
+      read -r -p "Enable IPv6 forwarding for this VPS? [y/N]: " answer
+      requested=${answer:-off}
+    else
+      requested="off"
+    fi
+  fi
+  normalize_ipv6_mode "$requested" || die "IPv6 mode must be on or off. Default is off."
 }
 
 is_valid_timezone() {
@@ -609,9 +648,10 @@ install_shortcut() {
 
 full_init() {
   local timezone=${1:-${VPS_TIMEZONE:-auto}}
+  local ipv6_mode=${2:-${VPS_IPV6:-}}
   require_root
   require_supported_os
-  tune_kernel
+  tune_kernel "$ipv6_mode"
   setup_timezone "$timezone"
   setup_swap
   setup_mss clamp
@@ -657,8 +697,10 @@ usage() {
 Usage: setup.sh <command> [option]
 
 Commands:
-  full [auto|keep|ZONE]    Apply all defaults; auto-detect timezone
-  kernel                   Apply BBR, FQ, TFO, and TCP buffer settings
+  full [auto|keep|ZONE] [on|off]
+                           Apply defaults; IPv6 forwarding defaults off
+  kernel [on|off]          Apply BBR, FQ, TFO, TCP, and IPv6 settings
+  ipv6 [on|off]            Enable or disable IPv6 forwarding (default: off)
   mss [clamp|dual-fixed|1200..1460] Persist MSS policy (default: clamp)
   swap                     Create managed 2/4 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
@@ -692,6 +734,7 @@ menu() {
   7. Remove 3X-UI
   8. Update this project
   9. Install/refresh shortcut (vps-init)
+ 10. Enable/disable IPv6 forwarding
   0. Exit
 EOF
     read -r -p "Select [0-9]: " choice
@@ -705,6 +748,7 @@ EOF
       7) uninstall_3xui; pause_menu ;;
       8) update_self; pause_menu ;;
       9) install_shortcut; pause_menu ;;
+      10) tune_kernel; pause_menu ;;
       0) return 0 ;;
       *) warn "Invalid choice."; pause_menu ;;
     esac
@@ -716,8 +760,9 @@ main() {
     reexec_as_root "$@"
   fi
   case "${1:-menu}" in
-    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" ;;
-    kernel) tune_kernel ;;
+    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" "${3:-${VPS_IPV6:-}}" ;;
+    kernel) tune_kernel "${2:-${VPS_IPV6:-}}" ;;
+    ipv6) tune_kernel "${2:-}" ;;
     mss) setup_mss "${2:-clamp}" ;;
     swap) setup_swap ;;
     timezone) setup_timezone "${2:-auto}" ;;

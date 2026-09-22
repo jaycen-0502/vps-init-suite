@@ -8,7 +8,7 @@
 - 将 TCP 收发缓冲上限扩大到 16 MiB，并调整连接队列。
 - 根据物理内存自动选择低内存 4 MiB 安全档或标准 16 MiB 长肥管道档。
 - 通过独立 systemd 服务固化 sysctl，避免普通重启后失效。
-- 开启 IPv4/IPv6 转发、TCP 时间戳、SACK、连接保活和受控 conntrack 参数。
+- 开启 IPv4 转发；IPv6 转发由用户选择，默认关闭，同时保留普通 IPv6 主机连接能力。
 - 支持 `clamp-to-PMTU` 或固定值 MSS，同时覆盖本机流量和转发流量。
 - 无现有 SWAP 时，根据内存自动创建 2 GiB 或 4 GiB SWAP，设置 `swappiness=10`。
 - 通过三个 HTTPS 地理服务依次探测公网出口时区，并启用网络时间同步。
@@ -64,6 +64,7 @@ sudo ./setup.sh full
 ```bash
 vps-init
 vps-init status
+vps-init ipv6 on
 ```
 
 快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。只读的 `status`、`version`、`help` 不需要 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
@@ -87,9 +88,11 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 
 | 命令 | 说明 |
 | --- | --- |
-| `sudo ./setup.sh full` | 完整初始化，并自动探测公网出口时区 |
-| `sudo ./setup.sh full Asia/Tokyo` | 完整初始化，并显式指定 IANA 时区 |
-| `sudo ./setup.sh kernel` | 仅应用 BBR、FQ、TFO 和 TCP 参数 |
+| `sudo ./setup.sh full` | 完整初始化；交互询问 IPv6 转发，默认关闭 |
+| `sudo ./setup.sh full auto on` | 完整初始化并开启 IPv6 转发 |
+| `sudo ./setup.sh full Asia/Tokyo off` | 完整初始化并关闭 IPv6 转发 |
+| `sudo ./setup.sh kernel on` | 仅应用内核参数并开启 IPv6 转发 |
+| `sudo ./setup.sh ipv6 off` | 关闭 IPv6 转发（默认策略） |
 | `sudo ./setup.sh mss clamp` | 使用路径 MTU 自动钳制 MSS（默认） |
 | `sudo ./setup.sh mss 1380` | 将 MSS 固定为 1380，可使用 1200-1460 |
 | `sudo ./setup.sh mss dual-fixed` | IPv4 固定 1380、IPv6 固定 1340 |
@@ -107,6 +110,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 - 项目只写入带 `vps-init-suite` 名称的 sysctl、systemd、SWAP 和 iptables 资源，不删除第三方调优文件。
 - 对附件中列出的已知历史 sysctl 碎片会先备份到 `/var/lib/vps-init-suite/backups/`，再删除，避免被旧脚本覆盖；不会覆盖 `/etc/sysctl.conf`。
 - 低于 1500 MiB 内存使用 4 MiB 缓冲和较低队列，高于或等于 1500 MiB 使用 16 MiB 缓冲；这只是内核基准，应用自身仍需按内存规划。
+- IPv6 默认不做路由转发；选择 `on` 时开启 forwarding 并使用 `accept_ra=2`，适合中转/路由节点。该选项不会关闭普通 IPv6 出站连接。
 - `nf_conntrack` 仅在内核实际暴露对应 sysctl 节点时配置；精简内核或容器环境会安全跳过，不会导致整套初始化失败。
 - MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。
 - 快捷入口为 `/usr/local/bin/vps-init`，实际脚本保存在 `/usr/local/lib/vps-init-suite/setup.sh`。
