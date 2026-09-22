@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.2.1"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -107,7 +107,7 @@ show_status() {
   fi
 
   printf '%s\n' "------------------------------------------------------------"
-  printf 'Version:                 %s\n' "$VERSION"
+  printf 'Version:                 %s\n' "$SCRIPT_VERSION"
   printf 'Shortcut command:        %s\n' "$LAUNCHER_NAME"
   printf 'Congestion control:      %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
   printf 'Default qdisc:           %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
@@ -614,7 +614,7 @@ pause_menu() {
 menu() {
   while true; do
     [[ -t 1 ]] && clear
-    printf '%s\n' "VPS Initialization & Kernel Tuning Suite v${VERSION}"
+    printf '%s\n' "VPS Initialization & Kernel Tuning Suite v${SCRIPT_VERSION}"
     show_status
     cat <<'EOF'
   1. Full initialization (recommended)
@@ -660,7 +660,7 @@ main() {
     uninstall-3xui) uninstall_3xui "${2:-}" ;;
     update) update_self ;;
     menu) menu ;;
-    version|--version|-v) printf '%s\n' "$VERSION" ;;
+    version|--version|-v) printf '%s\n' "$SCRIPT_VERSION" ;;
     help|--help|-h) usage ;;
     *) usage; exit 2 ;;
   esac
