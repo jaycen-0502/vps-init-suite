@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# Managed by vps-init-suite.
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.1"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -15,7 +16,9 @@ readonly SWAP_FILE="/swapfile-vps-init-suite"
 readonly MSS_CONFIG="/etc/default/vps-init-suite"
 readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
-readonly ROOT_COMMANDS=(full kernel ipv6 mss swap timezone install uninstall-3xui update)
+readonly STATE_DIR="/var/lib/vps-init-suite/state"
+readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
+readonly ROOT_COMMANDS=(full kernel ipv6 mss swap timezone install select menu uninstall remove uninstall-3xui update upgrade)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
   99-network-bbr.conf 99-optimal-proxy.conf 99-sysctl.conf 99-tcp-custom.conf
@@ -36,6 +39,10 @@ APT_UPDATED=0
 log() { printf '%s\n' "${GREEN}$*${RESET}"; }
 warn() { printf '%s\n' "${YELLOW}$*${RESET}" >&2; }
 die() { printf '%s\n' "${RED}Error: $*${RESET}" >&2; exit 1; }
+
+assert_not_symlink() {
+  [[ ! -L "$1" ]] || die "Refusing to write through symlink ${1}; inspect or remove it first."
+}
 
 on_error() {
   local exit_code=$?
@@ -58,7 +65,13 @@ is_root_command() {
 
 reexec_as_root() {
   command -v sudo >/dev/null || die "This command needs root privileges. Install sudo or run as root."
-  exec sudo -E "$INSTALLED_SCRIPT" "$@"
+  local source_path=${BASH_SOURCE[0]}
+  local executable="$INSTALLED_SCRIPT"
+  if [[ -f "$source_path" && "$source_path" != "/dev/stdin" ]]; then
+    executable=$(readlink -f -- "$source_path")
+  fi
+  [[ -f "$executable" ]] || die "Cannot locate the script for privilege escalation. Run the downloaded script with sudo."
+  exec sudo -E "$executable" "$@"
 }
 
 require_supported_os() {
@@ -85,10 +98,102 @@ backup_existing() {
   local path=$1
   [[ -e "$path" ]] || return 0
   local backup_dir
-  backup_dir="/var/lib/vps-init-suite/backups/$(date +%Y%m%d-%H%M%S)"
+  backup_dir="/var/lib/vps-init-suite/backups/$(date +%Y%m%d-%H%M%S-%N)"
   mkdir -p "$backup_dir"
   cp -a "$path" "$backup_dir/$(basename "$path")"
   warn "Backed up ${path} to ${backup_dir}."
+}
+
+capture_original_sysctl_state() {
+  [[ -e "$ORIGINAL_SYSCTL_STATE" ]] && return 0
+  [[ -e "${STATE_DIR}/initial-sysctl-unavailable" ]] && return 0
+  if is_suite_managed_file "$INSTALLED_SCRIPT"; then
+    mkdir -p "$STATE_DIR"
+    : >"${STATE_DIR}/initial-sysctl-unavailable"
+    warn "An older suite installation already exists; its original runtime sysctl values were not recorded, so uninstall will not guess them."
+    return 0
+  fi
+  local key value
+  local keys=(
+    net.core.default_qdisc
+    net.ipv4.tcp_congestion_control net.ipv4.tcp_fastopen
+    net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default
+    net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.ip_forward
+    net.ipv6.conf.all.forwarding net.ipv6.conf.default.forwarding
+    net.ipv6.conf.all.accept_ra net.ipv6.conf.default.accept_ra
+    net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
+    net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_window_scaling
+    net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_timestamps net.ipv4.tcp_tw_reuse
+    net.core.somaxconn net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog
+    net.ipv4.tcp_syncookies net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_fin_timeout
+    net.ipv4.ip_local_port_range net.ipv4.tcp_keepalive_time
+    net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes
+    net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_tcp_timeout_established
+    fs.file-max fs.nr_open vm.swappiness
+  )
+  mkdir -p "$STATE_DIR"
+  : >"$ORIGINAL_SYSCTL_STATE"
+  chmod 0600 "$ORIGINAL_SYSCTL_STATE"
+  for key in "${keys[@]}"; do
+    if value=$(sysctl -n "$key" 2>/dev/null); then
+      printf '%s = %s\n' "$key" "$value" >>"$ORIGINAL_SYSCTL_STATE"
+    fi
+  done
+}
+
+capture_original_managed_file() {
+  local path=$1
+  local state_dir=${2:-$STATE_DIR}
+  local filename marker original
+  filename=$(basename "$path")
+  marker="${state_dir}/original-${filename}.present"
+  original="${state_dir}/original-${filename}"
+  mkdir -p "$state_dir"
+  if [[ -e "$marker" ]]; then
+    # Older builds could snapshot the suite's own file as if it were user data.
+    if [[ -e "$original" ]] && is_suite_managed_file "$original"; then
+      rm -f -- "$marker" "$original"
+      : >"${state_dir}/original-${filename}.absent"
+    fi
+    return 0
+  fi
+  [[ -e "${state_dir}/original-${filename}.absent" ]] && return 0
+  if [[ -e "$path" ]] && ! is_suite_managed_file "$path"; then
+    cp -a -- "$path" "$original"
+    : >"$marker"
+  else
+    : >"${state_dir}/original-${filename}.absent"
+  fi
+}
+
+is_suite_managed_file() {
+  [[ -f "$1" ]] || return 1
+  local filename
+  filename=$(basename "$1")
+  grep -qFx '# Managed by vps-init-suite.' "$1" ||
+    grep -qF 'jaycen-0502/vps-init-suite' "$1" ||
+    case "$filename" in
+      vps-init-suite.conf) grep -qx 'tcp_bbr' "$1" ;;
+      vps-init-suite) grep -q '^MSS_MODE=' "$1" ;;
+      vps-init-suite-mss.service) grep -qF 'Apply vps-init-suite TCP MSS policy' "$1" ;;
+      vps-init-suite-sysctl.service) grep -qF 'Apply vps-init-suite kernel parameters' "$1" ;;
+      apply-mss.sh) grep -qF '/etc/default/vps-init-suite' "$1" ;;
+      *) return 1 ;;
+    esac
+}
+
+find_latest_unmanaged_backup() {
+  local filename=$1 backup_root=${2:-/var/lib/vps-init-suite/backups}
+  local candidates backup
+  [[ -d "$backup_root" ]] || return 0
+  candidates=$(find "$backup_root" -type f -name "$filename" -print 2>/dev/null | sort -r || true)
+  while IFS= read -r backup; do
+    [[ -n "$backup" ]] || continue
+    if ! is_suite_managed_file "$backup"; then
+      printf '%s\n' "$backup"
+      return 0
+    fi
+  done <<<"$candidates"
 }
 
 show_status() {
@@ -103,12 +208,17 @@ show_status() {
     swap=$(free -h | awk '/^Swap:/ {print $2 " total, " $3 " used"}')
   fi
   if command -v iptables >/dev/null && iptables -w 2 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
-    mss=$(awk -F= '/^MSS_MODE=/{mode=$2} /^MSS_VALUE=/{value=$2} END {if (mode == "fixed") print mode " (" value ")"; else print mode}' "$MSS_CONFIG" 2>/dev/null || true)
+    mss=$(awk -F= '/^MSS_MODE=/{mode=$2} /^MSS_VALUE=/{value=$2} /^MSS_VALUE6=/{value6=$2} END {if (mode == "fixed") print mode " (" value ")"; else if (mode == "dual-fixed") print mode " (IPv4 " value ", IPv6 " value6 ")"; else print mode}' "$MSS_CONFIG" 2>/dev/null || true)
   fi
 
   printf '%s\n' "------------------------------------------------------------"
   printf 'Version:                 %s\n' "$SCRIPT_VERSION"
   printf 'Shortcut command:        %s\n' "$LAUNCHER_NAME"
+  if [[ -x "$LAUNCHER_PATH" ]]; then
+    printf 'Shortcut installed:      yes\n'
+  else
+    printf 'Shortcut installed:      no\n'
+  fi
   printf 'Congestion control:      %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
   printf 'Default qdisc:           %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
   printf 'TCP Fast Open:           %s (target: 3)\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
@@ -126,6 +236,9 @@ show_status() {
 tune_kernel() {
   require_root
   require_supported_os
+  assert_not_symlink "$SYSCTL_FILE"
+  assert_not_symlink "$SYSCTL_UNIT"
+  assert_not_symlink /etc/modules-load.d/vps-init-suite.conf
   apt_install kmod procps
 
   local ipv6_mode
@@ -137,6 +250,8 @@ tune_kernel() {
     die "This kernel does not expose BBR. Upgrade the kernel before applying this profile."
   fi
 
+  capture_original_sysctl_state
+  capture_original_managed_file "$SYSCTL_FILE"
   clean_conflicts
 
   local memory_mb
@@ -189,7 +304,6 @@ net.netfilter.nf_conntrack_tcp_timeout_established = 600"
     warn "nf_conntrack sysctl nodes are unavailable; skipping conntrack limits."
   fi
 
-  backup_existing "$SYSCTL_FILE"
   cat >"$SYSCTL_FILE" <<EOF
 # Managed by vps-init-suite.
 net.core.default_qdisc = fq
@@ -229,10 +343,13 @@ vm.swappiness = 10
 EOF
 
   cat >/etc/modules-load.d/vps-init-suite.conf <<'EOF'
+# Managed by vps-init-suite.
 tcp_bbr
 EOF
 
+  capture_original_managed_file "$SYSCTL_UNIT"
   cat >"$SYSCTL_UNIT" <<EOF
+# Managed by vps-init-suite.
 [Unit]
 Description=Apply vps-init-suite kernel parameters
 After=systemd-sysctl.service
@@ -439,6 +556,7 @@ setup_timezone() {
 setup_swap() {
   require_root
   require_supported_os
+  assert_not_symlink "$SWAP_SYSCTL_FILE"
   apt_install util-linux
 
   if [[ -n $(swapon --show=NAME --noheadings 2>/dev/null) ]]; then
@@ -458,8 +576,12 @@ setup_swap() {
   (( available_bytes >= required_bytes )) || die "Not enough free disk space for ${swap_gib} GiB swap plus 1 GiB headroom."
 
   if [[ -e "$SWAP_FILE" ]]; then
-    warn "Recreating inactive managed swap file ${SWAP_FILE}."
-    rm -f -- "$SWAP_FILE"
+    if [[ -e "${STATE_DIR}/managed-swap.present" ]]; then
+      warn "Recreating inactive managed swap file ${SWAP_FILE}."
+      rm -f -- "$SWAP_FILE"
+    else
+      die "${SWAP_FILE} already exists but is not verified as suite-managed; preserving it. Inspect the file before moving it and rerunning swap setup."
+    fi
   fi
   if ! fallocate -l "${swap_gib}G" "$SWAP_FILE"; then
     dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((swap_gib * 1024)) status=progress
@@ -468,7 +590,11 @@ setup_swap() {
   mkswap "$SWAP_FILE"
   swapon "$SWAP_FILE"
   grep -qF "$SWAP_FILE none swap sw 0 0" /etc/fstab || printf '%s\n' "$SWAP_FILE none swap sw 0 0" >>/etc/fstab
+  mkdir -p "$STATE_DIR"
+  : >"${STATE_DIR}/managed-swap.present"
 
+  capture_original_sysctl_state
+  capture_original_managed_file "$SWAP_SYSCTL_FILE"
   cat >"$SWAP_SYSCTL_FILE" <<'EOF'
 # Managed by vps-init-suite.
 vm.swappiness = 10
@@ -478,9 +604,12 @@ EOF
 }
 
 write_mss_helper() {
+  assert_not_symlink "$MSS_HELPER"
   mkdir -p "$(dirname "$MSS_HELPER")"
+  capture_original_managed_file "$MSS_HELPER"
   cat >"$MSS_HELPER" <<'EOF'
 #!/usr/bin/env bash
+# Managed by vps-init-suite.
 set -Eeuo pipefail
 
 # shellcheck disable=SC1091
@@ -541,6 +670,8 @@ EOF
 setup_mss() {
   require_root
   require_supported_os
+  assert_not_symlink "$MSS_CONFIG"
+  assert_not_symlink "$MSS_UNIT"
   local requested=${1:-clamp}
   local mode value value6
 
@@ -561,14 +692,18 @@ setup_mss() {
   fi
 
   apt_install iptables
+  capture_original_managed_file "$MSS_CONFIG"
   cat >"$MSS_CONFIG" <<EOF
+# Managed by vps-init-suite.
 MSS_MODE=${mode}
 MSS_VALUE=${value}
 MSS_VALUE6=${value6}
 EOF
   write_mss_helper
 
+  capture_original_managed_file "$MSS_UNIT"
   cat >"$MSS_UNIT" <<EOF
+# Managed by vps-init-suite.
 [Unit]
 Description=Apply vps-init-suite TCP MSS policy
 After=network-pre.target
@@ -622,12 +757,214 @@ uninstall_3xui() {
   log "3X-UI and its known local data paths were removed."
 }
 
+restore_conflict_backups() {
+  local filename backup
+  local restored=0
+  local backup_root="/var/lib/vps-init-suite/backups"
+  [[ -d "$backup_root" ]] || return 0
+
+  for filename in "${CONFLICT_FILES[@]}"; do
+    [[ "$filename" == "$(basename "$SYSCTL_FILE")" ]] && continue
+    backup=$(find_latest_unmanaged_backup "$filename" "$backup_root")
+    [[ -n "$backup" && ! -e "/etc/sysctl.d/${filename}" ]] || continue
+    cp -a -- "$backup" "/etc/sysctl.d/${filename}"
+    restored=$((restored + 1))
+  done
+  if (( restored > 0 )); then
+    log "Restored ${restored} backed-up third-party sysctl fragment(s). Review them for conflicts before reapplying tuning."
+  fi
+
+}
+
+restore_original_managed_files() {
+  local path filename marker original backup
+  for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" \
+    /etc/modules-load.d/vps-init-suite.conf "$MSS_CONFIG" "$MSS_HELPER" \
+    "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
+    filename=$(basename "$path")
+    marker="${STATE_DIR}/original-${filename}.present"
+    original="${STATE_DIR}/original-${filename}"
+    if [[ -e "$marker" && -e "$original" ]] && ! is_suite_managed_file "$original"; then
+      mkdir -p "$(dirname "$path")"
+      cp -a -- "$original" "$path"
+      log "Restored pre-existing ${filename}. Inspect it for conflicting tuning values."
+    elif [[ ! -e "$path" ]] && backup=$(find_latest_unmanaged_backup "$filename"); then
+      if [[ -n "$backup" ]]; then
+        cp -a -- "$backup" "$path"
+        warn "Restored legacy backup ${filename}; inspect it for conflicts."
+      fi
+    fi
+  done
+}
+
+restore_original_sysctl_state() {
+  local line key value
+  [[ -r "$ORIGINAL_SYSCTL_STATE" ]] || return 0
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] || continue
+    key=${line%%=*}
+    value=${line#*=}
+    key=${key//[[:space:]]/}
+    value=${value# }
+    sysctl -w "${key}=${value}" >/dev/null 2>&1 || warn "Could not restore runtime sysctl ${key}."
+  done <"$ORIGINAL_SYSCTL_STATE"
+}
+
+remove_managed_swap() {
+  local used_bytes="0"
+  [[ -e "${STATE_DIR}/managed-swap.present" ]] || die "The swap file is not verified as suite-managed; refusing to remove it."
+  if [[ -e "$SWAP_FILE" ]]; then
+    used_bytes=$(swapon --show=NAME,USED --bytes --noheadings --raw 2>/dev/null | awk -v file="$SWAP_FILE" '$1 == file {sum += $2} END {print sum + 0}')
+    if (( used_bytes > 0 )); then
+      die "Managed swap is in use (${used_bytes} bytes). Keep it, or free memory and run 'swapoff ${SWAP_FILE}' manually before uninstalling with --remove-swap."
+    fi
+    if swapon --show=NAME --noheadings --raw | grep -Fxq "$SWAP_FILE"; then
+      swapoff "$SWAP_FILE"
+    fi
+    rm -f -- "$SWAP_FILE"
+  fi
+  sed -i '\|^/swapfile-vps-init-suite none swap sw 0 0$|d' /etc/fstab
+  rm -f -- "${STATE_DIR}/managed-swap.present"
+  log "Managed swap file and fstab entry removed."
+}
+
+remove_managed_mss_rules() {
+  local binary chain rule mode value value6 expected_rule
+  local -a rule_args
+  mode=$(awk -F= '$1 == "MSS_MODE" {print $2; exit}' "$MSS_CONFIG" 2>/dev/null || true)
+  value=$(awk -F= '$1 == "MSS_VALUE" {print $2; exit}' "$MSS_CONFIG" 2>/dev/null || true)
+  value6=$(awk -F= '$1 == "MSS_VALUE6" {print $2; exit}' "$MSS_CONFIG" 2>/dev/null || true)
+  for binary in iptables ip6tables; do
+    command -v "$binary" >/dev/null || continue
+    "$binary" -w 5 -t mangle -S >/dev/null 2>&1 || continue
+    for chain in OUTPUT FORWARD; do
+      while "$binary" -w 5 -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; do
+        "$binary" -w 5 -t mangle -D "$chain" -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS || break
+      done
+    done
+    if "$binary" -w 5 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
+      expected_rule=""
+      case "$mode:$binary" in
+        clamp:*) expected_rule="-A VPS_INIT_MSS -j TCPMSS --clamp-mss-to-pmtu" ;;
+        fixed:iptables|fixed:ip6tables)
+          if [[ "$value" =~ ^[0-9]+$ ]]; then
+            expected_rule="-A VPS_INIT_MSS -j TCPMSS --set-mss ${value}"
+          fi
+          ;;
+        dual-fixed:iptables)
+          if [[ "$value" =~ ^[0-9]+$ ]]; then
+            expected_rule="-A VPS_INIT_MSS -j TCPMSS --set-mss ${value}"
+          fi
+          ;;
+        dual-fixed:ip6tables)
+          if [[ "$value6" =~ ^[0-9]+$ ]]; then
+            expected_rule="-A VPS_INIT_MSS -j TCPMSS --set-mss ${value6}"
+          fi
+          ;;
+      esac
+      while IFS= read -r rule; do
+        [[ -n "$expected_rule" && "$rule" == "$expected_rule" ]] || continue
+        read -r -a rule_args <<<"$rule"
+        "$binary" -w 5 -t mangle -D "${rule_args[@]:2}" || break
+      done < <("$binary" -w 5 -t mangle -S VPS_INIT_MSS 2>/dev/null)
+      if [[ -z $("$binary" -w 5 -t mangle -S VPS_INIT_MSS 2>/dev/null | sed -n '2p') ]]; then
+        "$binary" -w 5 -t mangle -X VPS_INIT_MSS || true
+      else
+        warn "Leaving non-suite rules in ${binary}'s VPS_INIT_MSS chain untouched."
+      fi
+    fi
+  done
+}
+
+remove_managed_file() {
+  local path=$1
+  [[ -e "$path" || -L "$path" ]] || return 0
+  if [[ "$path" == "$LAUNCHER_PATH" ]]; then
+    if [[ -L "$path" && $(readlink -f -- "$path") == "$INSTALLED_SCRIPT" ]]; then
+      rm -f -- "$path"
+    else
+      warn "Leaving unrelated shortcut path untouched: ${path}"
+    fi
+  elif is_suite_managed_file "$path"; then
+    rm -f -- "$path"
+  else
+    warn "Leaving unrecognized file untouched: ${path}"
+  fi
+}
+
+uninstall_suite() {
+  require_root
+  require_supported_os
+  local remove_swap=0
+  local assume_yes=0
+  local option
+  for option in "$@"; do
+    case "$option" in
+      --remove-swap) remove_swap=1 ;;
+      --yes) assume_yes=1 ;;
+      *) die "Unknown uninstall option: ${option}" ;;
+    esac
+  done
+
+  warn "This removes vps-init-suite services, sysctl files, MSS rules, and the vps-init command."
+  if (( remove_swap )); then
+    warn "--remove-swap also deletes the managed swap file; this is blocked if swap is in use."
+  else
+    log "Managed swap will be preserved by default."
+  fi
+
+  if (( ! assume_yes )); then
+    [[ -t 0 ]] || die "Interactive confirmation required. Use 'uninstall --yes' (and optionally --remove-swap)."
+    read -r -p "Type REMOVE-VPS-INIT to continue: " answer
+    [[ "$answer" == "REMOVE-VPS-INIT" ]] || { warn "Cancelled."; return 0; }
+  fi
+
+  if (( remove_swap )); then
+    remove_managed_swap
+  fi
+
+  remove_managed_mss_rules
+  if is_suite_managed_file "$MSS_UNIT"; then
+    systemctl disable --now vps-init-suite-mss.service >/dev/null 2>&1 || true
+  fi
+  if is_suite_managed_file "$SYSCTL_UNIT"; then
+    systemctl disable --now vps-init-suite-sysctl.service >/dev/null 2>&1 || true
+  fi
+  local managed_path
+  for managed_path in "$MSS_UNIT" "$SYSCTL_UNIT" \
+    /etc/modules-load.d/vps-init-suite.conf \
+    "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" \
+    "$MSS_CONFIG" "$MSS_HELPER" "$LAUNCHER_PATH" "$INSTALLED_SCRIPT"; do
+    remove_managed_file "$managed_path"
+  done
+  systemctl daemon-reload
+  systemctl reset-failed vps-init-suite-mss.service vps-init-suite-sysctl.service >/dev/null 2>&1 || true
+
+  restore_conflict_backups
+  restore_original_managed_files
+  if ! sysctl -e --system >/dev/null 2>&1; then
+    warn "Some remaining sysctl values could not be reapplied; review 'sysctl --system'."
+  fi
+  if [[ -e "${STATE_DIR}/initial-sysctl-unavailable" ]]; then
+    warn "Runtime sysctl baseline was not recorded by the older installation; restart to load the restored configuration files."
+  else
+    restore_original_sysctl_state
+  fi
+  rm -f -- "$ORIGINAL_SYSCTL_STATE" "${STATE_DIR}/initial-sysctl-unavailable" "$STATE_DIR"/original-*
+  rmdir "$STATE_DIR" 2>/dev/null || true
+  rmdir "$INSTALL_DIR" 2>/dev/null || true
+  log "vps-init-suite has been uninstalled. Backups remain under /var/lib/vps-init-suite/backups."
+}
+
 install_shortcut() {
   require_root
   require_supported_os
   local source_path=${BASH_SOURCE[0]:-}
   local temporary
 
+  assert_not_symlink "$INSTALLED_SCRIPT"
+  capture_original_managed_file "$INSTALLED_SCRIPT"
+  capture_original_managed_file "$LAUNCHER_PATH"
   mkdir -p "$INSTALL_DIR" "$(dirname "$LAUNCHER_PATH")"
   temporary=$(mktemp "${INSTALL_DIR}/setup.sh.XXXXXX")
 
@@ -705,9 +1042,13 @@ Commands:
   swap                     Create managed 2/4 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
   install                  Install the 'vps-init' shortcut command
+  select                   Choose an action interactively
   status                   Show current settings
+  uninstall [--remove-swap] Remove suite (preserves swap by default)
+  remove                   Alias for uninstall
   uninstall-3xui [--yes]   Permanently remove 3X-UI and known data paths
   update                   Download or pull the latest project version
+  upgrade                  Alias for update
   menu                     Open the interactive menu
   version                  Print the installed script version
 EOF
@@ -732,12 +1073,13 @@ menu() {
   5. Create swap
   6. Auto-detect timezone and enable NTP
   7. Remove 3X-UI
-  8. Update this project
-  9. Install/refresh shortcut (vps-init)
+  8. Upgrade/download latest script
+  9. Install/repair shortcut (vps-init)
  10. Enable/disable IPv6 forwarding
+ 11. Uninstall vps-init-suite (keeps swap)
   0. Exit
 EOF
-    read -r -p "Select [0-9]: " choice
+    read -r -p "Select [0-11]: " choice
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -749,8 +1091,43 @@ EOF
       8) update_self; pause_menu ;;
       9) install_shortcut; pause_menu ;;
       10) tune_kernel; pause_menu ;;
+      11) uninstall_suite; return $? ;;
       0) return 0 ;;
       *) warn "Invalid choice."; pause_menu ;;
+    esac
+  done
+}
+
+select_menu() {
+  local choice
+  while true; do
+    printf '\nVPS Init - choose an action\n'
+    printf '%s\n' \
+      "  1. Full initialization" \
+      "  2. Kernel settings (including IPv6 choice)" \
+      "  3. Timezone and time synchronization" \
+      "  4. Create swap if missing" \
+      "  5. Configure MSS clamp-to-PMTU" \
+      "  6. Install/refresh vps-init shortcut" \
+      "  7. Show status" \
+      "  8. Upgrade/download latest script" \
+      "  9. Uninstall suite (keep swap)" \
+      " 10. Uninstall suite and remove managed swap" \
+      "  0. Exit"
+    read -r -p "Select [0-10]: " choice
+    case "$choice" in
+      1) full_init ;;
+      2) tune_kernel ;;
+      3) setup_timezone auto ;;
+      4) setup_swap ;;
+      5) setup_mss clamp ;;
+      6) install_shortcut ;;
+      7) show_status ;;
+      8) update_self ;;
+      9) uninstall_suite; return $? ;;
+      10) uninstall_suite --remove-swap; return $? ;;
+      0) return 0 ;;
+      *) warn "Invalid choice." ;;
     esac
   done
 }
@@ -767,9 +1144,11 @@ main() {
     swap) setup_swap ;;
     timezone) setup_timezone "${2:-auto}" ;;
     install|shortcut) install_shortcut ;;
+    select|choose) select_menu ;;
+    uninstall|remove) uninstall_suite "${@:2}" ;;
     status) show_status ;;
     uninstall-3xui) uninstall_3xui "${2:-}" ;;
-    update) update_self ;;
+    update|upgrade) update_self ;;
     menu) menu ;;
     version|--version|-v) printf '%s\n' "$SCRIPT_VERSION" ;;
     help|--help|-h) usage ;;

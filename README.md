@@ -15,6 +15,7 @@
 - 优先使用 `systemd-timesyncd`，在 D-Bus/timesyncd 不可用时回退到 chrony 和本地时区软链接。
 - 可选彻底清理 3X-UI 服务及已知数据目录。
 - 完整初始化后安装 `vps-init` 快捷命令，随时打开菜单或执行子命令。
+- 提供首次安装、已安装机器交互选择、保留 SWAP 卸载和显式删除受管 SWAP。
 
 ## 支持系统
 
@@ -67,7 +68,38 @@ vps-init status
 vps-init ipv6 on
 ```
 
+不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令和卸载套件等选项。也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
+
 快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。只读的 `status`、`version`、`help` 不需要 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
+
+## 已安装机器：选择操作或卸载
+
+旧版本先刷新脚本，再打开新菜单：
+
+```bash
+vps-init update
+vps-init select
+```
+
+交互式选择操作：
+
+```bash
+vps-init select
+```
+
+直接卸载本套件（会要求输入确认短语）：
+
+```bash
+vps-init uninstall
+```
+
+卸载默认保留 SWAP。只有确定要删除本套件创建的 SWAP 时才使用：
+
+```bash
+vps-init uninstall --remove-swap
+```
+
+如果受管 SWAP 正在使用，脚本会拒绝删除，避免关闭活跃 swap 造成低内存 VPS OOM；对旧版本留下、无法证明归属的同名 swap 文件也会拒绝删除。卸载会移除本项目的 sysctl/systemd/MSS 规则和快捷命令，并尝试恢复此前备份的 sysctl 碎片及首次安装时记录的运行时 sysctl 值；备份目录 `/var/lib/vps-init-suite/backups/` 会保留。对于升级前已安装的旧版本，原始运行时值从未记录，脚本不会猜测，卸载时会提示重启以加载还原后的配置。系统时间和已安装依赖包不会自动回滚。卸载后建议重启并检查网络转发状态。
 
 需要交互式菜单：
 
@@ -101,6 +133,10 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 | `sudo ./setup.sh timezone America/Los_Angeles` | 手动指定 IANA 时区 |
 | `sudo ./setup.sh timezone keep` | 保留当前时区，仅启用网络时间同步 |
 | `sudo ./setup.sh install` | 单独安装或刷新 `vps-init` 快捷命令 |
+| `vps-init upgrade` | 下载并安装最新脚本版本 |
+| `vps-init select` | 已安装机器打开操作选择器 |
+| `vps-init uninstall` | 卸载本套件，默认保留 SWAP |
+| `vps-init uninstall --remove-swap` | 卸载并删除空闲的本套件 SWAP |
 | `./setup.sh status` | 查看当前状态 |
 | `sudo ./setup.sh uninstall-3xui` | 交互确认后清理 3X-UI |
 | `sudo ./setup.sh update` | 更新仓库或下载最新脚本 |
@@ -130,8 +166,9 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 
 ```bash
 bash -n setup.sh
-shellcheck setup.sh tests/timezone_test.sh
+shellcheck setup.sh tests/timezone_test.sh tests/profile_test.sh
 bash tests/timezone_test.sh
+bash tests/profile_test.sh
 ```
 
 ## 许可证
