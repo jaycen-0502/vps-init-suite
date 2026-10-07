@@ -1081,11 +1081,12 @@ menu() {
   7. Remove 3X-UI
   8. Upgrade/download latest script
   9. Install/repair shortcut (vps-init)
- 10. Enable/disable IPv6 forwarding
- 11. Uninstall vps-init-suite (keeps swap)
+ 10. Enable IPv6 forwarding
+ 11. Disable IPv6 forwarding
+ 12. Uninstall vps-init-suite (keeps swap)
   0. Exit
 EOF
-    read -r -p "Select [0-11]: " choice
+    read -r -p "Select [0-12]: " choice
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -1096,8 +1097,9 @@ EOF
       7) uninstall_3xui; pause_menu ;;
       8) update_self; pause_menu ;;
       9) install_shortcut; pause_menu ;;
-      10) tune_kernel; pause_menu ;;
-      11) uninstall_suite; return $? ;;
+      10) tune_kernel on; pause_menu ;;
+      11) tune_kernel off; pause_menu ;;
+      12) uninstall_suite; return $? ;;
       0) return 0 ;;
       *) warn "Invalid choice."; pause_menu ;;
     esac
@@ -1119,8 +1121,10 @@ select_menu() {
       "  8. Upgrade/download latest script" \
       "  9. Uninstall suite (keep swap)" \
       " 10. Uninstall suite and remove managed swap" \
+      " 11. Enable IPv6 forwarding" \
+      " 12. Disable IPv6 forwarding" \
       "  0. Exit"
-    read -r -p "Select [0-10]: " choice
+    read -r -p "Select [0-12]: " choice
     case "$choice" in
       1) full_init ;;
       2) tune_kernel ;;
@@ -1132,6 +1136,8 @@ select_menu() {
       8) update_self ;;
       9) uninstall_suite; return $? ;;
       10) uninstall_suite --remove-swap; return $? ;;
+      11) tune_kernel on ;;
+      12) tune_kernel off ;;
       0) return 0 ;;
       *) warn "Invalid choice." ;;
     esac

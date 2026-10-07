@@ -68,7 +68,7 @@ vps-init status
 vps-init ipv6 on
 ```
 
-不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令和卸载套件等选项。也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
+不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令、开启/禁用 IPv6 转发和卸载套件等选项。这里的“禁用 IPv6”仅关闭内核转发，不会关闭本机 IPv6 出站；也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
 
 快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。只读的 `status`、`version`、`help` 不需要 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
 
@@ -125,6 +125,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 | `sudo ./setup.sh full Asia/Tokyo off` | 完整初始化并关闭 IPv6 转发 |
 | `sudo ./setup.sh kernel on` | 仅应用内核参数并开启 IPv6 转发 |
 | `sudo ./setup.sh ipv6 off` | 关闭 IPv6 转发（默认策略） |
+| `vps-init` 菜单中的“禁用 IPv6 转发” | 关闭 IPv6 forwarding，保留普通 IPv6 出站 |
 | `sudo ./setup.sh mss clamp` | 使用路径 MTU 自动钳制 MSS（默认） |
 | `sudo ./setup.sh mss 1380` | 将 MSS 固定为 1380，可使用 1200-1460 |
 | `sudo ./setup.sh mss dual-fixed` | IPv4 固定 1380、IPv6 固定 1340 |
