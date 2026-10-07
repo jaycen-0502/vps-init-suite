@@ -256,18 +256,21 @@ tune_kernel() {
 
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
-  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog syn_backlog tw_buckets conntrack_config ipv6_config
+  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog syn_backlog tw_buckets keepalive_time keepalive_intvl keepalive_probes conntrack_config ipv6_config
   if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
-    profile="low-memory (4 MiB buffers)"
+    profile="low-memory high-concurrency (4 MiB buffers)"
     rmem_max=4194304
     wmem_max=4194304
-    rmem_default=131072
-    wmem_default=131072
+    rmem_default=65536
+    wmem_default=65536
     file_max=262144
     conntrack_max=65536
-    backlog=4096
-    syn_backlog=2048
-    tw_buckets=20000
+    backlog=8192
+    syn_backlog=4096
+    tw_buckets=32768
+    keepalive_time=300
+    keepalive_intvl=15
+    keepalive_probes=3
   else
     profile="standard (16 MiB buffers)"
     rmem_max=16777216
@@ -279,6 +282,9 @@ tune_kernel() {
     backlog=8192
     syn_backlog=8192
     tw_buckets=50000
+    keepalive_time=120
+    keepalive_intvl=15
+    keepalive_probes=5
   fi
   log "Detected ${memory_mb} MiB RAM; applying ${profile} profile."
 
@@ -313,7 +319,7 @@ net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${wmem_max}
 net.core.rmem_default = ${rmem_default}
 net.core.wmem_default = ${wmem_default}
-net.ipv4.tcp_rmem = 4096 87380 ${rmem_max}
+net.ipv4.tcp_rmem = 4096 65536 ${rmem_max}
 net.ipv4.tcp_wmem = 4096 65536 ${wmem_max}
 net.ipv4.ip_forward = 1
 ${ipv6_config}
@@ -333,9 +339,9 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_max_tw_buckets = ${tw_buckets}
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.ip_local_port_range = 10240 65535
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_time = ${keepalive_time}
+net.ipv4.tcp_keepalive_intvl = ${keepalive_intvl}
+net.ipv4.tcp_keepalive_probes = ${keepalive_probes}
 ${conntrack_config}
 fs.file-max = ${file_max}
 fs.nr_open = ${file_max}
