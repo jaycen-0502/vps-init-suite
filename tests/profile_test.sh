@@ -25,6 +25,7 @@ assert_equal "on" "$(normalize_ipv6_mode on)"
 assert_equal "on" "$(normalize_ipv6_mode enabled)"
 assert_equal "off" "$(normalize_ipv6_mode disabled)"
 assert_equal "off" "$(resolve_ipv6_mode "")"
+assert_equal "on" "$(resolve_ipv6_mode on)"
 is_root_command uninstall
 is_root_command select
 if is_root_command status; then

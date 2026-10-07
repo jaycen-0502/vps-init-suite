@@ -241,8 +241,13 @@ tune_kernel() {
   assert_not_symlink /etc/modules-load.d/vps-init-suite.conf
   apt_install kmod procps
 
-  local ipv6_mode
-  ipv6_mode=$(resolve_ipv6_mode "${1:-}")
+  local ipv6_mode requested_ipv6
+  requested_ipv6=${1:-}
+  if [[ -z "$requested_ipv6" ]] && [[ -r /proc/sys/net/ipv6/conf/all/forwarding ]]; then
+    requested_ipv6=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)
+    [[ "$requested_ipv6" == "1" ]] && requested_ipv6=on || requested_ipv6=off
+  fi
+  ipv6_mode=$(resolve_ipv6_mode "$requested_ipv6")
 
   modprobe tcp_bbr 2>/dev/null || true
   modprobe nf_conntrack 2>/dev/null || true
@@ -1119,12 +1124,13 @@ select_menu() {
       "  6. Install/refresh vps-init shortcut" \
       "  7. Show status" \
       "  8. Upgrade/download latest script" \
-      "  9. Uninstall suite (keep swap)" \
-      " 10. Uninstall suite and remove managed swap" \
-      " 11. Enable IPv6 forwarding" \
-      " 12. Disable IPv6 forwarding" \
+      "  9. Install/repair shortcut (vps-init)" \
+      " 10. Enable IPv6 forwarding" \
+      " 11. Disable IPv6 forwarding" \
+      " 12. Uninstall suite (keep swap)" \
+      " 13. Uninstall suite and remove managed swap" \
       "  0. Exit"
-    read -r -p "Select [0-12]: " choice
+    read -r -p "Select [0-13]: " choice
     case "$choice" in
       1) full_init ;;
       2) tune_kernel ;;
@@ -1134,10 +1140,11 @@ select_menu() {
       6) install_shortcut ;;
       7) show_status ;;
       8) update_self ;;
-      9) uninstall_suite; return $? ;;
-      10) uninstall_suite --remove-swap; return $? ;;
-      11) tune_kernel on ;;
-      12) tune_kernel off ;;
+      9) install_shortcut ;;
+      10) tune_kernel on ;;
+      11) tune_kernel off ;;
+      12) uninstall_suite; return $? ;;
+      13) uninstall_suite --remove-swap; return $? ;;
       0) return 0 ;;
       *) warn "Invalid choice." ;;
     esac
