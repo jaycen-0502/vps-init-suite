@@ -18,7 +18,11 @@ jobs:
         run: shellcheck setup.sh tests/timezone_test.sh tests/profile_test.sh
       - name: Check Bash syntax
         run: bash -n setup.sh tests/timezone_test.sh tests/profile_test.sh
+      - name: Check Python syntax
+        run: python3 -m py_compile xui-policy.py tests/xui_policy_test.py
       - name: Test timezone detection
         run: bash tests/timezone_test.sh
       - name: Test memory profiles
         run: bash tests/profile_test.sh
+      - name: Test 3X-UI policy helper
+        run: python3 tests/xui_policy_test.py

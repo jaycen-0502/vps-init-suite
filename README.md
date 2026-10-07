@@ -14,6 +14,7 @@
 - 通过三个 HTTPS 地理服务依次探测公网出口时区，并启用网络时间同步。
 - 优先使用 `systemd-timesyncd`，在 D-Bus/timesyncd 不可用时回退到 chrony 和本地时区软链接。
 - 可选彻底清理 3X-UI 服务及已知数据目录。
+- 可选安全调整 3X-UI 的 Xray `policy.levels[0]`：先停面板、备份 SQLite、修改后校验并重启，失败时保留备份并尝试恢复。
 - 完整初始化后安装 `vps-init` 快捷命令，随时打开菜单或执行子命令。
 - 提供首次安装、已安装机器交互选择、保留 SWAP 卸载和显式删除受管 SWAP。
 
@@ -68,9 +69,11 @@ vps-init status
 vps-init ipv6 on
 ```
 
-不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令、开启/禁用 IPv6 转发和卸载套件等选项。这里的“禁用 IPv6”仅关闭内核转发，不会关闭本机 IPv6 出站；也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
+不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令、开启/禁用 IPv6 转发、3X-UI policy 和卸载套件等选项。这里的“禁用 IPv6”仅关闭内核转发，不会关闭本机 IPv6 出站；也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
 
-快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。只读的 `status`、`version`、`help` 不需要 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
+如果安装了 3X-UI，还可以在菜单中进入 `3X-UI / Xray connection policy`，查看或调整连接空闲策略。首次进入会按需安装 Python 辅助程序。
+
+快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。常规只读的 `status`、`version`、`help` 不需要 root；`xui-policy` 还要读取通常仅 root 可读的 3X-UI 数据库，因此会自动请求 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
 
 ## 已安装机器：选择操作或卸载
 
@@ -139,6 +142,11 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 | `vps-init uninstall` | 卸载本套件，默认保留 SWAP |
 | `vps-init uninstall --remove-swap` | 卸载并删除空闲的本套件 SWAP |
 | `./setup.sh status` | 查看当前状态 |
+| `vps-init xui-policy status` | 查看 3X-UI Xray policy（只读） |
+| `vps-init xui-policy stable` | 设置稳定长连接档：`connIdle=300`、`uplinkOnly=2`、`downlinkOnly=5` |
+| `vps-init xui-policy high-concurrency` | 设置 1G 高并发档：`connIdle=120`、`uplinkOnly=2`、`downlinkOnly=5` |
+| `vps-init xui-policy set 120 2 5` | 交互确认后设置自定义 policy 值 |
+| `vps-init xui-policy restore` | 交互确认后恢复最近一次已验证的 policy 备份 |
 | `sudo ./setup.sh uninstall-3xui` | 交互确认后清理 3X-UI |
 | `sudo ./setup.sh update` | 更新仓库或下载最新脚本 |
 
@@ -160,6 +168,10 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 - MSS 使用专用 `VPS_INIT_MSS` 链和注释标记，不保存或覆盖整套防火墙规则。
 - 完整初始化默认使用 `clamp-to-PMTU`；只有明确执行 `mss dual-fixed` 才会使用 IPv4 1380 / IPv6 1340 固定值。
 - 已存在任何活动 SWAP 时不会修改；磁盘余量不足时不会创建新文件。
+- 3X-UI policy 工具只支持 SQLite，默认读取 `/etc/x-ui/x-ui.db`，也会识别 `XUI_DB_FOLDER`；检测到 PostgreSQL 等其他后端时会拒绝修改。
+- 3X-UI policy 工具只修改 `xrayTemplateConfig` 中的 `policy.levels[0]`，不会覆盖入站、出站、路由或用户数据；修改前会停止 `x-ui.service` 并创建完整性校验过的备份。
+- `connIdle` 是空闲连接超时，不是连接总生命周期；活跃流量、LINE/Telegram/WebSocket/HTTP2 心跳可能让连接继续保持。过短的 `uplinkOnly` 或 `downlinkOnly` 可能造成正常长连接重连，建议先使用稳定档。
+- policy 修改会重启 `x-ui.service`，现有代理连接可能短暂重连；若重启失败，脚本会尝试恢复之前的 policy 并重新启动服务。备份保留在 `/var/lib/vps-init-suite/backups/3xui/`。
 - 3X-UI 清理是不可逆操作，交互模式要求输入 `REMOVE`；自动化必须显式传入 `--yes`。
 - 内核不提供 BBR 时，脚本会停止并提示升级，不会伪装成成功。
 
@@ -172,6 +184,8 @@ bash -n setup.sh
 shellcheck setup.sh tests/timezone_test.sh tests/profile_test.sh
 bash tests/timezone_test.sh
 bash tests/profile_test.sh
+python3 -m py_compile xui-policy.py tests/xui_policy_test.py
+python3 tests/xui_policy_test.py
 ```
 
 ## 许可证

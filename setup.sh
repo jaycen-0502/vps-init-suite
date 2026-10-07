@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.5.1"
+readonly SCRIPT_VERSION="1.6.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -18,7 +18,9 @@ readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
 readonly STATE_DIR="/var/lib/vps-init-suite/state"
 readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
-readonly ROOT_COMMANDS=(full kernel ipv6 mss swap timezone install select menu uninstall remove uninstall-3xui update upgrade)
+readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
+readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
+readonly ROOT_COMMANDS=(full kernel ipv6 mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
   99-network-bbr.conf 99-optimal-proxy.conf 99-sysctl.conf 99-tcp-custom.conf
@@ -35,10 +37,19 @@ else
 fi
 
 APT_UPDATED=0
+XUI_POLICY_SERVICE_STOPPED=0
 
 log() { printf '%s\n' "${GREEN}$*${RESET}"; }
 warn() { printf '%s\n' "${YELLOW}$*${RESET}" >&2; }
-die() { printf '%s\n' "${RED}Error: $*${RESET}" >&2; exit 1; }
+die() {
+  # Never leave 3X-UI stopped if an explicit error exits this script.
+  if (( XUI_POLICY_SERVICE_STOPPED )); then
+    systemctl start x-ui.service >/dev/null 2>&1 || true
+    XUI_POLICY_SERVICE_STOPPED=0
+  fi
+  printf '%s\n' "${RED}Error: $*${RESET}" >&2
+  exit 1
+}
 
 assert_not_symlink() {
   [[ ! -L "$1" ]] || die "Refusing to write through symlink ${1}; inspect or remove it first."
@@ -46,6 +57,10 @@ assert_not_symlink() {
 
 on_error() {
   local exit_code=$?
+  if (( XUI_POLICY_SERVICE_STOPPED )); then
+    systemctl start x-ui.service >/dev/null 2>&1 || true
+    XUI_POLICY_SERVICE_STOPPED=0
+  fi
   printf '%s\n' "${RED}Failed at line ${BASH_LINENO[0]} (exit ${exit_code}).${RESET}" >&2
   exit "$exit_code"
 }
@@ -178,6 +193,7 @@ is_suite_managed_file() {
       vps-init-suite-mss.service) grep -qF 'Apply vps-init-suite TCP MSS policy' "$1" ;;
       vps-init-suite-sysctl.service) grep -qF 'Apply vps-init-suite kernel parameters' "$1" ;;
       apply-mss.sh) grep -qF '/etc/default/vps-init-suite' "$1" ;;
+      xui-policy.py) grep -qF 'SETTING_KEY = "xrayTemplateConfig"' "$1" ;;
       *) return 1 ;;
     esac
 }
@@ -768,6 +784,178 @@ uninstall_3xui() {
   log "3X-UI and its known local data paths were removed."
 }
 
+install_xui_policy_helper() {
+  require_root
+  require_supported_os
+  command -v python3 >/dev/null || apt_install python3
+  assert_not_symlink "$XUI_POLICY_HELPER"
+  capture_original_managed_file "$XUI_POLICY_HELPER"
+  mkdir -p "$INSTALL_DIR"
+  local source_path=${1:-${BASH_SOURCE[0]:-}}
+  local source_helper=""
+  local temporary
+  if [[ -n "$source_path" && "$source_path" != "$INSTALLED_SCRIPT" && "$source_path" != "bash" && "$source_path" != "/dev/stdin" && -f "$source_path" ]]; then
+    source_helper="$(dirname -- "$source_path")/xui-policy.py"
+  fi
+  temporary=$(mktemp "${INSTALL_DIR}/xui-policy.py.XXXXXX")
+  if [[ -n "$source_helper" && -f "$source_helper" ]]; then
+    install -m 0755 "$source_helper" "$temporary"
+  else
+    command -v curl >/dev/null || apt_install ca-certificates curl
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --silent --show-error --fail \
+      "https://raw.githubusercontent.com/${REPO_SLUG}/main/xui-policy.py" -o "$temporary"
+    chmod 0755 "$temporary"
+  fi
+  python3 - "$temporary" <<'PY'
+import pathlib
+import sys
+compile(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[1], "exec")
+PY
+  mv -f -- "$temporary" "$XUI_POLICY_HELPER"
+  log "3X-UI policy helper installed."
+}
+
+ensure_xui_policy_helper() {
+  if [[ -x "$XUI_POLICY_HELPER" ]] && is_suite_managed_file "$XUI_POLICY_HELPER"; then
+    return 0
+  fi
+  install_xui_policy_helper >&2
+}
+
+xui_policy_database() {
+  ensure_xui_policy_helper
+  python3 "$XUI_POLICY_HELPER" locate
+}
+
+xui_policy_stop_service() {
+  XUI_POLICY_SERVICE_STOPPED=0
+  if systemctl is-active --quiet x-ui.service; then
+    systemctl stop x-ui.service
+    XUI_POLICY_SERVICE_STOPPED=1
+  fi
+}
+
+xui_policy_start_service() {
+  if (( XUI_POLICY_SERVICE_STOPPED )); then
+    systemctl start x-ui.service
+    systemctl is-active --quiet x-ui.service || return 1
+    XUI_POLICY_SERVICE_STOPPED=0
+  fi
+}
+
+xui_policy_apply() {
+  local seconds=$1 uplink=$2 downlink=$3
+  local database backup
+  [[ -t 0 ]] || die "Interactive confirmation is required before editing the 3X-UI database."
+  database=$(xui_policy_database) || die "Could not locate the 3X-UI SQLite database."
+  python3 "$XUI_POLICY_HELPER" show "$database"
+  warn "This changes Xray policy level 0 and restarts x-ui.service; active proxy sessions may reconnect."
+  local answer
+  read -r -p "Type APPLY-XUI-POLICY to continue: " answer
+  [[ "$answer" == "APPLY-XUI-POLICY" ]] || { warn "Cancelled."; return 0; }
+  backup="${XUI_BACKUP_ROOT}/x-ui-$(date +%Y%m%d-%H%M%S-%N).db"
+  mkdir -p "$XUI_BACKUP_ROOT"
+  chmod 0700 "$XUI_BACKUP_ROOT"
+  xui_policy_stop_service
+  if ! python3 "$XUI_POLICY_HELPER" backup "$database" "$backup"; then
+    xui_policy_start_service || true
+    die "Could not create a verified 3X-UI database backup; no policy change was made."
+  fi
+  if ! python3 "$XUI_POLICY_HELPER" set "$database" "$seconds" "$uplink" "$downlink"; then
+    python3 "$XUI_POLICY_HELPER" restore-policy "$database" "$backup" >/dev/null 2>&1 || true
+    xui_policy_start_service || true
+    die "Could not update the 3X-UI policy; the backup was kept at ${backup}."
+  fi
+  if ! xui_policy_start_service; then
+    warn "3X-UI failed to restart after the policy change; restoring the verified backup."
+    python3 "$XUI_POLICY_HELPER" restore-policy "$database" "$backup" || true
+    systemctl start x-ui.service >/dev/null 2>&1 || true
+    XUI_POLICY_SERVICE_STOPPED=0
+    die "3X-UI did not restart cleanly; the previous database was restored."
+  fi
+  log "3X-UI policy updated. Verified backup: ${backup}"
+}
+
+xui_policy_restore_latest() {
+  local database backup
+  database=$(xui_policy_database) || die "Could not locate the 3X-UI SQLite database."
+  backup=$(find "$XUI_BACKUP_ROOT" -maxdepth 1 -type f -name 'x-ui-*.db' -printf '%f\n' 2>/dev/null | sort -r | head -n 1)
+  [[ -n "$backup" ]] || die "No vps-init-suite 3X-UI policy backup was found."
+  backup="${XUI_BACKUP_ROOT}/${backup}"
+  warn "This will restore the 3X-UI database backup: ${backup}"
+  [[ -t 0 ]] || die "Interactive confirmation required for database restore."
+  local answer
+  read -r -p "Type RESTORE-3XUI to continue: " answer
+  [[ "$answer" == "RESTORE-3XUI" ]] || { warn "Cancelled."; return 0; }
+  xui_policy_stop_service
+  if ! python3 "$XUI_POLICY_HELPER" restore-policy "$database" "$backup"; then
+    xui_policy_start_service || true
+    die "Could not restore the 3X-UI database backup."
+  fi
+  xui_policy_start_service || die "3X-UI did not restart after database restore."
+  log "3X-UI database restored from ${backup}."
+}
+
+xui_policy_menu() {
+  local choice seconds uplink downlink
+  while true; do
+    printf '\n3X-UI / Xray policy\n'
+    printf '%s\n' \
+      "  1. Show current policy" \
+      "  2. Stable long-connection profile (connIdle 300, uplink 2, downlink 5)" \
+      "  3. 1G high-concurrency profile (connIdle 120, uplink 2, downlink 5)" \
+      "  4. Custom policy values" \
+      "  5. Restore latest verified database backup" \
+      "  0. Back"
+    read -r -p "Select [0-5]: " choice
+    case "$choice" in
+      1)
+        local database
+        database=$(xui_policy_database) || die "Could not locate the 3X-UI SQLite database."
+        python3 "$XUI_POLICY_HELPER" show "$database"
+        ;;
+      2) xui_policy_apply 300 2 5 ;;
+      3) xui_policy_apply 120 2 5 ;;
+      4)
+        read -r -p "connIdle seconds [120-86400]: " seconds
+        read -r -p "uplinkOnly seconds [0-86400]: " uplink
+        read -r -p "downlinkOnly seconds [0-86400]: " downlink
+        [[ "$seconds" =~ ^[0-9]+$ && "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ ]] || { warn "Values must be integers."; continue; }
+        (( seconds >= 60 && seconds <= 86400 && uplink >= 1 && uplink <= 86400 && downlink >= 1 && downlink <= 86400 )) || { warn "Values are outside the allowed range."; continue; }
+        xui_policy_apply "$seconds" "$uplink" "$downlink"
+        ;;
+      5) xui_policy_restore_latest ;;
+      0) return 0 ;;
+      *) warn "Invalid choice." ;;
+    esac
+  done
+}
+
+xui_policy() {
+  require_root
+  require_supported_os
+  local action=${1:-menu} database
+  case "$action" in
+    menu|select) xui_policy_menu ;;
+    status)
+      database=$(xui_policy_database) || die "Could not locate the 3X-UI SQLite database."
+      python3 "$XUI_POLICY_HELPER" show "$database"
+      ;;
+    stable) xui_policy_apply 300 2 5 ;;
+    high-concurrency) xui_policy_apply 120 2 5 ;;
+    set)
+      [[ $# -ge 2 && $# -le 4 ]] || die "Usage: vps-init xui-policy set CONN_IDLE [UPLINK_ONLY DOWNLINK_ONLY]"
+      [[ "$2" =~ ^[0-9]+$ ]] || die "connIdle must be an integer."
+      local uplink=${3:-2} downlink=${4:-5}
+      [[ "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ ]] || die "uplinkOnly/downlinkOnly must be integers."
+      (( 60 <= 10#$2 && 10#$2 <= 86400 && 1 <= 10#$uplink && 10#$uplink <= 86400 && 1 <= 10#$downlink && 10#$downlink <= 86400 )) || die "Policy values are outside the allowed range."
+      xui_policy_apply "$2" "$uplink" "$downlink"
+      ;;
+    restore) xui_policy_restore_latest ;;
+    *) die "Usage: vps-init xui-policy [status|stable|high-concurrency|set|restore|menu]" ;;
+  esac
+}
+
 restore_conflict_backups() {
   local filename backup
   local restored=0
@@ -791,7 +979,7 @@ restore_original_managed_files() {
   local path filename marker original backup
   for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" \
     /etc/modules-load.d/vps-init-suite.conf "$MSS_CONFIG" "$MSS_HELPER" \
-    "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
+    "$XUI_POLICY_HELPER" "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
     filename=$(basename "$path")
     marker="${STATE_DIR}/original-${filename}.present"
     original="${STATE_DIR}/original-${filename}"
@@ -945,7 +1133,7 @@ uninstall_suite() {
   for managed_path in "$MSS_UNIT" "$SYSCTL_UNIT" \
     /etc/modules-load.d/vps-init-suite.conf \
     "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" \
-    "$MSS_CONFIG" "$MSS_HELPER" "$LAUNCHER_PATH" "$INSTALLED_SCRIPT"; do
+    "$MSS_CONFIG" "$MSS_HELPER" "$XUI_POLICY_HELPER" "$LAUNCHER_PATH" "$INSTALLED_SCRIPT"; do
     remove_managed_file "$managed_path"
   done
   systemctl daemon-reload
@@ -1058,6 +1246,7 @@ Commands:
   uninstall [--remove-swap] Remove suite (preserves swap by default)
   remove                   Alias for uninstall
   uninstall-3xui [--yes]   Permanently remove 3X-UI and known data paths
+  xui-policy [action]      Inspect or tune 3X-UI Xray connection policy
   update                   Download or pull the latest project version
   upgrade                  Alias for update
   menu                     Open the interactive menu
@@ -1087,11 +1276,12 @@ menu() {
   8. Upgrade/download latest script
   9. Install/repair shortcut (vps-init)
  10. Enable IPv6 forwarding
- 11. Disable IPv6 forwarding
- 12. Uninstall vps-init-suite (keeps swap)
+  11. Disable IPv6 forwarding
+  12. Uninstall vps-init-suite (keeps swap)
+  13. 3X-UI / Xray connection policy
   0. Exit
 EOF
-    read -r -p "Select [0-12]: " choice
+    read -r -p "Select [0-13]: " choice
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -1105,6 +1295,7 @@ EOF
       10) tune_kernel on; pause_menu ;;
       11) tune_kernel off; pause_menu ;;
       12) uninstall_suite; return $? ;;
+      13) xui_policy_menu ;;
       0) return 0 ;;
       *) warn "Invalid choice."; pause_menu ;;
     esac
@@ -1129,8 +1320,9 @@ select_menu() {
       " 11. Disable IPv6 forwarding" \
       " 12. Uninstall suite (keep swap)" \
       " 13. Uninstall suite and remove managed swap" \
+      " 14. 3X-UI / Xray connection policy" \
       "  0. Exit"
-    read -r -p "Select [0-13]: " choice
+    read -r -p "Select [0-14]: " choice
     case "$choice" in
       1) full_init ;;
       2) tune_kernel ;;
@@ -1145,6 +1337,7 @@ select_menu() {
       11) tune_kernel off ;;
       12) uninstall_suite; return $? ;;
       13) uninstall_suite --remove-swap; return $? ;;
+      14) xui_policy_menu ;;
       0) return 0 ;;
       *) warn "Invalid choice." ;;
     esac
@@ -1167,6 +1360,7 @@ main() {
     uninstall|remove) uninstall_suite "${@:2}" ;;
     status) show_status ;;
     uninstall-3xui) uninstall_3xui "${2:-}" ;;
+    xui-policy|xray-policy) xui_policy "${@:2}" ;;
     update|upgrade) update_self ;;
     menu) menu ;;
     version|--version|-v) printf '%s\n' "$SCRIPT_VERSION" ;;
