@@ -910,7 +910,7 @@ install_xui_policy_helper() {
   assert_not_symlink "$XUI_POLICY_HELPER"
   capture_original_managed_file "$XUI_POLICY_HELPER"
   mkdir -p "$INSTALL_DIR"
-  local source_path=${1:-${BASH_SOURCE[0]:-}}
+  local source_path=${BASH_SOURCE[0]:-}
   local source_helper=""
   local temporary
   if [[ -n "$source_path" && "$source_path" != "$INSTALLED_SCRIPT" && "$source_path" != "bash" && "$source_path" != "/dev/stdin" && -f "$source_path" ]]; then
