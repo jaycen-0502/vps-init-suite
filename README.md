@@ -169,7 +169,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 - 低内存档的监听队列为 `somaxconn=8192`、`tcp_max_syn_backlog=4096`、`netdev_max_backlog=8192`；标准档提升到 `somaxconn=16384`、`tcp_max_syn_backlog=8192`、`netdev_max_backlog=16384`，不是无限增大；若 `ListenOverflows` 持续增长，应优先检查应用监听 backlog、CPU steal 和上游连接突发。
 - 两档 TCP keepalive 均采用 `300/15/3`，减少代理节点上大量空闲长连接的定时器开销；应用层心跳和 NAT 超时可能需要独立调整，内核 keepalive 不替代 Xray/3X-UI 的连接策略。
 - IPv6 默认不做路由转发；选择 `on` 时开启 forwarding 并使用 `accept_ra=2`，适合中转/路由节点。该选项不会关闭普通 IPv6 出站连接。
-- `nf_conntrack` 仅在内核实际暴露对应 sysctl 节点时配置；精简内核或容器环境会安全跳过，不会导致整套初始化失败。代理节点的 established 超时使用 7200 秒，避免旧版本的 600 秒过早清理长连接；是否真正经过 conntrack 仍由系统 NAT/防火墙决定。
+- `nf_conntrack` 仅在内核实际暴露对应 sysctl 节点时配置；精简内核或容器环境会安全跳过，不会导致整套初始化失败。代理节点的 established 超时保持 432000 秒（5 天），避免较短超时过早清理空闲长连接；是否真正经过 conntrack 仍由系统 NAT/防火墙决定。
 - MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。
 - 快捷入口为 `/usr/local/bin/vps-init`，实际脚本保存在 `/usr/local/lib/vps-init-suite/setup.sh`。
 - 时区探测依次查询 `ipwho.is`、`ipinfo.io` 和 `ipapi.co`；这些服务会看到 VPS 的公网出口 IP，但脚本不会向其发送其他机器数据。

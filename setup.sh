@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.8.0"
+readonly SCRIPT_VERSION="1.8.1"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -22,7 +22,7 @@ readonly STATE_DIR="/var/lib/vps-init-suite/state"
 readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
 readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
 readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
-readonly XUI_POLICY_HELPER_VERSION="1.8.0"
+readonly XUI_POLICY_HELPER_VERSION="1.8.1"
 readonly ROOT_COMMANDS=(full kernel ipv6 mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
@@ -366,11 +366,19 @@ net.ipv6.conf.default.accept_ra = 1"
   fi
 
   conntrack_config=""
-  if [[ -e /proc/sys/net/netfilter/nf_conntrack_max && -e /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established ]]; then
-    conntrack_config="net.netfilter.nf_conntrack_max = ${conntrack_max}
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200"
-  else
+  if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    conntrack_config="net.netfilter.nf_conntrack_max = ${conntrack_max}"
+  fi
+  if [[ -e /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established ]]; then
+    if [[ -n "$conntrack_config" ]]; then
+      conntrack_config+=$'\n'
+    fi
+    conntrack_config+="net.netfilter.nf_conntrack_tcp_timeout_established = 432000"
+  fi
+  if [[ -z "$conntrack_config" ]]; then
     warn "系统没有 nf_conntrack 参数节点，跳过连接跟踪限制。"
+  else
+    log "已按内核实际暴露的 conntrack 参数应用代理长连接保护。"
   fi
 
   cat >"$SYSCTL_FILE" <<EOF
@@ -416,6 +424,9 @@ EOF
 # Managed by vps-init-suite.
 tcp_bbr
 EOF
+  if [[ -n "$conntrack_config" && -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    printf '%s\n' nf_conntrack >>/etc/modules-load.d/vps-init-suite.conf
+  fi
 
   capture_original_managed_file "$SYSCTL_UNIT"
   cat >"$SYSCTL_UNIT" <<EOF
@@ -478,7 +489,8 @@ proxy_nofile_limit() {
 configure_xui_service_limits() {
   local file_limit=${1:?missing x-ui file limit}
   xui_service_detected || return 0
-  if [[ -e "$XUI_LIMITS_DIR" && -L "$XUI_LIMITS_DIR" ]]; then
+  systemctl cat x-ui.service >/dev/null 2>&1 || return 0
+  if [[ -L "$XUI_LIMITS_DIR" ]]; then
     warn "检测到 x-ui.service.d 是符号链接，跳过文件句柄 drop-in，避免写入未知位置。"
     return 0
   fi
@@ -1411,9 +1423,9 @@ menu() {
  11. 关闭 IPv6 转发
  12. 卸载 vps-init-suite（保留 SWAP）
  13. 3X-UI / Xray 连接策略
-  0. 退出
+ 14. 退出（也可输入 0）
 EOF
-    read -r -p "请选择 [0-13]: " choice
+    read -r -p "请选择 [0-14]: " choice
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -1428,7 +1440,7 @@ EOF
       11) tune_kernel off; pause_menu ;;
       12) uninstall_suite; return $? ;;
       13) xui_policy_menu ;;
-      0) return 0 ;;
+      14|0) return 0 ;;
       *) warn "无效选项。"; pause_menu ;;
     esac
   done
