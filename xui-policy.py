@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Managed by vps-init-suite.
 
-"""Safely inspect and adjust the Xray policy stored by 3X-UI."""
+"""安全查看和调整 3X-UI 中保存的 Xray policy。"""
 
 import json
 import os
@@ -25,12 +25,12 @@ def fail(message):
 def db_rows(connection):
     columns = {row[1] for row in connection.execute("PRAGMA table_info(settings)")}
     if not {"id", "key", "value"}.issubset(columns):
-        fail("The 3X-UI settings table has an unsupported schema; no changes were made.")
+        fail("3X-UI settings 表结构不受支持，未做任何修改。")
     rows = connection.execute(
         "SELECT id, value FROM settings WHERE key = ? ORDER BY id", (SETTING_KEY,)
     ).fetchall()
     if len(rows) != 1:
-        fail(f"Expected one {SETTING_KEY} row in the 3X-UI database; found {len(rows)}.")
+        fail(f"3X-UI 数据库应有一条 {SETTING_KEY} 记录，实际找到 {len(rows)} 条。")
     return rows[0]
 
 
@@ -49,9 +49,9 @@ def load_config(connection):
     try:
         config = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as error:
-        fail(f"Stored Xray template is not valid JSON: {error}")
+        fail(f"数据库中的 Xray 模板不是有效 JSON：{error}")
     if not isinstance(config, dict):
-        fail("Stored Xray template is not a JSON object; no changes were made.")
+        fail("数据库中的 Xray 模板不是 JSON 对象，未做任何修改。")
     return config
 
 
@@ -60,35 +60,35 @@ def show_policy(database):
         config = load_config(connection)
     policy = config.get("policy") or {}
     if not isinstance(policy, dict):
-        fail("The Xray policy field is not an object; no changes were made.")
+        fail("Xray policy 字段不是对象，未做任何修改。")
     levels = policy.get("levels") or {}
     if not isinstance(levels, dict):
-        fail("The Xray policy levels field is not an object; no changes were made.")
-    print("3X-UI Xray policy levels (only level 0 is changed by this tool):")
+        fail("Xray policy 的 levels 字段不是对象，未做任何修改。")
+    print("3X-UI Xray policy（本工具只修改 level 0）：")
     if not levels:
-        print("  No levels configured; effective connIdle uses Xray defaults.")
+        print("  未配置 levels，connIdle 将使用 Xray 默认值。")
     for key in sorted(levels, key=str):
         level = levels[key]
         if not isinstance(level, dict):
-            print(f"  level {key}: invalid value ({type(level).__name__})")
+            print(f"  level {key}：值无效（{type(level).__name__}）")
             continue
         fields = ("handshake", "connIdle", "uplinkOnly", "downlinkOnly", "bufferSize")
-        values = ", ".join(f"{field}={level.get(field, 'default')}" for field in fields)
-        print(f"  level {key}: {values}")
+        values = "，".join(f"{field}={level.get(field, '默认')}" for field in fields)
+        print(f"  level {key}：{values}")
 
 
 def backup_database(database, destination):
     destination = Path(destination)
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if destination.exists():
-        fail(f"Backup destination already exists: {destination}")
+        fail(f"备份目标已存在：{destination}")
     source = open_database(database, readonly=True)
     target = sqlite3.connect(destination)
     try:
         source.backup(target)
         result = target.execute("PRAGMA integrity_check").fetchone()[0]
         if result != "ok":
-            fail(f"Database backup failed integrity check: {result}")
+            fail(f"数据库备份完整性校验失败：{result}")
     finally:
         target.close()
         source.close()
@@ -102,7 +102,7 @@ def restore_database(database, backup):
         source.backup(target)
         result = target.execute("PRAGMA integrity_check").fetchone()[0]
         if result != "ok":
-            fail(f"Restored database failed integrity check: {result}")
+            fail(f"恢复后的数据库完整性校验失败：{result}")
     finally:
         target.close()
         source.close()
@@ -128,16 +128,16 @@ def restore_policy(database, backup):
         except Exception:
             target.rollback()
             raise
-    print("Restored only the Xray policy from the selected backup; other panel data was preserved.")
+    print("仅恢复了所选备份中的 Xray policy，其他面板数据已保留。")
 
 
 def set_policy(database, conn_idle, uplink_only=None, downlink_only=None):
     if not 60 <= conn_idle <= 86400:
-        fail("connIdle must be between 60 and 86400 seconds.")
+        fail("connIdle 必须在 60 到 86400 秒之间。")
     if uplink_only is not None and not 1 <= uplink_only <= 86400:
-        fail("uplinkOnly must be between 1 and 86400 seconds.")
+        fail("uplinkOnly 必须在 1 到 86400 秒之间。")
     if downlink_only is not None and not 1 <= downlink_only <= 86400:
-        fail("downlinkOnly must be between 1 and 86400 seconds.")
+        fail("downlinkOnly 必须在 1 到 86400 秒之间。")
     with closing(open_database(database)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -145,17 +145,17 @@ def set_policy(database, conn_idle, uplink_only=None, downlink_only=None):
             config = load_config(connection)
             policy = config.setdefault("policy", {})
             if not isinstance(policy, dict):
-                fail("The Xray policy field is not an object; no changes were made.")
+                fail("Xray policy 字段不是对象，未做任何修改。")
             levels = policy.setdefault("levels", {})
             if not isinstance(levels, dict):
-                fail("The Xray policy levels field is not an object; no changes were made.")
+                fail("Xray policy 的 levels 字段不是对象，未做任何修改。")
             level = levels.setdefault("0", {})
             if not isinstance(level, dict):
-                fail("Xray policy level 0 is not an object; no changes were made.")
+                fail("Xray policy level 0 不是对象，未做任何修改。")
             previous = {
-                "connIdle": level.get("connIdle", "unset (Xray default)"),
-                "uplinkOnly": level.get("uplinkOnly", "unset (Xray default)"),
-                "downlinkOnly": level.get("downlinkOnly", "unset (Xray default)"),
+                "connIdle": level.get("connIdle", "未设置（Xray 默认）"),
+                "uplinkOnly": level.get("uplinkOnly", "未设置（Xray 默认）"),
+                "downlinkOnly": level.get("downlinkOnly", "未设置（Xray 默认）"),
             }
             level["connIdle"] = conn_idle
             if uplink_only is not None:
@@ -171,10 +171,10 @@ def set_policy(database, conn_idle, uplink_only=None, downlink_only=None):
             connection.rollback()
             raise
     print(
-        "Updated policy level 0: "
-        f"connIdle {previous['connIdle']} -> {conn_idle}, "
-        f"uplinkOnly {previous['uplinkOnly']} -> {level.get('uplinkOnly', 'unset')}, "
-        f"downlinkOnly {previous['downlinkOnly']} -> {level.get('downlinkOnly', 'unset')}."
+        "已更新 policy level 0："
+        f"connIdle {previous['connIdle']} -> {conn_idle}，"
+        f"uplinkOnly {previous['uplinkOnly']} -> {level.get('uplinkOnly', 'unset')}，"
+        f"downlinkOnly {previous['downlinkOnly']} -> {level.get('downlinkOnly', 'unset')}。"
     )
 
 
@@ -232,13 +232,13 @@ def locate_database():
 
     backend = values.get("XUI_DB_TYPE", "sqlite").lower()
     if backend not in ("", "sqlite", "sqlite3"):
-        fail(f"3X-UI uses {backend} storage. This tool only supports SQLite and made no changes.")
+        fail(f"3X-UI 使用 {backend} 存储，本工具只支持 SQLite，未做任何修改。")
     folder = values.get("XUI_DB_FOLDER", "/etc/x-ui")
     if not folder.startswith("/"):
-        fail("XUI_DB_FOLDER must be an absolute path; refusing to guess the database location.")
+        fail("XUI_DB_FOLDER 必须是绝对路径，拒绝猜测数据库位置。")
     database = Path(folder) / "x-ui.db"
     if not database.is_file():
-        fail(f"3X-UI SQLite database not found: {database}")
+        fail(f"找不到 3X-UI SQLite 数据库：{database}")
     print(database)
 
 
@@ -252,24 +252,24 @@ def main(argv):
     elif len(argv) in (4, 6) and argv[1] == "set":
         seconds = int(argv[3])
         if not 60 <= seconds <= 86400:
-            fail("connIdle must be between 60 and 86400 seconds.")
+            fail("connIdle 必须在 60 到 86400 秒之间。")
         uplink = downlink = None
         if len(argv) == 6:
             uplink, downlink = int(argv[4]), int(argv[5])
             if not 1 <= uplink <= 86400 or not 1 <= downlink <= 86400:
-                fail("uplinkOnly and downlinkOnly must be between 1 and 86400 seconds.")
+                fail("uplinkOnly 和 downlinkOnly 必须在 1 到 86400 秒之间。")
         set_policy(argv[2], seconds, uplink, downlink)
     elif len(argv) == 4 and argv[1] == "restore":
         restore_database(argv[2], argv[3])
     elif len(argv) == 4 and argv[1] == "restore-policy":
         restore_policy(argv[2], argv[3])
     else:
-        fail("Usage: xui-policy.py locate|show DB|backup DB DEST|set DB SECONDS [UPLINK DOWNLINK]|restore DB BACKUP|restore-policy DB BACKUP")
+        fail("用法：xui-policy.py locate|show DB|backup DB DEST|set DB SECONDS [UPLINK DOWNLINK]|restore DB BACKUP|restore-policy DB BACKUP")
 
 
 if __name__ == "__main__":
     try:
         main(sys.argv)
     except (RuntimeError, sqlite3.Error, OSError, ValueError) as error:
-        print(f"xui-policy: {error}", file=sys.stderr)
+        print(f"xui-policy 错误：{error}", file=sys.stderr)
         sys.exit(1)

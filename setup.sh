@@ -839,7 +839,7 @@ import sys
 compile(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[1], "exec")
 PY
   mv -f -- "$temporary" "$XUI_POLICY_HELPER"
-  log "3X-UI policy helper installed."
+  log "3X-UI policy 辅助程序已安装。"
 }
 
 ensure_xui_policy_helper() {
@@ -873,53 +873,53 @@ xui_policy_start_service() {
 xui_policy_apply() {
   local seconds=$1 uplink=$2 downlink=$3
   local database backup
-  [[ -t 0 ]] || die "Interactive confirmation is required before editing the 3X-UI database."
-  database=$(xui_policy_database) || die "Could not locate the 3X-UI SQLite database."
+  [[ -t 0 ]] || die "修改 3X-UI 数据库前需要交互式确认。"
+  database=$(xui_policy_database) || die "找不到 3X-UI SQLite 数据库。"
   python3 "$XUI_POLICY_HELPER" show "$database"
-  warn "This changes Xray policy level 0 and restarts x-ui.service; active proxy sessions may reconnect."
+  warn "即将修改 Xray policy level 0，并重启 x-ui.service；现有代理连接可能短暂重连。"
   local answer
-  read -r -p "Type APPLY-XUI-POLICY to continue: " answer
-  [[ "$answer" == "APPLY-XUI-POLICY" ]] || { warn "Cancelled."; return 0; }
+  read -r -p "请输入 APPLY-XUI-POLICY 继续：" answer
+  [[ "$answer" == "APPLY-XUI-POLICY" ]] || { warn "已取消。"; return 0; }
   backup="${XUI_BACKUP_ROOT}/x-ui-$(date +%Y%m%d-%H%M%S-%N).db"
   mkdir -p "$XUI_BACKUP_ROOT"
   chmod 0700 "$XUI_BACKUP_ROOT"
   xui_policy_stop_service
   if ! python3 "$XUI_POLICY_HELPER" backup "$database" "$backup"; then
     xui_policy_start_service || true
-    die "Could not create a verified 3X-UI database backup; no policy change was made."
+    die "无法创建并校验 3X-UI 数据库备份，未修改 policy。"
   fi
   if ! python3 "$XUI_POLICY_HELPER" set "$database" "$seconds" "$uplink" "$downlink"; then
     python3 "$XUI_POLICY_HELPER" restore-policy "$database" "$backup" >/dev/null 2>&1 || true
     xui_policy_start_service || true
-    die "Could not update the 3X-UI policy; the backup was kept at ${backup}."
+    die "无法更新 3X-UI policy，备份仍保留在：${backup}"
   fi
   if ! xui_policy_start_service; then
-    warn "3X-UI failed to restart after the policy change; restoring the verified backup."
+    warn "修改 policy 后 3X-UI 重启失败，正在恢复已验证备份。"
     python3 "$XUI_POLICY_HELPER" restore-policy "$database" "$backup" || true
     systemctl start x-ui.service >/dev/null 2>&1 || true
     XUI_POLICY_SERVICE_STOPPED=0
-    die "3X-UI did not restart cleanly; the previous database was restored."
+    die "3X-UI 未能正常重启，已恢复之前的 policy。"
   fi
   log "3X-UI policy 已更新，已验证备份：${backup}"
 }
 
 xui_policy_restore_latest() {
   local database backup
-  database=$(xui_policy_database) || die "Could not locate the 3X-UI SQLite database."
+  database=$(xui_policy_database) || die "找不到 3X-UI SQLite 数据库。"
   backup=$(find "$XUI_BACKUP_ROOT" -maxdepth 1 -type f -name 'x-ui-*.db' -printf '%f\n' 2>/dev/null | sort -r | head -n 1)
-  [[ -n "$backup" ]] || die "No vps-init-suite 3X-UI policy backup was found."
+  [[ -n "$backup" ]] || die "没有找到 vps-init-suite 的 3X-UI policy 备份。"
   backup="${XUI_BACKUP_ROOT}/${backup}"
-  warn "This will restore the 3X-UI database backup: ${backup}"
-  [[ -t 0 ]] || die "Interactive confirmation required for database restore."
+  warn "即将恢复 3X-UI policy 备份：${backup}"
+  [[ -t 0 ]] || die "恢复数据库前需要交互式确认。"
   local answer
-  read -r -p "Type RESTORE-3XUI to continue: " answer
-  [[ "$answer" == "RESTORE-3XUI" ]] || { warn "Cancelled."; return 0; }
+  read -r -p "请输入 RESTORE-3XUI 继续：" answer
+  [[ "$answer" == "RESTORE-3XUI" ]] || { warn "已取消。"; return 0; }
   xui_policy_stop_service
   if ! python3 "$XUI_POLICY_HELPER" restore-policy "$database" "$backup"; then
     xui_policy_start_service || true
-    die "Could not restore the 3X-UI database backup."
+    die "无法恢复 3X-UI policy 备份。"
   fi
-  xui_policy_start_service || die "3X-UI did not restart after database restore."
+  xui_policy_start_service || die "恢复后 3X-UI 未能正常重启。"
   log "已从以下备份恢复 3X-UI policy：${backup}"
 }
 
@@ -958,7 +958,7 @@ xui_policy_menu() {
     case "$choice" in
       1)
         local database
-        database=$(xui_policy_database) || die "Could not locate the 3X-UI SQLite database."
+        database=$(xui_policy_database) || die "找不到 3X-UI SQLite 数据库。"
         python3 "$XUI_POLICY_HELPER" show "$database"
         ;;
       2) xui_policy_apply 300 2 5 ;;
@@ -985,21 +985,21 @@ xui_policy() {
   case "$action" in
     menu|select) xui_policy_menu ;;
     status)
-      database=$(xui_policy_database) || die "Could not locate the 3X-UI SQLite database."
+      database=$(xui_policy_database) || die "找不到 3X-UI SQLite 数据库。"
       python3 "$XUI_POLICY_HELPER" show "$database"
       ;;
     stable) xui_policy_apply 300 2 5 ;;
     high-concurrency) xui_policy_apply 120 2 5 ;;
     set)
-      [[ $# -ge 2 && $# -le 4 ]] || die "Usage: vps-init xui-policy set CONN_IDLE [UPLINK_ONLY DOWNLINK_ONLY]"
-      [[ "$2" =~ ^[0-9]+$ ]] || die "connIdle must be an integer."
+      [[ $# -ge 2 && $# -le 4 ]] || die "用法：vps-init xui-policy set CONN_IDLE [UPLINK_ONLY DOWNLINK_ONLY]"
+      [[ "$2" =~ ^[0-9]+$ ]] || die "connIdle 必须是整数。"
       local uplink=${3:-2} downlink=${4:-5}
-      [[ "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ ]] || die "uplinkOnly/downlinkOnly must be integers."
-      (( 60 <= 10#$2 && 10#$2 <= 86400 && 1 <= 10#$uplink && 10#$uplink <= 86400 && 1 <= 10#$downlink && 10#$downlink <= 86400 )) || die "Policy values are outside the allowed range."
+      [[ "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ ]] || die "uplinkOnly/downlinkOnly 必须是整数。"
+      (( 60 <= 10#$2 && 10#$2 <= 86400 && 1 <= 10#$uplink && 10#$uplink <= 86400 && 1 <= 10#$downlink && 10#$downlink <= 86400 )) || die "policy 参数超出允许范围。"
       xui_policy_apply "$2" "$uplink" "$downlink"
       ;;
     restore) xui_policy_restore_latest ;;
-    *) die "Usage: vps-init xui-policy [status|stable|high-concurrency|set|restore|menu]" ;;
+    *) die "用法：vps-init xui-policy [status|stable|high-concurrency|set|restore|menu]" ;;
   esac
 }
 
