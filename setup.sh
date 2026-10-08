@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.7.0"
+readonly SCRIPT_VERSION="1.8.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -16,11 +16,13 @@ readonly SWAP_FILE="/swapfile-vps-init-suite"
 readonly MSS_CONFIG="/etc/default/vps-init-suite"
 readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
+readonly XUI_LIMITS_DIR="/etc/systemd/system/x-ui.service.d"
+readonly XUI_LIMITS_FILE="${XUI_LIMITS_DIR}/90-vps-init-suite.conf"
 readonly STATE_DIR="/var/lib/vps-init-suite/state"
 readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
 readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
 readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
-readonly XUI_POLICY_HELPER_VERSION="1.7.0"
+readonly XUI_POLICY_HELPER_VERSION="1.8.0"
 readonly ROOT_COMMANDS=(full kernel ipv6 mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
@@ -154,7 +156,8 @@ capture_original_sysctl_state() {
     net.ipv6.conf.all.accept_ra net.ipv6.conf.default.accept_ra
     net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
     net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_window_scaling
-    net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_timestamps net.ipv4.tcp_tw_reuse
+    net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_moderate_rcvbuf
+    net.ipv4.tcp_timestamps net.ipv4.tcp_tw_reuse
     net.core.somaxconn net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog
     net.ipv4.tcp_syncookies net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_fin_timeout
     net.ipv4.ip_local_port_range net.ipv4.tcp_keepalive_time
@@ -232,6 +235,8 @@ show_status() {
   local timezone="unavailable"
   local swap="none"
   local mss="not configured"
+  local xui_nofile="未检测到 x-ui.service"
+  local xui_pid
 
   if command -v timedatectl >/dev/null; then
     timezone=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
@@ -249,6 +254,15 @@ show_status() {
   if command -v iptables >/dev/null && iptables -w 2 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
     mss=$(awk -F= '/^MSS_MODE=/{mode=$2} /^MSS_VALUE=/{value=$2} /^MSS_VALUE6=/{value6=$2} END {if (mode == "fixed") print mode " (" value ")"; else if (mode == "dual-fixed") print mode " (IPv4 " value ", IPv6 " value6 ")"; else print mode}' "$MSS_CONFIG" 2>/dev/null || true)
   fi
+  if xui_service_detected && command -v systemctl >/dev/null; then
+    xui_pid=$(systemctl show x-ui.service --property=MainPID --value 2>/dev/null || true)
+    if [[ "$xui_pid" =~ ^[1-9][0-9]*$ && -r "/proc/${xui_pid}/limits" ]]; then
+      xui_nofile=$(awk '$1 == "Max" && $2 == "open" && $3 == "files" {print $4}' "/proc/${xui_pid}/limits")
+      [[ -n "$xui_nofile" ]] || xui_nofile="未读取"
+    else
+      xui_nofile="未运行（下次启动配置：$(systemctl show x-ui.service --property=LimitNOFILE --value 2>/dev/null || echo 未读取)）"
+    fi
+  fi
 
   printf '%s\n' "------------------------------------------------------------"
   printf '版本:                    %s\n' "$SCRIPT_VERSION"
@@ -261,6 +275,8 @@ show_status() {
   printf '拥塞控制:                %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
   printf '默认队列:                %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
   printf 'TCP Fast Open:           %s（目标值: 3）\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
+  printf 'TCP 监听队列:            %s（SYN: %s）\n' "$(sysctl -n net.core.somaxconn 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo unavailable)"
+  printf 'TCP Keepalive:           %s/%s/%s 秒\n' "$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo unavailable)"
   printf 'IPv4 转发:               %s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unavailable)"
   printf 'IPv6 转发:               %s\n' "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo unavailable)"
   printf 'IPv6 状态:               %s\n' "$(if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == "1" ]]; then printf '%s' 已开启; else printf '%s' 已关闭; fi)"
@@ -269,6 +285,7 @@ show_status() {
   printf '时区:                    %s\n' "${timezone:-未知}"
   printf 'Swap:                    %s\n' "$swap"
   printf 'MSS 策略:                %s\n' "${mss:-未配置}"
+  printf 'x-ui 文件句柄上限:       %s\n' "$xui_nofile"
   printf '%s\n' "------------------------------------------------------------"
 }
 
@@ -300,16 +317,17 @@ tune_kernel() {
 
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
-  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog syn_backlog tw_buckets keepalive_time keepalive_intvl keepalive_probes conntrack_config ipv6_config
+  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog netdev_backlog syn_backlog tw_buckets keepalive_time keepalive_intvl keepalive_probes conntrack_config ipv6_config
   if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
     profile="低内存高并发（4 MiB 缓冲）"
     rmem_max=4194304
     wmem_max=4194304
     rmem_default=65536
     wmem_default=65536
-    file_max=262144
+    file_max=$(proxy_nofile_limit "$memory_mb")
     conntrack_max=65536
     backlog=8192
+    netdev_backlog=8192
     syn_backlog=4096
     tw_buckets=32768
     keepalive_time=300
@@ -321,14 +339,15 @@ tune_kernel() {
     wmem_max=16777216
     rmem_default=262144
     wmem_default=262144
-    file_max=524288
+    file_max=$(proxy_nofile_limit "$memory_mb")
     conntrack_max=131072
-    backlog=8192
+    backlog=16384
+    netdev_backlog=16384
     syn_backlog=8192
     tw_buckets=50000
-    keepalive_time=120
+    keepalive_time=300
     keepalive_intvl=15
-    keepalive_probes=5
+    keepalive_probes=3
   fi
   log "检测到 ${memory_mb} MiB 内存，正在应用 ${profile} 配置。"
 
@@ -349,7 +368,7 @@ net.ipv6.conf.default.accept_ra = 1"
   conntrack_config=""
   if [[ -e /proc/sys/net/netfilter/nf_conntrack_max && -e /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established ]]; then
     conntrack_config="net.netfilter.nf_conntrack_max = ${conntrack_max}
-net.netfilter.nf_conntrack_tcp_timeout_established = 600"
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200"
   else
     warn "系统没有 nf_conntrack 参数节点，跳过连接跟踪限制。"
   fi
@@ -374,10 +393,11 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_tw_reuse = 1
 net.core.somaxconn = ${backlog}
-net.core.netdev_max_backlog = ${backlog}
+net.core.netdev_max_backlog = ${netdev_backlog}
 net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_max_tw_buckets = ${tw_buckets}
@@ -417,6 +437,7 @@ EOF
   sysctl -p "$SYSCTL_FILE"
   systemctl daemon-reload
   systemctl enable vps-init-suite-sysctl.service >/dev/null
+  configure_xui_service_limits "$file_max"
   log "内核配置已生效，并已设置为开机自动应用。"
 }
 
@@ -442,6 +463,64 @@ buffer_profile() {
     printf '%s\n' "4"
   else
     printf '%s\n' "16"
+  fi
+}
+
+proxy_nofile_limit() {
+  local memory_mb=$1
+  if (( memory_mb < 1500 )); then
+    printf '%s\n' "262144"
+  else
+    printf '%s\n' "524288"
+  fi
+}
+
+configure_xui_service_limits() {
+  local file_limit=${1:?missing x-ui file limit}
+  xui_service_detected || return 0
+  if [[ -e "$XUI_LIMITS_DIR" && -L "$XUI_LIMITS_DIR" ]]; then
+    warn "检测到 x-ui.service.d 是符号链接，跳过文件句柄 drop-in，避免写入未知位置。"
+    return 0
+  fi
+  assert_not_symlink "$XUI_LIMITS_FILE"
+  if [[ -e "$XUI_LIMITS_FILE" ]] && ! is_suite_managed_file "$XUI_LIMITS_FILE"; then
+    warn "发现非本项目的 x-ui 文件句柄配置，保持原文件不变并跳过覆盖。"
+    return 0
+  fi
+
+  mkdir -p "$XUI_LIMITS_DIR"
+  capture_original_managed_file "$XUI_LIMITS_FILE"
+  local temporary
+  temporary=$(mktemp "${XUI_LIMITS_DIR}/.90-vps-init-suite.XXXXXX")
+  cat >"$temporary" <<EOF
+# Managed by vps-init-suite.
+# Proxy-node service limit; takes effect on the next x-ui.service restart.
+[Service]
+LimitNOFILE=${file_limit}
+EOF
+  chmod 0644 "$temporary"
+  mv -f -- "$temporary" "$XUI_LIMITS_FILE"
+  systemctl daemon-reload
+  if systemctl is-active --quiet x-ui.service; then
+    if [[ -t 0 ]]; then
+      local answer
+      read -r -p "是否现在重启 x-ui.service 使文件句柄上限生效？现有代理连接会短暂重连 [y/N]: " answer
+      case "${answer:-n}" in
+        y|Y|yes|YES)
+          if systemctl restart x-ui.service; then
+            log "已为 x-ui.service 应用 LimitNOFILE=${file_limit}。"
+          else
+            warn "x-ui.service 重启失败，正在尝试启动服务；文件句柄设置将在下次成功启动时生效。"
+            systemctl start x-ui.service >/dev/null 2>&1 || true
+          fi
+          ;;
+        *) log "已为 x-ui.service 保存 LimitNOFILE=${file_limit}；下次重启面板服务后生效。" ;;
+      esac
+    else
+      log "已为 x-ui.service 保存 LimitNOFILE=${file_limit}；下次重启面板服务后生效。"
+    fi
+  else
+    log "已为 x-ui.service 设置 LimitNOFILE=${file_limit}；服务下次启动时生效。"
   fi
 }
 
@@ -1029,7 +1108,7 @@ restore_original_managed_files() {
   local path filename marker original backup
   for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" \
     /etc/modules-load.d/vps-init-suite.conf "$MSS_CONFIG" "$MSS_HELPER" \
-    "$XUI_POLICY_HELPER" "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
+    "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
     filename=$(basename "$path")
     marker="${STATE_DIR}/original-${filename}.present"
     original="${STATE_DIR}/original-${filename}"
@@ -1183,9 +1262,11 @@ uninstall_suite() {
   for managed_path in "$MSS_UNIT" "$SYSCTL_UNIT" \
     /etc/modules-load.d/vps-init-suite.conf \
     "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" \
-    "$MSS_CONFIG" "$MSS_HELPER" "$XUI_POLICY_HELPER" "$LAUNCHER_PATH" "$INSTALLED_SCRIPT"; do
+    "$MSS_CONFIG" "$MSS_HELPER" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" \
+    "$LAUNCHER_PATH" "$INSTALLED_SCRIPT"; do
     remove_managed_file "$managed_path"
   done
+  rmdir "$XUI_LIMITS_DIR" 2>/dev/null || true
   systemctl daemon-reload
   systemctl reset-failed vps-init-suite-mss.service vps-init-suite-sysctl.service >/dev/null 2>&1 || true
 

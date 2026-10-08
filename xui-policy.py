@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 
 SETTING_KEY = "xrayTemplateConfig"
-HELPER_VERSION = "1.7.0"
+HELPER_VERSION = "1.8.0"
 
 
 def fail(message):

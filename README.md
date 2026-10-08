@@ -7,6 +7,7 @@
 - 持久启用 BBR、FQ 和双向 TCP Fast Open（值为 `3`）。
 - 将 TCP 收发缓冲上限扩大到 16 MiB，并调整连接队列。
 - 根据物理内存自动选择低内存高并发 4 MiB 安全档或标准 16 MiB 长肥管道档；1G 档使用较低 socket 默认缓冲、适度增大监听队列并放宽 TCP keepalive，避免 4000+ 长连接造成额外定时器压力。
+- 面向代理节点设置 TCP 自动接收缓冲、连接跟踪和大内存队列；检测到 `x-ui.service` 时仅添加独立 systemd drop-in 提高 `LimitNOFILE`，不覆盖 3X-UI 原服务文件。
 - 通过独立 systemd 服务固化 sysctl，避免普通重启后失效。
 - 开启 IPv4 转发；IPv6 转发由用户选择，默认关闭，同时保留普通 IPv6 主机连接能力。
 - 支持 `clamp-to-PMTU` 或固定值 MSS，同时覆盖本机流量和转发流量。
@@ -72,6 +73,16 @@ vps-init ipv6 on
 不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令、开启/禁用 IPv6 转发、3X-UI policy 和卸载套件等选项。这里的“禁用 IPv6”仅关闭内核转发，不会关闭本机 IPv6 出站；也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
 
 如果安装了 3X-UI，完整初始化结束时会提示是否打开 `3X-UI / Xray 连接策略` 菜单；也可以随时执行 `vps-init xui-policy`。首次进入会按需安装 Python 辅助程序。
+
+代理节点建议在内核调优后单独执行：
+
+```bash
+vps-init kernel off       # IPv6 转发按需选择 on/off
+vps-init mss clamp       # 推荐按路径 MTU 自动钳制，不固定 1380
+vps-init xui-policy stable
+```
+
+`kernel` 只更新项目自己的 `/etc/sysctl.d/99-vps-init-suite.conf`，不会覆盖 `/etc/sysctl.conf` 或删除其他防火墙规则。检测到 3X-UI 时会写入独立的 `x-ui.service.d/90-vps-init-suite.conf`；文件句柄上限在下次重启 `x-ui.service` 后生效。MSS 规则使用项目专用链，支持 VLESS Reality、SOCKS5 和 UDP，不会清空用户现有规则。
 
 快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。常规只读的 `status`、`version`、`help` 不需要 root；`xui-policy` 还要读取通常仅 root 可读的 3X-UI 数据库，因此会自动请求 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
 
@@ -155,10 +166,10 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 - 项目只写入带 `vps-init-suite` 名称的 sysctl、systemd、SWAP 和 iptables 资源，不删除第三方调优文件。
 - 对附件中列出的已知历史 sysctl 碎片会先备份到 `/var/lib/vps-init-suite/backups/`，再删除，避免被旧脚本覆盖；不会覆盖 `/etc/sysctl.conf`。
 - 低于 1500 MiB 内存使用 4 MiB 缓冲和较低队列，高于或等于 1500 MiB 使用 16 MiB 缓冲；这只是内核基准，应用自身仍需按内存规划。
-- 低内存档的监听队列为 `somaxconn=8192`、`tcp_max_syn_backlog=4096`、`netdev_max_backlog=8192`，不是无限增大；若 `ListenOverflows` 持续增长，应优先检查应用监听 backlog、CPU steal 和上游连接突发。
-- 低内存档的 TCP keepalive 为 `300/15/3`；应用层心跳和 NAT 超时可能需要独立调整，内核 keepalive 不替代 Xray/3X-UI 的连接策略。
+- 低内存档的监听队列为 `somaxconn=8192`、`tcp_max_syn_backlog=4096`、`netdev_max_backlog=8192`；标准档提升到 `somaxconn=16384`、`tcp_max_syn_backlog=8192`、`netdev_max_backlog=16384`，不是无限增大；若 `ListenOverflows` 持续增长，应优先检查应用监听 backlog、CPU steal 和上游连接突发。
+- 两档 TCP keepalive 均采用 `300/15/3`，减少代理节点上大量空闲长连接的定时器开销；应用层心跳和 NAT 超时可能需要独立调整，内核 keepalive 不替代 Xray/3X-UI 的连接策略。
 - IPv6 默认不做路由转发；选择 `on` 时开启 forwarding 并使用 `accept_ra=2`，适合中转/路由节点。该选项不会关闭普通 IPv6 出站连接。
-- `nf_conntrack` 仅在内核实际暴露对应 sysctl 节点时配置；精简内核或容器环境会安全跳过，不会导致整套初始化失败。
+- `nf_conntrack` 仅在内核实际暴露对应 sysctl 节点时配置；精简内核或容器环境会安全跳过，不会导致整套初始化失败。代理节点的 established 超时使用 7200 秒，避免旧版本的 600 秒过早清理长连接；是否真正经过 conntrack 仍由系统 NAT/防火墙决定。
 - MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。
 - 快捷入口为 `/usr/local/bin/vps-init`，实际脚本保存在 `/usr/local/lib/vps-init-suite/setup.sh`。
 - 时区探测依次查询 `ipwho.is`、`ipinfo.io` 和 `ipapi.co`；这些服务会看到 VPS 的公网出口 IP，但脚本不会向其发送其他机器数据。
@@ -166,6 +177,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 - 无人值守模式探测失败时会保留当前时区；交互模式提供常用地区、任意 IANA 时区及保留现状选项。
 - 每次重写项目自己的 sysctl 文件前，旧版本都会备份到 `/var/lib/vps-init-suite/backups/`。
 - MSS 使用专用 `VPS_INIT_MSS` 链和注释标记，不保存或覆盖整套防火墙规则。
+- 不会执行 `iptables -F`、不会覆盖 `/etc/sysctl.conf`，也不会覆盖已有的非本项目 `x-ui.service` drop-in；同名受管文件升级前会进入备份目录。
 - 完整初始化默认使用 `clamp-to-PMTU`；只有明确执行 `mss dual-fixed` 才会使用 IPv4 1380 / IPv6 1340 固定值。
 - 已存在任何活动 SWAP 时不会修改；磁盘余量不足时不会创建新文件。
 - 3X-UI policy 工具只支持 SQLite，默认读取 `/etc/x-ui/x-ui.db`，也会识别 `XUI_DB_FOLDER`；检测到 PostgreSQL 等其他后端时会拒绝修改。
