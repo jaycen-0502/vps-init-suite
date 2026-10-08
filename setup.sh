@@ -22,7 +22,7 @@ readonly STATE_DIR="/var/lib/vps-init-suite/state"
 readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
 readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
 readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
-readonly XUI_POLICY_HELPER_VERSION="1.8.1"
+readonly XUI_POLICY_HELPER_VERSION="1.8.0"
 readonly ROOT_COMMANDS=(full kernel ipv6 mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
