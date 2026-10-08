@@ -382,8 +382,8 @@ net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${wmem_max}
 net.core.rmem_default = ${rmem_default}
 net.core.wmem_default = ${wmem_default}
-net.ipv4.tcp_rmem = 4096 65536 ${rmem_max}
-net.ipv4.tcp_wmem = 4096 65536 ${wmem_max}
+net.ipv4.tcp_rmem = 4096 ${rmem_default} ${rmem_max}
+net.ipv4.tcp_wmem = 4096 ${wmem_default} ${wmem_max}
 net.ipv4.ip_forward = 1
 ${ipv6_config}
 net.ipv6.conf.all.disable_ipv6 = 0
