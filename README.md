@@ -15,7 +15,7 @@
 - 优先使用 `systemd-timesyncd`，在 D-Bus/timesyncd 不可用时回退到 chrony 和本地时区软链接。
 - 可选彻底清理 3X-UI 服务及已知数据目录。
 - 可选安全调整 3X-UI 的 Xray `policy.levels[0]`：先停面板、备份 SQLite、修改后校验并重启，失败时保留备份并尝试恢复。
-- 完整初始化后安装 `vps-init` 快捷命令，随时打开菜单或执行子命令。
+- 完整初始化后安装 `vps-init` 快捷命令，随时打开中文菜单或执行子命令；如果检测到 3X-UI，会在初始化结束时询问是否立即打开 policy 菜单。
 - 提供首次安装、已安装机器交互选择、保留 SWAP 卸载和显式删除受管 SWAP。
 
 ## 支持系统
@@ -61,7 +61,7 @@ chmod +x setup.sh
 sudo ./setup.sh full
 ```
 
-初始化成功后可直接使用快捷命令：
+初始化成功后可直接使用快捷命令（菜单已汉化）：
 
 ```bash
 vps-init
@@ -71,7 +71,7 @@ vps-init ipv6 on
 
 不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令、开启/禁用 IPv6 转发、3X-UI policy 和卸载套件等选项。这里的“禁用 IPv6”仅关闭内核转发，不会关闭本机 IPv6 出站；也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
 
-如果安装了 3X-UI，还可以在菜单中进入 `3X-UI / Xray connection policy`，查看或调整连接空闲策略。首次进入会按需安装 Python 辅助程序。
+如果安装了 3X-UI，完整初始化结束时会提示是否打开 `3X-UI / Xray 连接策略` 菜单；也可以随时执行 `vps-init xui-policy`。首次进入会按需安装 Python 辅助程序。
 
 快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。常规只读的 `status`、`version`、`help` 不需要 root；`xui-policy` 还要读取通常仅 root 可读的 3X-UI 数据库，因此会自动请求 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
 
@@ -174,6 +174,8 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 - policy 修改会重启 `x-ui.service`，现有代理连接可能短暂重连；若重启失败，脚本会尝试恢复之前的 policy 并重新启动服务。备份保留在 `/var/lib/vps-init-suite/backups/3xui/`。
 - 3X-UI 清理是不可逆操作，交互模式要求输入 `REMOVE`；自动化必须显式传入 `--yes`。
 - 内核不提供 BBR 时，脚本会停止并提示升级，不会伪装成成功。
+- 时区探测现在每个服务最多等待 3 秒且不重复重试；全部失败会自动保留现有时区继续，不会卡在选择提示。需要手动改时区时执行 `vps-init timezone Asia/Tokyo`。
+- `apt` 依赖会先检查已安装的软件包，已安装的包不会重复执行 `apt-get update/install`，可减少初始化等待时间。
 
 ## 修改后检查
 
@@ -181,9 +183,11 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 
 ```bash
 bash -n setup.sh
-shellcheck setup.sh tests/timezone_test.sh tests/profile_test.sh
+shellcheck setup.sh tests/timezone_test.sh tests/profile_test.sh tests/behavior_test.sh tests/timezone_speed_test.sh
 bash tests/timezone_test.sh
 bash tests/profile_test.sh
+bash tests/behavior_test.sh
+bash tests/timezone_speed_test.sh
 python3 -m py_compile xui-policy.py tests/xui_policy_test.py
 python3 tests/xui_policy_test.py
 ```

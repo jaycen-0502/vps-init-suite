@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.6.0"
+readonly SCRIPT_VERSION="1.7.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -101,12 +101,27 @@ require_supported_os() {
   command -v apt-get >/dev/null || die "apt-get is required."
 }
 
+package_is_installed() {
+  local status
+  command -v dpkg-query >/dev/null 2>&1 || return 1
+  status=$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null) || return 1
+  [[ "$status" == "install ok installed" ]]
+}
+
 apt_install() {
+  local package
+  local -a missing=()
+  for package in "$@"; do
+    if ! package_is_installed "$package"; then
+      missing+=("$package")
+    fi
+  done
+  ((${#missing[@]} == 0)) && return 0
   if [[ $APT_UPDATED -eq 0 ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get update -y
     APT_UPDATED=1
   fi
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
 }
 
 backup_existing() {
@@ -220,6 +235,13 @@ show_status() {
   if command -v timedatectl >/dev/null; then
     timezone=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
   fi
+  if [[ -z "$timezone" || "$timezone" == "unavailable" ]]; then
+    if [[ -r /etc/timezone ]]; then
+      timezone=$(sed -n '1p' /etc/timezone)
+    elif [[ -L /etc/localtime ]]; then
+      timezone=$(readlink -f /etc/localtime | sed 's#^/usr/share/zoneinfo/##')
+    fi
+  fi
   if command -v swapon >/dev/null && [[ -n $(swapon --show=NAME --noheadings 2>/dev/null) ]]; then
     swap=$(free -h | awk '/^Swap:/ {print $2 " total, " $3 " used"}')
   fi
@@ -228,24 +250,24 @@ show_status() {
   fi
 
   printf '%s\n' "------------------------------------------------------------"
-  printf 'Version:                 %s\n' "$SCRIPT_VERSION"
-  printf 'Shortcut command:        %s\n' "$LAUNCHER_NAME"
+  printf '版本:                    %s\n' "$SCRIPT_VERSION"
+  printf '快捷命令:                %s\n' "$LAUNCHER_NAME"
   if [[ -x "$LAUNCHER_PATH" ]]; then
-    printf 'Shortcut installed:      yes\n'
+    printf '快捷命令状态:            已安装\n'
   else
-    printf 'Shortcut installed:      no\n'
+    printf '快捷命令状态:            未安装\n'
   fi
-  printf 'Congestion control:      %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
-  printf 'Default qdisc:           %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
-  printf 'TCP Fast Open:           %s (target: 3)\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
-  printf 'IPv4 forwarding:         %s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unavailable)"
-  printf 'IPv6 forwarding:         %s\n' "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo unavailable)"
-  printf 'IPv6 mode:               %s\n' "$(if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == "1" ]]; then printf '%s' enabled; else printf '%s' disabled; fi)"
-  printf 'TCP buffer profile:       %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unavailable) bytes"
-  printf 'Swappiness:              %s\n' "$(sysctl -n vm.swappiness 2>/dev/null || echo unavailable)"
-  printf 'Timezone:                %s\n' "${timezone:-unavailable}"
+  printf '拥塞控制:                %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
+  printf '默认队列:                %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
+  printf 'TCP Fast Open:           %s（目标值: 3）\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
+  printf 'IPv4 转发:               %s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unavailable)"
+  printf 'IPv6 转发:               %s\n' "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo unavailable)"
+  printf 'IPv6 状态:               %s\n' "$(if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == "1" ]]; then printf '%s' 已开启; else printf '%s' 已关闭; fi)"
+  printf 'TCP 缓冲上限:            %s 字节\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unavailable)"
+  printf 'Swap 倾向:               %s\n' "$(sysctl -n vm.swappiness 2>/dev/null || echo unavailable)"
+  printf '时区:                    %s\n' "${timezone:-未知}"
   printf 'Swap:                    %s\n' "$swap"
-  printf 'MSS policy:              %s\n' "${mss:-configured}"
+  printf 'MSS 策略:                %s\n' "${mss:-未配置}"
   printf '%s\n' "------------------------------------------------------------"
 }
 
@@ -279,7 +301,7 @@ tune_kernel() {
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
   local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog syn_backlog tw_buckets keepalive_time keepalive_intvl keepalive_probes conntrack_config ipv6_config
   if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
-    profile="low-memory high-concurrency (4 MiB buffers)"
+    profile="低内存高并发（4 MiB 缓冲）"
     rmem_max=4194304
     wmem_max=4194304
     rmem_default=65536
@@ -293,7 +315,7 @@ tune_kernel() {
     keepalive_intvl=15
     keepalive_probes=3
   else
-    profile="standard (16 MiB buffers)"
+    profile="标准档（16 MiB 缓冲）"
     rmem_max=16777216
     wmem_max=16777216
     rmem_default=262144
@@ -307,20 +329,20 @@ tune_kernel() {
     keepalive_intvl=15
     keepalive_probes=5
   fi
-  log "Detected ${memory_mb} MiB RAM; applying ${profile} profile."
+  log "检测到 ${memory_mb} MiB 内存，正在应用 ${profile} 配置。"
 
   if [[ "$ipv6_mode" == "on" ]]; then
     ipv6_config="net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.default.forwarding = 1
 net.ipv6.conf.all.accept_ra = 2
 net.ipv6.conf.default.accept_ra = 2"
-    log "IPv6 forwarding enabled by user selection."
+    log "已按选择开启 IPv6 转发。"
   else
     ipv6_config="net.ipv6.conf.all.forwarding = 0
 net.ipv6.conf.default.forwarding = 0
 net.ipv6.conf.all.accept_ra = 1
 net.ipv6.conf.default.accept_ra = 1"
-    warn "IPv6 forwarding disabled (default); normal IPv6 host connectivity remains available."
+    warn "IPv6 转发已关闭（默认）；本机普通 IPv6 出站连接仍保留。"
   fi
 
   conntrack_config=""
@@ -328,7 +350,7 @@ net.ipv6.conf.default.accept_ra = 1"
     conntrack_config="net.netfilter.nf_conntrack_max = ${conntrack_max}
 net.netfilter.nf_conntrack_tcp_timeout_established = 600"
   else
-    warn "nf_conntrack sysctl nodes are unavailable; skipping conntrack limits."
+    warn "系统没有 nf_conntrack 参数节点，跳过连接跟踪限制。"
   fi
 
   cat >"$SYSCTL_FILE" <<EOF
@@ -394,7 +416,7 @@ EOF
   sysctl -p "$SYSCTL_FILE"
   systemctl daemon-reload
   systemctl enable vps-init-suite-sysctl.service >/dev/null
-  log "Kernel profile applied and enabled at boot."
+  log "内核配置已生效，并已设置为开机自动应用。"
 }
 
 clean_conflicts() {
@@ -409,7 +431,7 @@ clean_conflicts() {
     fi
   done
   if (( found )); then
-    warn "Removed known third-party sysctl fragments after backing them up."
+    warn "已备份并移除已知的第三方 sysctl 碎片配置。"
   fi
 }
 
@@ -435,7 +457,7 @@ resolve_ipv6_mode() {
   local answer
   if [[ -z "$requested" ]]; then
     if [[ -t 0 ]]; then
-      read -r -p "Enable IPv6 forwarding for this VPS? [y/N]: " answer
+      read -r -p "是否开启本 VPS 的 IPv6 转发？[y/N]: " answer
       requested=${answer:-off}
     else
       requested="off"
@@ -456,7 +478,7 @@ fetch_timezone_text() {
   local url=$1
   local response
   response=$(curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
-    --connect-timeout 3 --max-time 6 --retry 1 "$url" 2>/dev/null) || return 1
+    --connect-timeout 2 --max-time 3 "$url" 2>/dev/null) || return 1
   response=${response//$'\r'/}
   response=${response//$'\n'/}
   is_valid_timezone "$response" || return 1
@@ -468,7 +490,7 @@ fetch_timezone_json() {
   local filter=$2
   local response timezone
   response=$(curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
-    --connect-timeout 3 --max-time 6 --retry 1 "$url" 2>/dev/null) || return 1
+    --connect-timeout 2 --max-time 3 "$url" 2>/dev/null) || return 1
   timezone=$(jq -er "$filter" <<<"$response" 2>/dev/null) || return 1
   is_valid_timezone "$timezone" || return 1
   printf '%s\n' "$timezone"
@@ -494,17 +516,17 @@ detect_public_timezone() {
 choose_timezone_interactively() {
   local choice custom_timezone
   cat >&2 <<'EOF'
-Automatic timezone detection failed. Select a fallback:
-  1. Keep the current timezone
-  2. UTC
-  3. Asia/Tokyo
-  4. America/Los_Angeles
-  5. America/New_York
-  6. Europe/London
-  7. Asia/Singapore
-  8. Enter another IANA timezone
+自动时区探测失败，请选择：
+  1. 保留当前时区（推荐）
+  2. UTC（协调世界时）
+  3. Asia/Tokyo（东京）
+  4. America/Los_Angeles（洛杉矶）
+  5. America/New_York（纽约）
+  6. Europe/London（伦敦）
+  7. Asia/Singapore（新加坡）
+  8. 输入其他 IANA 时区
 EOF
-  read -r -p "Select [1-8]: " choice
+  read -r -p "请选择 [1-8]（直接回车保留当前时区）: " choice
   case "$choice" in
     1) printf '%s\n' "keep" ;;
     2) printf '%s\n' "Etc/UTC" ;;
@@ -514,7 +536,7 @@ EOF
     6) printf '%s\n' "Europe/London" ;;
     7) printf '%s\n' "Asia/Singapore" ;;
     8)
-      read -r -p "IANA timezone (for example Europe/Berlin): " custom_timezone
+      read -r -p "请输入 IANA 时区（例如 Europe/Berlin）: " custom_timezone
       is_valid_timezone "$custom_timezone" || die "Unknown IANA timezone: ${custom_timezone}"
       printf '%s\n' "$custom_timezone"
       ;;
@@ -527,10 +549,10 @@ enable_network_time() {
     return 0
   fi
   if systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1; then
-    warn "D-Bus time control unavailable; systemd-timesyncd enabled directly."
+    warn "D-Bus 时间控制不可用，已直接启用 systemd-timesyncd。"
     return 0
   fi
-  warn "systemd-timesyncd unavailable; installing chrony fallback."
+  warn "systemd-timesyncd 不可用，正在安装 chrony 作为备用校时服务。"
   apt_install chrony
   systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
   systemctl enable --now chrony.service
@@ -543,7 +565,7 @@ set_timezone() {
   fi
   ln -snf "/usr/share/zoneinfo/${timezone}" /etc/localtime
   printf '%s\n' "$timezone" >/etc/timezone
-  warn "timedatectl unavailable; timezone applied with /etc/localtime symlink."
+  warn "timedatectl 不可用，已通过 /etc/localtime 软链接设置时区。"
 }
 
 setup_timezone() {
@@ -554,14 +576,12 @@ setup_timezone() {
 
   apt_install ca-certificates curl jq tzdata
   if [[ "$requested" == "auto" ]]; then
-    warn "Detecting timezone from the VPS public network egress..."
+    warn "正在根据 VPS 公网出口自动探测时区..."
     if timezone=$(detect_public_timezone); then
-      log "Detected IANA timezone: ${timezone}"
-    elif [[ -t 0 ]]; then
-      timezone=$(choose_timezone_interactively)
+      log "检测到 IANA 时区：${timezone}"
     else
       timezone="keep"
-      warn "Timezone detection failed in non-interactive mode; keeping the current timezone."
+      warn "自动探测失败（已快速跳过），保留当前时区继续；如需手动设置，请执行：vps-init timezone 时区。"
     fi
   elif [[ "$requested" == "keep" ]]; then
     timezone="keep"
@@ -572,12 +592,12 @@ setup_timezone() {
 
   if [[ "$timezone" != "keep" ]]; then
     set_timezone "$timezone"
-    log "Timezone set to ${timezone}."
+    log "时区已设置为 ${timezone}。"
   else
-    warn "Keeping the current system timezone."
+    warn "保留当前系统时区。"
   fi
   enable_network_time
-  log "Network time synchronization enabled. Current local time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+  log "网络时间同步已启用，当前时间：$(date '+%Y-%m-%d %H:%M:%S %Z')"
 }
 
 setup_swap() {
@@ -587,7 +607,7 @@ setup_swap() {
   apt_install util-linux
 
   if [[ -n $(swapon --show=NAME --noheadings 2>/dev/null) ]]; then
-    warn "An active swap device already exists; leaving it unchanged."
+    warn "系统已有活动 SWAP，保持现状不修改。"
     return 0
   fi
 
@@ -604,7 +624,7 @@ setup_swap() {
 
   if [[ -e "$SWAP_FILE" ]]; then
     if [[ -e "${STATE_DIR}/managed-swap.present" ]]; then
-      warn "Recreating inactive managed swap file ${SWAP_FILE}."
+      warn "正在重新创建未启用的受管 SWAP 文件 ${SWAP_FILE}。"
       rm -f -- "$SWAP_FILE"
     else
       die "${SWAP_FILE} already exists but is not verified as suite-managed; preserving it. Inspect the file before moving it and rerunning swap setup."
@@ -627,7 +647,7 @@ setup_swap() {
 vm.swappiness = 10
 EOF
   sysctl -p "$SWAP_SYSCTL_FILE"
-  log "Created ${swap_gib} GiB swap with swappiness 10."
+  log "已创建 ${swap_gib} GiB SWAP，swappiness 设置为 10。"
 }
 
 write_mss_helper() {
@@ -688,8 +708,15 @@ apply_family() {
   done
 }
 
-apply_family iptables
-apply_family ip6tables
+if ! apply_family iptables; then
+  printf '%s\n' 'vps-init-suite: IPv4 MSS policy could not be applied; continuing.' >&2
+fi
+if ! apply_family ip6tables; then
+  printf '%s\n' 'vps-init-suite: IPv6 MSS policy could not be applied; continuing.' >&2
+fi
+# A restricted VPS may not grant CAP_NET_ADMIN. Keep the systemd unit healthy
+# and report the skipped family instead of making the whole initialization fail.
+exit 0
 EOF
   chmod 0755 "$MSS_HELPER"
 }
@@ -748,7 +775,7 @@ EOF
   systemctl daemon-reload
   systemctl enable vps-init-suite-mss.service >/dev/null
   if ! systemctl restart vps-init-suite-mss.service; then
-    warn "MSS service could not start; continuing without MSS rules. Check: systemctl status vps-init-suite-mss.service"
+    warn "MSS 服务未能启动，将继续完成其他配置；检查命令：systemctl status vps-init-suite-mss.service"
     systemctl disable vps-init-suite-mss.service >/dev/null 2>&1 || true
     return 0
   fi
@@ -873,7 +900,7 @@ xui_policy_apply() {
     XUI_POLICY_SERVICE_STOPPED=0
     die "3X-UI did not restart cleanly; the previous database was restored."
   fi
-  log "3X-UI policy updated. Verified backup: ${backup}"
+  log "3X-UI policy 已更新，已验证备份：${backup}"
 }
 
 xui_policy_restore_latest() {
@@ -893,21 +920,41 @@ xui_policy_restore_latest() {
     die "Could not restore the 3X-UI database backup."
   fi
   xui_policy_start_service || die "3X-UI did not restart after database restore."
-  log "3X-UI database restored from ${backup}."
+  log "已从以下备份恢复 3X-UI policy：${backup}"
+}
+
+xui_service_detected() {
+  [[ -e /etc/x-ui/x-ui.db || -e /usr/local/x-ui/x-ui.db ||
+    -e /etc/systemd/system/x-ui.service || -e /usr/lib/systemd/system/x-ui.service ]]
+}
+
+offer_xui_policy() {
+  xui_service_detected || return 0
+  log "检测到 3X-UI，可以直接调整 Xray 连接策略。"
+  if [[ ! -t 0 ]]; then
+    warn "当前为非交互模式，未打开 3X-UI 菜单；稍后执行 vps-init xui-policy 即可。"
+    return 0
+  fi
+  local answer
+  read -r -p "现在打开 3X-UI 参数菜单吗？[Y/n]: " answer
+  case "${answer:-y}" in
+    y|Y|yes|Yes|YES) xui_policy_menu ;;
+    *) log "已跳过 3X-UI 参数菜单，稍后可执行：vps-init xui-policy" ;;
+  esac
 }
 
 xui_policy_menu() {
   local choice seconds uplink downlink
   while true; do
-    printf '\n3X-UI / Xray policy\n'
+    printf '\n========== 3X-UI / Xray 连接策略 ==========\n'
     printf '%s\n' \
-      "  1. Show current policy" \
-      "  2. Stable long-connection profile (connIdle 300, uplink 2, downlink 5)" \
-      "  3. 1G high-concurrency profile (connIdle 120, uplink 2, downlink 5)" \
-      "  4. Custom policy values" \
-      "  5. Restore latest verified database backup" \
-      "  0. Back"
-    read -r -p "Select [0-5]: " choice
+      "  1. 查看当前 policy（只读）" \
+      "  2. 稳定长连接：connIdle=300，uplinkOnly=2，downlinkOnly=5" \
+      "  3. 1G 高并发：connIdle=120，uplinkOnly=2，downlinkOnly=5" \
+      "  4. 自定义 policy 参数" \
+      "  5. 恢复最近一次已验证备份" \
+      "  0. 返回上一级"
+    read -r -p "请选择 [0-5]: " choice
     case "$choice" in
       1)
         local database
@@ -917,16 +964,16 @@ xui_policy_menu() {
       2) xui_policy_apply 300 2 5 ;;
       3) xui_policy_apply 120 2 5 ;;
       4)
-        read -r -p "connIdle seconds [120-86400]: " seconds
-        read -r -p "uplinkOnly seconds [0-86400]: " uplink
-        read -r -p "downlinkOnly seconds [0-86400]: " downlink
-        [[ "$seconds" =~ ^[0-9]+$ && "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ ]] || { warn "Values must be integers."; continue; }
-        (( seconds >= 60 && seconds <= 86400 && uplink >= 1 && uplink <= 86400 && downlink >= 1 && downlink <= 86400 )) || { warn "Values are outside the allowed range."; continue; }
+        read -r -p "请输入 connIdle 秒数 [60-86400]: " seconds
+        read -r -p "请输入 uplinkOnly 秒数 [1-86400]: " uplink
+        read -r -p "请输入 downlinkOnly 秒数 [1-86400]: " downlink
+        [[ "$seconds" =~ ^[0-9]+$ && "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ ]] || { warn "参数必须是整数。"; continue; }
+        (( seconds >= 60 && seconds <= 86400 && uplink >= 1 && uplink <= 86400 && downlink >= 1 && downlink <= 86400 )) || { warn "参数超出允许范围。"; continue; }
         xui_policy_apply "$seconds" "$uplink" "$downlink"
         ;;
       5) xui_policy_restore_latest ;;
       0) return 0 ;;
-      *) warn "Invalid choice." ;;
+      *) warn "无效选项。" ;;
     esac
   done
 }
@@ -1192,8 +1239,9 @@ full_init() {
   setup_swap
   setup_mss clamp
   install_shortcut
-  log "VPS initialization completed."
+  log "VPS 初始化完成。"
   show_status
+  offer_xui_policy
 }
 
 update_self() {
@@ -1263,25 +1311,25 @@ pause_menu() {
 menu() {
   while true; do
     [[ -t 1 ]] && clear
-    printf '%s\n' "VPS Initialization & Kernel Tuning Suite v${SCRIPT_VERSION}"
+    printf '%s\n' "VPS 初始化与内核调优工具 v${SCRIPT_VERSION}"
     show_status
     cat <<'EOF'
-  1. Full initialization (recommended)
-  2. Kernel and network tuning
-  3. MSS clamp-to-PMTU
-  4. Fixed MSS 1380
-  5. Create swap
-  6. Auto-detect timezone and enable NTP
-  7. Remove 3X-UI
-  8. Upgrade/download latest script
-  9. Install/repair shortcut (vps-init)
- 10. Enable IPv6 forwarding
-  11. Disable IPv6 forwarding
-  12. Uninstall vps-init-suite (keeps swap)
-  13. 3X-UI / Xray connection policy
-  0. Exit
+  1. 完整初始化（推荐）
+  2. 内核与网络调优
+  3. MSS 自动钳制（clamp-to-PMTU）
+  4. 固定 MSS 1380
+  5. 创建 SWAP
+  6. 自动探测时区并启用网络校时
+  7. 卸载 3X-UI
+  8. 升级/下载最新版脚本
+  9. 安装/修复快捷命令（vps-init）
+ 10. 开启 IPv6 转发
+ 11. 关闭 IPv6 转发
+ 12. 卸载 vps-init-suite（保留 SWAP）
+ 13. 3X-UI / Xray 连接策略
+  0. 退出
 EOF
-    read -r -p "Select [0-13]: " choice
+    read -r -p "请选择 [0-13]: " choice
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -1297,7 +1345,7 @@ EOF
       12) uninstall_suite; return $? ;;
       13) xui_policy_menu ;;
       0) return 0 ;;
-      *) warn "Invalid choice."; pause_menu ;;
+      *) warn "无效选项。"; pause_menu ;;
     esac
   done
 }
@@ -1305,24 +1353,24 @@ EOF
 select_menu() {
   local choice
   while true; do
-    printf '\nVPS Init - choose an action\n'
+    printf '\nVPS Init - 请选择操作\n'
     printf '%s\n' \
-      "  1. Full initialization" \
-      "  2. Kernel settings (including IPv6 choice)" \
-      "  3. Timezone and time synchronization" \
-      "  4. Create swap if missing" \
-      "  5. Configure MSS clamp-to-PMTU" \
-      "  6. Install/refresh vps-init shortcut" \
-      "  7. Show status" \
-      "  8. Upgrade/download latest script" \
-      "  9. Install/repair shortcut (vps-init)" \
-      " 10. Enable IPv6 forwarding" \
-      " 11. Disable IPv6 forwarding" \
-      " 12. Uninstall suite (keep swap)" \
-      " 13. Uninstall suite and remove managed swap" \
-      " 14. 3X-UI / Xray connection policy" \
-      "  0. Exit"
-    read -r -p "Select [0-14]: " choice
+      "  1. 完整初始化" \
+      "  2. 内核设置（含 IPv6 选择）" \
+      "  3. 时区与网络校时" \
+      "  4. 没有 SWAP 时创建 SWAP" \
+      "  5. 配置 MSS 自动钳制" \
+      "  6. 安装/刷新 vps-init 快捷命令" \
+      "  7. 查看当前状态" \
+      "  8. 升级/下载最新版脚本" \
+      "  9. 安装/修复快捷命令" \
+      " 10. 开启 IPv6 转发" \
+      " 11. 关闭 IPv6 转发" \
+      " 12. 卸载套件（保留 SWAP）" \
+      " 13. 卸载套件并删除受管 SWAP" \
+      " 14. 3X-UI / Xray 连接策略" \
+      "  0. 退出"
+    read -r -p "请选择 [0-14]: " choice
     case "$choice" in
       1) full_init ;;
       2) tune_kernel ;;
@@ -1339,7 +1387,7 @@ select_menu() {
       13) uninstall_suite --remove-swap; return $? ;;
       14) xui_policy_menu ;;
       0) return 0 ;;
-      *) warn "Invalid choice." ;;
+      *) warn "无效选项。" ;;
     esac
   done
 }
