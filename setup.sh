@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.8.1"
+readonly SCRIPT_VERSION="1.9.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -23,7 +23,7 @@ readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
 readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
 readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
 readonly XUI_POLICY_HELPER_VERSION="1.8.0"
-readonly ROOT_COMMANDS=(full kernel ipv6 mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
+readonly ROOT_COMMANDS=(full kernel ipv6 conntrack mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
   99-network-bbr.conf 99-optimal-proxy.conf 99-sysctl.conf 99-tcp-custom.conf
@@ -156,7 +156,7 @@ capture_original_sysctl_state() {
     net.ipv6.conf.all.accept_ra net.ipv6.conf.default.accept_ra
     net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
     net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_window_scaling
-    net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_moderate_rcvbuf
+    net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_mtu_probing
     net.ipv4.tcp_timestamps net.ipv4.tcp_tw_reuse
     net.core.somaxconn net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog
     net.ipv4.tcp_syncookies net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_fin_timeout
@@ -275,6 +275,7 @@ show_status() {
   printf '拥塞控制:                %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
   printf '默认队列:                %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
   printf 'TCP Fast Open:           %s（目标值: 3）\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
+  printf 'TCP MTU 探测:            %s（目标值: 1）\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unavailable)"
   printf 'TCP 监听队列:            %s（SYN: %s）\n' "$(sysctl -n net.core.somaxconn 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo unavailable)"
   printf 'TCP Keepalive:           %s/%s/%s 秒\n' "$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo unavailable)"
   printf 'IPv4 转发:               %s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unavailable)"
@@ -285,8 +286,53 @@ show_status() {
   printf '时区:                    %s\n' "${timezone:-未知}"
   printf 'Swap:                    %s\n' "$swap"
   printf 'MSS 策略:                %s\n' "${mss:-未配置}"
+  printf 'Conntrack:               %s\n' "$(if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then printf '已加载 (%s/%s)' "$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo '?')" "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '?')"; else printf '%s' 未加载; fi)"
   printf 'x-ui 文件句柄上限:       %s\n' "$xui_nofile"
   printf '%s\n' "------------------------------------------------------------"
+}
+
+diagnose_system() {
+  printf '%s\n' '================ VPS CPU/网络诊断 ================'
+  printf '%s\n' '--- 进程 CPU（优先看 xray / ksoftirqd）---'
+  ps -eLo pid,tid,psr,pcpu,pmem,comm --sort=-pcpu 2>/dev/null | head -n 18 || true
+  printf '%s\n' '--- CPU 时间（us 用户态 / sy 内核态 / st 宿主机 steal）---'
+  if command -v vmstat >/dev/null 2>&1; then
+    vmstat 1 3
+  else
+    printf '%s\n' 'vmstat 不可用（未安装 procps）。'
+  fi
+  printf '%s\n' '--- Xray 进程（不显示启动参数）---'
+  if pgrep -x xray >/dev/null 2>&1; then
+    ps -C xray -o pid,pcpu,pmem,etime,comm --sort=-pcpu 2>/dev/null || true
+  else
+    printf '%s\n' '未发现 xray 进程。'
+  fi
+  printf '%s\n' '--- Socket 总览 ---'
+  if command -v ss >/dev/null 2>&1; then
+    ss -s
+  else
+    printf '%s\n' 'ss 不可用（未安装 iproute2）。'
+  fi
+  printf '%s\n' '--- TCP 重传/队列计数（累计值）---'
+  if command -v nstat >/dev/null 2>&1; then
+    nstat -az 2>/dev/null | grep -E 'TcpRetransSegs|TcpTimeouts|TCPFastRetrans|TCPRcvQDrop|ListenOverflows|ListenDrops' || true
+  else
+    printf '%s\n' 'nstat 不可用（可安装 iproute2 后重试）。'
+  fi
+  printf '%s\n' '--- Conntrack ---'
+  if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
+    printf 'count=%s max=%s\n' "$(cat /proc/sys/net/netfilter/nf_conntrack_count)" "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '?')"
+  else
+    printf '%s\n' '未加载 conntrack。'
+  fi
+  printf '%s\n' '--- 网卡/队列丢包统计 ---'
+  if command -v ip >/dev/null 2>&1; then
+    ip -s link 2>/dev/null | sed -n '/^[0-9].*: /,/^[0-9].*: /p' | head -n 80 || true
+  fi
+  if command -v tc >/dev/null 2>&1; then
+    tc -s qdisc show 2>/dev/null || true
+  fi
+  printf '%s\n' '================================================='
 }
 
 tune_kernel() {
@@ -297,16 +343,23 @@ tune_kernel() {
   assert_not_symlink /etc/modules-load.d/vps-init-suite.conf
   apt_install kmod procps
 
-  local ipv6_mode requested_ipv6
+  local ipv6_mode requested_ipv6 conntrack_mode requested_conntrack
   requested_ipv6=${1:-}
+  requested_conntrack=${2:-${VPS_CONNTRACK:-auto}}
   if [[ -z "$requested_ipv6" ]] && [[ -r /proc/sys/net/ipv6/conf/all/forwarding ]]; then
     requested_ipv6=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)
     [[ "$requested_ipv6" == "1" ]] && requested_ipv6=on || requested_ipv6=off
   fi
   ipv6_mode=$(resolve_ipv6_mode "$requested_ipv6")
 
+  conntrack_mode=$(resolve_conntrack_mode "$requested_conntrack")
   modprobe tcp_bbr 2>/dev/null || true
-  modprobe nf_conntrack 2>/dev/null || true
+  if [[ "$conntrack_mode" == "on" ]]; then
+    modprobe nf_conntrack 2>/dev/null || true
+    log "Conntrack 已启用（模式: ${requested_conntrack}）。"
+  else
+    log "代理默认不主动加载 conntrack（模式: ${requested_conntrack}），减少无 NAT 场景的每包开销。"
+  fi
   if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
     die "This kernel does not expose BBR. Upgrade the kernel before applying this profile."
   fi
@@ -366,10 +419,10 @@ net.ipv6.conf.default.accept_ra = 1"
   fi
 
   conntrack_config=""
-  if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+  if [[ "$conntrack_mode" == "on" && -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
     conntrack_config="net.netfilter.nf_conntrack_max = ${conntrack_max}"
   fi
-  if [[ -e /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established ]]; then
+  if [[ "$conntrack_mode" == "on" && -e /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established ]]; then
     if [[ -n "$conntrack_config" ]]; then
       conntrack_config+=$'\n'
     fi
@@ -400,7 +453,8 @@ net.ipv6.conf.lo.disable_ipv6 = 0
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_slow_start_after_idle = 1
+net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_tw_reuse = 1
@@ -424,7 +478,7 @@ EOF
 # Managed by vps-init-suite.
 tcp_bbr
 EOF
-  if [[ -n "$conntrack_config" && -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+  if [[ "$conntrack_mode" == "on" && -n "$conntrack_config" && -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
     printf '%s\n' nf_conntrack >>/etc/modules-load.d/vps-init-suite.conf
   fi
 
@@ -556,6 +610,41 @@ resolve_ipv6_mode() {
     fi
   fi
   normalize_ipv6_mode "$requested" || die "IPv6 mode must be on or off. Default is off."
+}
+
+normalize_conntrack_mode() {
+  case "${1:-}" in
+    auto|on|off) printf '%s\n' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+conntrack_rules_present() {
+  local binary
+  for binary in iptables ip6tables; do
+    command -v "$binary" >/dev/null 2>&1 || continue
+    if "$binary" -w 2 -S 2>/dev/null | grep -Eq -- ' -m (conntrack|state)( |$)'; then
+      return 0
+    fi
+    if "$binary" -w 2 -t nat -S 2>/dev/null | grep -Eq -- '^-A (PREROUTING|POSTROUTING|OUTPUT) '; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_conntrack_mode() {
+  local requested=${1:-${VPS_CONNTRACK:-auto}}
+  normalize_conntrack_mode "$requested" || die "Conntrack mode must be auto, on, or off."
+  if [[ "$requested" == "auto" ]]; then
+    if conntrack_rules_present; then
+      printf '%s\n' "on"
+    else
+      printf '%s\n' "off"
+    fi
+  else
+    printf '%s\n' "$requested"
+  fi
 }
 
 is_valid_timezone() {
@@ -1328,9 +1417,10 @@ install_shortcut() {
 full_init() {
   local timezone=${1:-${VPS_TIMEZONE:-auto}}
   local ipv6_mode=${2:-${VPS_IPV6:-}}
+  local conntrack_mode=${3:-${VPS_CONNTRACK:-auto}}
   require_root
   require_supported_os
-  tune_kernel "$ipv6_mode"
+  tune_kernel "$ipv6_mode" "$conntrack_mode"
   setup_timezone "$timezone"
   setup_swap
   setup_mss clamp
@@ -1377,16 +1467,19 @@ usage() {
 Usage: setup.sh <command> [option]
 
 Commands:
-  full [auto|keep|ZONE] [on|off]
-                           Apply defaults; IPv6 forwarding defaults off
-  kernel [on|off]          Apply BBR, FQ, TFO, TCP, and IPv6 settings
+  full [auto|keep|ZONE] [on|off] [auto|on|off]
+                           Apply defaults; IPv6 forwarding defaults off; conntrack auto
+  kernel [on|off] [auto|on|off]
+                           Apply BBR, FQ, TFO, TCP, and IPv6 settings
   ipv6 [on|off]            Enable or disable IPv6 forwarding (default: off)
+  conntrack [auto|on|off]  Select conntrack for NAT/firewall or proxy-only mode
   mss [clamp|dual-fixed|1200..1460] Persist MSS policy (default: clamp)
   swap                     Create managed 2/4 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
   install                  Install the 'vps-init' shortcut command
   select                   Choose an action interactively
   status                   Show current settings
+  diagnose                 Show CPU, retransmission, softirq, and conntrack counters
   uninstall [--remove-swap] Remove suite (preserves swap by default)
   remove                   Alias for uninstall
   uninstall-3xui [--yes]   Permanently remove 3X-UI and known data paths
@@ -1423,9 +1516,10 @@ menu() {
  11. 关闭 IPv6 转发
  12. 卸载 vps-init-suite（保留 SWAP）
  13. 3X-UI / Xray 连接策略
- 14. 退出（也可输入 0）
+ 14. 网络/CPU 诊断
+ 15. 退出（也可输入 0）
 EOF
-    read -r -p "请选择 [0-14]: " choice
+    read -r -p "请选择 [0-15]: " choice
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -1440,7 +1534,8 @@ EOF
       11) tune_kernel off; pause_menu ;;
       12) uninstall_suite; return $? ;;
       13) xui_policy_menu ;;
-      14|0) return 0 ;;
+      14) diagnose_system; pause_menu ;;
+      15|0) return 0 ;;
       *) warn "无效选项。"; pause_menu ;;
     esac
   done
@@ -1465,8 +1560,9 @@ select_menu() {
       " 12. 卸载套件（保留 SWAP）" \
       " 13. 卸载套件并删除受管 SWAP" \
       " 14. 3X-UI / Xray 连接策略" \
+      " 15. 网络/CPU 诊断" \
       "  0. 退出"
-    read -r -p "请选择 [0-14]: " choice
+    read -r -p "请选择 [0-15]: " choice
     case "$choice" in
       1) full_init ;;
       2) tune_kernel ;;
@@ -1482,6 +1578,7 @@ select_menu() {
       12) uninstall_suite; return $? ;;
       13) uninstall_suite --remove-swap; return $? ;;
       14) xui_policy_menu ;;
+      15) diagnose_system ;;
       0) return 0 ;;
       *) warn "无效选项。" ;;
     esac
@@ -1493,9 +1590,10 @@ main() {
     reexec_as_root "$@"
   fi
   case "${1:-menu}" in
-    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" "${3:-${VPS_IPV6:-}}" ;;
-    kernel) tune_kernel "${2:-${VPS_IPV6:-}}" ;;
+    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" "${3:-${VPS_IPV6:-}}" "${4:-${VPS_CONNTRACK:-auto}}" ;;
+    kernel) tune_kernel "${2:-${VPS_IPV6:-}}" "${3:-${VPS_CONNTRACK:-auto}}" ;;
     ipv6) tune_kernel "${2:-}" ;;
+    conntrack) tune_kernel "${VPS_IPV6:-}" "${2:-auto}" ;;
     mss) setup_mss "${2:-clamp}" ;;
     swap) setup_swap ;;
     timezone) setup_timezone "${2:-auto}" ;;
@@ -1503,6 +1601,7 @@ main() {
     select|choose) select_menu ;;
     uninstall|remove) uninstall_suite "${@:2}" ;;
     status) show_status ;;
+    diagnose) diagnose_system ;;
     uninstall-3xui) uninstall_3xui "${2:-}" ;;
     xui-policy|xray-policy) xui_policy "${@:2}" ;;
     update|upgrade) update_self ;;

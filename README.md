@@ -7,7 +7,7 @@
 - 持久启用 BBR、FQ 和双向 TCP Fast Open（值为 `3`）。
 - 将 TCP 收发缓冲上限扩大到 16 MiB，并调整连接队列。
 - 根据物理内存自动选择低内存高并发 4 MiB 安全档或标准 16 MiB 长肥管道档；1G 档使用较低 socket 默认缓冲、适度增大监听队列并放宽 TCP keepalive，避免 4000+ 长连接造成额外定时器压力。
-- 面向代理节点设置 TCP 自动接收缓冲、连接跟踪和大内存队列；检测到 `x-ui.service` 时仅添加独立 systemd drop-in 提高 `LimitNOFILE`，不覆盖 3X-UI 原服务文件。
+- 面向代理节点设置 TCP 自动接收缓冲和适度连接队列；`tcp_slow_start_after_idle=1` 避免空闲连接恢复时突发发包放大丢包。连接跟踪（conntrack）默认自动判断：有 NAT/状态防火墙才启用，纯 Xray 代理默认不主动加载，减少每包开销。
 - 通过独立 systemd 服务固化 sysctl，避免普通重启后失效。
 - 开启 IPv4 转发；IPv6 转发由用户选择，默认关闭，同时保留普通 IPv6 主机连接能力。
 - 支持 `clamp-to-PMTU` 或固定值 MSS，同时覆盖本机流量和转发流量。
@@ -80,6 +80,7 @@ vps-init ipv6 on
 vps-init kernel off       # IPv6 转发按需选择 on/off
 vps-init mss clamp       # 推荐按路径 MTU 自动钳制，不固定 1380
 vps-init xui-policy stable
+vps-init diagnose        # CPU、软中断、TCP 重传、conntrack 诊断
 ```
 
 `kernel` 只更新项目自己的 `/etc/sysctl.d/99-vps-init-suite.conf`，不会覆盖 `/etc/sysctl.conf` 或删除其他防火墙规则。检测到 3X-UI 时会写入独立的 `x-ui.service.d/90-vps-init-suite.conf`；文件句柄上限在下次重启 `x-ui.service` 后生效。MSS 规则使用项目专用链，支持 VLESS Reality、SOCKS5 和 UDP，不会清空用户现有规则。
@@ -134,11 +135,15 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 
 | 命令 | 说明 |
 | --- | --- |
-| `sudo ./setup.sh full` | 完整初始化；交互询问 IPv6 转发，默认关闭 |
-| `sudo ./setup.sh full auto on` | 完整初始化并开启 IPv6 转发 |
-| `sudo ./setup.sh full Asia/Tokyo off` | 完整初始化并关闭 IPv6 转发 |
-| `sudo ./setup.sh kernel on` | 仅应用内核参数并开启 IPv6 转发 |
+| `sudo ./setup.sh full` | 完整初始化；IPv6 默认关闭，conntrack 自动判断 |
+| `sudo ./setup.sh full auto on off` | 完整初始化并开启 IPv6，明确关闭 conntrack（纯代理） |
+| `sudo ./setup.sh full Asia/Tokyo off on` | 完整初始化并关闭 IPv6，明确开启 conntrack（NAT/防火墙） |
+| `sudo ./setup.sh kernel on auto` | 仅应用内核参数并开启 IPv6，conntrack 自动判断 |
 | `sudo ./setup.sh ipv6 off` | 关闭 IPv6 转发（默认策略） |
+| `sudo ./setup.sh conntrack off` | 纯代理节点不主动加载 conntrack |
+| `sudo ./setup.sh conntrack on` | VPS 做 NAT/转发或使用状态防火墙时启用 conntrack |
+| `sudo ./setup.sh conntrack auto` | 根据现有 iptables/nat 规则自动选择（默认） |
+| `vps-init diagnose` | 查看 Xray、ksoftirqd、CPU steal、TCP 重传、队列和 conntrack 计数 |
 | `vps-init` 菜单中的“禁用 IPv6 转发” | 关闭 IPv6 forwarding，保留普通 IPv6 出站 |
 | `sudo ./setup.sh mss clamp` | 使用路径 MTU 自动钳制 MSS（默认） |
 | `sudo ./setup.sh mss 1380` | 将 MSS 固定为 1380，可使用 1200-1460 |
@@ -168,8 +173,9 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 - 低于 1500 MiB 内存使用 4 MiB 缓冲和较低队列，高于或等于 1500 MiB 使用 16 MiB 缓冲；这只是内核基准，应用自身仍需按内存规划。
 - 低内存档的监听队列为 `somaxconn=8192`、`tcp_max_syn_backlog=4096`、`netdev_max_backlog=8192`；标准档提升到 `somaxconn=16384`、`tcp_max_syn_backlog=8192`、`netdev_max_backlog=16384`，不是无限增大；若 `ListenOverflows` 持续增长，应优先检查应用监听 backlog、CPU steal 和上游连接突发。
 - 两档 TCP keepalive 均采用 `300/15/3`，减少代理节点上大量空闲长连接的定时器开销；应用层心跳和 NAT 超时可能需要独立调整，内核 keepalive 不替代 Xray/3X-UI 的连接策略。
+- `tcp_slow_start_after_idle=1` 让空闲连接恢复时重新谨慎探测拥塞窗口，降低突发发送、丢包和重传放大风险；这会牺牲极少量恢复瞬时速度，优先保证单核 VPS 稳定性。`tcp_mtu_probing=1` 只在检测到 PMTU 黑洞时探测，不改变 UDP，也不替代 MSS `clamp-to-PMTU`。
 - IPv6 默认不做路由转发；选择 `on` 时开启 forwarding 并使用 `accept_ra=2`，适合中转/路由节点。该选项不会关闭普通 IPv6 出站连接。
-- `nf_conntrack` 仅在内核实际暴露对应 sysctl 节点时配置；精简内核或容器环境会安全跳过，不会导致整套初始化失败。代理节点的 established 超时保持 432000 秒（5 天），避免较短超时过早清理空闲长连接；是否真正经过 conntrack 仍由系统 NAT/防火墙决定。
+- `nf_conntrack` 默认使用 `auto`：检测到现有 NAT 或 conntrack/state 防火墙规则才加载并配置；纯 Xray/VLESS/Reality/SOCKS 代理不主动加载。需要 NAT、iptables 状态匹配或复杂转发时用 `vps-init conntrack on`。启用时 established 超时为 432000 秒（5 天）；如果仅代理且 `conntrack_count` 不断增长，应优先关闭它而不是继续扩大表。
 - MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。
 - 快捷入口为 `/usr/local/bin/vps-init`，实际脚本保存在 `/usr/local/lib/vps-init-suite/setup.sh`。
 - 时区探测依次查询 `ipwho.is`、`ipinfo.io` 和 `ipapi.co`；这些服务会看到 VPS 的公网出口 IP，但脚本不会向其发送其他机器数据。
@@ -187,6 +193,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 - 3X-UI 清理是不可逆操作，交互模式要求输入 `REMOVE`；自动化必须显式传入 `--yes`。
 - 内核不提供 BBR 时，脚本会停止并提示升级，不会伪装成成功。
 - 时区探测现在每个服务最多等待 3 秒且不重复重试；全部失败会自动保留现有时区继续，不会卡在选择提示。需要手动改时区时执行 `vps-init timezone Asia/Tokyo`。
+- `vps-init diagnose` 是只读诊断，不显示 Xray 启动参数；若 `xray` 占用高查 sniffing/QUIC/重连，若 `ksoftirqd` 占用高查 UDP 包速率、网卡丢包和 conntrack，若 `st` 高则是宿主机 steal，调内核参数无法根治。
 - `apt` 依赖会先检查已安装的软件包，已安装的包不会重复执行 `apt-get update/install`，可减少初始化等待时间。
 
 ## 修改后检查

@@ -28,6 +28,10 @@ assert_equal "on" "$(normalize_ipv6_mode enabled)"
 assert_equal "off" "$(normalize_ipv6_mode disabled)"
 assert_equal "off" "$(resolve_ipv6_mode "")"
 assert_equal "on" "$(resolve_ipv6_mode on)"
+assert_equal "auto" "$(normalize_conntrack_mode auto)"
+assert_equal "on" "$(normalize_conntrack_mode on)"
+assert_equal "off" "$(normalize_conntrack_mode off)"
+assert_equal "off" "$(resolve_conntrack_mode off)"
 is_root_command uninstall
 is_root_command select
 if is_root_command status; then
