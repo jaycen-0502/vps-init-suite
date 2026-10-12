@@ -635,7 +635,7 @@ conntrack_rules_present() {
 
 resolve_conntrack_mode() {
   local requested=${1:-${VPS_CONNTRACK:-auto}}
-  normalize_conntrack_mode "$requested" || die "Conntrack mode must be auto, on, or off."
+  normalize_conntrack_mode "$requested" >/dev/null || die "Conntrack mode must be auto, on, or off."
   if [[ "$requested" == "auto" ]]; then
     if conntrack_rules_present; then
       printf '%s\n' "on"
