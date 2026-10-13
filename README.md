@@ -28,42 +28,30 @@
 - Ubuntu 20.04/22.04/24.04 及更新版本
 - systemd、Linux 内核 BBR 支持
 
-## 推荐安装方式
+## 傻瓜式一键安装（推荐）
 
-如果当前提示符是 `root@主机`，不要加 `sudo`。`less` 和 `sudo` 都不是脚本依赖；检查文件可以用 `sed` 或 `cat`：
+在 VPS 的 SSH 终端中，整行复制执行。脚本会先下载到临时文件、检查 Bash 语法，再开始初始化；root 会直接运行，普通用户会自动通过 `sudo` 提权。安装过程中会逐项确认带宽和 RTT，确认一项后才询问下一项。
 
-> 下面的代码块每一行都是一条独立命令，请逐行粘贴并在每行按一次 Enter。不要把多行命令连成一行，否则 `curl` 会把后面的命令误当成 URL。
+```bash
+( f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)" -o "$f" && bash -n "$f" && if [ "$(id -u)" -eq 0 ]; then bash "$f" full; else sudo bash "$f" full; fi )
+```
+
+如果当前提示符是 `root@主机`，不需要也不要加 `sudo`；上面的一键命令会自动识别。普通用户需要系统已安装 `sudo`，否则请先切换到 root 再运行。`less` 不是安装依赖。
+
+不建议使用 `curl ... | bash`：初始化需要交互读取带宽、RTT 等输入，管道可能占用标准输入，让提示无法正常接收答案。
+
+想先查看脚本再执行时，可用下面的分步方式（每行单独执行）：
 
 ```bash
 curl -fsSL -o setup.sh "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)"
 sed -n '1,260p' setup.sh
+bash -n setup.sh
 chmod +x setup.sh
-./setup.sh full
+./setup.sh full       # 当前是 root
+# 普通用户则运行：sudo ./setup.sh full
 ```
 
-root 用户也可以使用这一条命令直接下载并执行（不会依赖 `less` 或 `sudo`）：
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)" -o /tmp/vps-init-setup.sh && chmod +x /tmp/vps-init-setup.sh && /tmp/vps-init-setup.sh full
-```
-
-如果之前误把多条命令粘成一行，先删除错误下载文件，再重新逐行执行：
-
-```bash
-rm -f setup.sh
-curl -fsSL -o setup.sh "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)"
-chmod +x setup.sh
-./setup.sh full
-```
-
-看到 `curl: (6) Could not resolve host: sed`、`Could not resolve host: chmod` 或下载内容开头是 `<html>` 时，说明命令粘贴方式有误；不要运行该文件。
-
-如果你是普通用户，使用下面的方式；快捷命令对需要特权的操作会自动请求 `sudo`：
-
-```bash
-chmod +x setup.sh
-sudo ./setup.sh full
-```
+如果下载文件开头是 `<html>` 或 Bash 语法检查失败，不要运行该文件。
 
 初始化成功后可直接使用快捷命令（菜单已汉化）：
 
@@ -128,14 +116,6 @@ vps-init uninstall --remove-swap
 ./setup.sh menu                 # 当前是 root
 # 普通用户使用：sudo ./setup.sh menu
 ```
-
-确认脚本内容后，也可以一行执行完整初始化：
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)" | bash -s -- full
-```
-
-上面的管道命令仅适用于当前已经是 root 的会话；普通用户请将末尾改为 `| sudo bash -s -- full`。
 
 ## 命令
 
