@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.2"
+readonly SCRIPT_VERSION="1.10.3"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -622,19 +622,21 @@ calculate_buffer_max() {
 
 resolve_tuning_profile() {
   local requested_bandwidth=${1:-} requested_rtt=${2:-} memory_mb=$3
-  local stored_bandwidth stored_rtt answer bdp_bytes requested_mib memory_cap_mib
+  local stored_bandwidth stored_rtt bdp_bytes requested_mib memory_cap_mib
   stored_bandwidth=$(tuning_value BANDWIDTH_MBPS)
   stored_rtt=$(tuning_value RTT_MS)
   [[ -n "$requested_bandwidth" ]] || requested_bandwidth="$stored_bandwidth"
   [[ -n "$requested_rtt" ]] || requested_rtt="$stored_rtt"
 
   if [[ -z "$requested_bandwidth" && -t 0 ]]; then
-    read -r -p "请输入 VPS 标称带宽 Mbps（输入 auto 使用保守 100 Mbps）[auto]: " answer
-    requested_bandwidth=${answer:-auto}
+    prompt_tuning_value requested_bandwidth "VPS 标称带宽" \
+      "请输入 VPS 标称带宽 Mbps（输入 auto 使用保守 100 Mbps）[auto]: " \
+      auto 1 100000 1 100 Mbps
   fi
   if [[ -z "$requested_rtt" && -t 0 ]]; then
-    read -r -p "请输入代理用户到 VPS 的典型 RTT 毫秒（跨洋可填 160）[160]: " answer
-    requested_rtt=${answer:-160}
+    prompt_tuning_value requested_rtt "代理 RTT" \
+      "请输入代理用户到 VPS 的典型 RTT 毫秒（跨洋可填 160）[160]: " \
+      160 1 2000 1 160 ms
   fi
   [[ -n "$requested_bandwidth" ]] || requested_bandwidth=auto
   [[ -n "$requested_rtt" ]] || requested_rtt=160
@@ -669,20 +671,66 @@ EOF
   mv -f -- "$temporary" "$TUNING_CONFIG"
 }
 
+prompt_tuning_value() {
+  local target=$1 label=$2 prompt=$3 default=$4 minimum=$5 maximum=$6
+  local allow_auto=$7 auto_fallback=$8 unit=$9 answer value digit_limit
+  digit_limit=${#maximum}
+
+  while true; do
+    if ! read -r -p "$prompt" answer; then
+      printf '\n'
+      die "无法读取${label}输入，请在交互式终端重试。"
+    fi
+    printf '\n'
+    value=${answer:-$default}
+
+    if [[ "$allow_auto" == "1" && "$value" == "auto" ]]; then
+      printf -v "$target" '%s' "auto"
+      printf '已确认%s：auto（按保守值 %s %s 计算）。\n\n' "$label" "$auto_fallback" "$unit"
+      return 0
+    fi
+
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+      printf '输入无效：请输入 %s-%s 之间的整数%s。请重新输入本项。\n\n' \
+        "$minimum" "$maximum" "$([[ "$allow_auto" == "1" ]] && printf '，或输入 auto' || true)"
+      continue
+    fi
+
+    while [[ "$value" == 0* && "$value" != 0 ]]; do value=${value#0}; done
+    if (( ${#value} > digit_limit )); then
+      printf '输入超出范围：%s 需在 %s-%s 之间。请重新输入本项。\n\n' \
+        "$label" "$minimum" "$maximum"
+      continue
+    fi
+    value=$((10#$value))
+    if (( value < minimum || value > maximum )); then
+      printf '输入超出范围：%s 需在 %s-%s 之间。请重新输入本项。\n\n' \
+        "$label" "$minimum" "$maximum"
+      continue
+    fi
+
+    printf -v "$target" '%s' "$value"
+    printf '已确认%s：%s %s。\n\n' "$label" "$value" "$unit"
+    return 0
+  done
+}
+
 configure_bandwidth_profile() {
   require_root
   require_supported_os
-  local memory_mb bandwidth=${1:-} rtt=${2:-} answer current_bandwidth current_rtt
+  local memory_mb bandwidth=${1:-} rtt=${2:-} current_bandwidth current_rtt
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
   if [[ -z "$bandwidth" && -t 0 ]]; then
     current_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
-    read -r -p "请输入 VPS 标称带宽 Mbps [${current_bandwidth:-auto}]: " answer
-    bandwidth=${answer:-${current_bandwidth:-auto}}
+    prompt_tuning_value bandwidth "VPS 标称带宽" \
+      "请输入 VPS 标称带宽 Mbps（输入 auto 使用保守 100 Mbps）[${current_bandwidth:-auto}]: " \
+      "${current_bandwidth:-auto}" 1 100000 1 100 Mbps
   fi
   if [[ -z "$rtt" && -t 0 ]]; then
     current_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
-    read -r -p "请输入代理用户到 VPS 的典型 RTT 毫秒 [${current_rtt:-160}]: " answer
-    rtt=${answer:-${current_rtt:-160}}
+    prompt_tuning_value rtt "代理 RTT" \
+      "请输入代理用户到 VPS 的典型 RTT 毫秒（跨洋可填 160）[${current_rtt:-160}]: " \
+      "${current_rtt:-160}" 1 2000 1 160 ms
   fi
   tune_kernel "${VPS_IPV6:-}" "${VPS_CONNTRACK:-auto}" "$bandwidth" "$rtt"
   log "已保存带宽档位：${TUNING_BANDWIDTH} Mbps，RTT：${TUNING_RTT} ms，TCP 缓冲上限：${TUNING_BUFFER_MAX} 字节。"

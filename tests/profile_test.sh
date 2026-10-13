@@ -65,6 +65,50 @@ fi
 
 TEST_TEMP_DIR=$(mktemp -d)
 trap 'rm -rf -- "$TEST_TEMP_DIR"' EXIT
+PROMPT_INPUTS=(invalid 0200 0160)
+PROMPT_INDEX=0
+PROMPT_TEXTS=()
+read() {
+  local prompt target has_prompt=0 arg
+  for arg in "$@"; do
+    [[ "$arg" == "-p" ]] && has_prompt=1
+  done
+  if (( !has_prompt )); then
+    builtin read "$@"
+    return $?
+  fi
+  while (($#)); do
+    case "$1" in
+      -r) shift ;;
+      -p) prompt=$2; shift 2 ;;
+      *) target=$1; shift ;;
+    esac
+  done
+  PROMPT_TEXTS+=("$prompt")
+  printf -v "$target" '%s' "${PROMPT_INPUTS[PROMPT_INDEX]}"
+  PROMPT_INDEX=$((PROMPT_INDEX + 1))
+}
+PROMPT_BANDWIDTH=""
+prompt_tuning_value PROMPT_BANDWIDTH "VPS 标称带宽" "请输入带宽：" auto 1 100000 1 100 Mbps >"$TEST_TEMP_DIR/prompt-output"
+assert_equal "200" "$PROMPT_BANDWIDTH"
+assert_equal "2" "$PROMPT_INDEX"
+assert_equal "请输入带宽：" "${PROMPT_TEXTS[0]}"
+assert_equal "请输入带宽：" "${PROMPT_TEXTS[1]}"
+grep -qF '已确认VPS 标称带宽：200 Mbps。' "$TEST_TEMP_DIR/prompt-output"
+
+PROMPT_RTT=""
+prompt_tuning_value PROMPT_RTT "代理 RTT" "请输入 RTT：" 160 1 2000 1 160 ms >"$TEST_TEMP_DIR/prompt-output"
+assert_equal "160" "$PROMPT_RTT"
+assert_equal "3" "$PROMPT_INDEX"
+assert_equal "请输入 RTT：" "${PROMPT_TEXTS[2]}"
+grep -qF '已确认代理 RTT：160 ms。' "$TEST_TEMP_DIR/prompt-output"
+
+PROMPT_AUTO=""
+PROMPT_INPUTS+=(auto)
+prompt_tuning_value PROMPT_AUTO "VPS 标称带宽" "请输入带宽：" auto 1 100000 1 100 Mbps >"$TEST_TEMP_DIR/prompt-output"
+assert_equal "auto" "$PROMPT_AUTO"
+grep -qF '已确认VPS 标称带宽：auto（按保守值 100 Mbps 计算）。' "$TEST_TEMP_DIR/prompt-output"
+
 assert_equal "" "$(tuning_value BANDWIDTH_MBPS "$TEST_TEMP_DIR/missing-tuning.conf")"
 cat >"$TEST_TEMP_DIR/tuning.conf" <<'EOF'
 BANDWIDTH_MBPS=200
