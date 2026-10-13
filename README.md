@@ -6,7 +6,7 @@
 
 - 持久启用 BBR、FQ 和双向 TCP Fast Open（值为 `3`）。
 - 根据用户输入的标称带宽和典型 RTT，按约 1.5 倍 BDP 计算 TCP 缓冲上限，再按物理内存设置安全天花板；不把 1C1G 当成唯一硬编码机型。
-- 默认使用保守的 `100 Mbps / 160 ms` 档；缓冲上限受动态物理内存天花板约束（约每 256 MiB RAM 放宽 1 MiB，上限 64 MiB），例如 1/2/4/8/16 GiB 内存分别最多约 4/8/16/32/64 MiB。TCP 缓冲是按连接按需增长，不会启动时预分配全部上限。
+- 默认使用保守的 `100 Mbps / 160 ms` 档；缓冲上限受动态物理内存天花板约束（约每 128 MiB RAM 放宽 1 MiB，上限 64 MiB），并将 BDP 结果向上取 4/8/16/32/64 MiB 档。例如约 1 GiB 机器输入 200 Mbps、160-200 ms RTT 时可使用 8 MiB。TCP 缓冲按需增长，不会启动时预分配全部上限；但大量同时高速传输的活跃连接仍可能提高内核内存占用，应结合 `vps-init diagnose` 及 `free -h` 观察。
 - 面向代理节点设置 TCP 自动接收缓冲和适度连接队列；`tcp_slow_start_after_idle=1` 避免空闲连接恢复时突发发包放大丢包。连接跟踪（conntrack）默认自动判断：有 NAT/状态防火墙才启用，纯 Xray 代理默认不主动加载，减少每包开销。
 - 通过独立 systemd 服务固化 sysctl，避免普通重启后失效。
 - 开启 IPv4 转发；IPv6 转发由用户选择，默认关闭，同时保留普通 IPv6 主机连接能力。
@@ -175,8 +175,8 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 
 - 项目只写入带 `vps-init-suite` 名称的 sysctl、systemd、SWAP 和 iptables 资源，不删除第三方调优文件。
 - 对附件中列出的已知历史 sysctl 碎片会先备份到 `/var/lib/vps-init-suite/backups/`，再删除，避免被旧脚本覆盖；不会覆盖 `/etc/sysctl.conf`。
-- 缓冲上限按 `BDP = 带宽(Mbps) × 125 × RTT(ms)` 估算，并使用约 1.5 倍 BDP；物理内存天花板按 `ceil(物理内存 MiB / 256)` 动态计算，最低 4 MiB、最高 64 MiB。若线路需求超过天花板，脚本会明确警告而不是盲目放大。
-- `rmem_default/wmem_default` 仍按内存档保持较小的 64 KiB 或 256 KiB；它们是初始值，不是每条连接预分配的最大缓冲。多连接代理不会因为 `rmem_max=4 MiB` 自动占用 `连接数 × 4 MiB`。
+- 缓冲上限按 `BDP = 带宽(Mbps) × 125 × RTT(ms)` 估算，并使用约 1.5 倍 BDP 后向上取 4/8/16/32/64 MiB 档；物理内存天花板按 `ceil(物理内存 MiB / 128)` 动态计算，最低 4 MiB、最高 64 MiB。若线路需求超过天花板，脚本会明确警告而不是盲目放大。
+- `rmem_default/wmem_default` 仍按内存档保持较小的 64 KiB 或 256 KiB；它们是初始值，不是每条连接预分配的最大缓冲。多连接代理不会因为较高的 `rmem_max/wmem_max` 上限而在启动时按连接数预分配内存；但很多连接同时跑满带宽时，实际内存仍会随活跃 socket 缓冲增长。
 - 低内存档的监听队列为 `somaxconn=8192`、`tcp_max_syn_backlog=4096`、`netdev_max_backlog=8192`；标准档提升到 `somaxconn=16384`、`tcp_max_syn_backlog=8192`、`netdev_max_backlog=16384`，不是无限增大；若 `ListenOverflows` 持续增长，应优先检查应用监听 backlog、CPU steal 和上游连接突发。
 - 两档 TCP keepalive 均采用 `300/15/3`，减少代理节点上大量空闲长连接的定时器开销；应用层心跳和 NAT 超时可能需要独立调整，内核 keepalive 不替代 Xray/3X-UI 的连接策略。
 - `tcp_slow_start_after_idle=1` 让空闲连接恢复时重新谨慎探测拥塞窗口，降低突发发送、丢包和重传放大风险；这会牺牲极少量恢复瞬时速度，优先保证单核 VPS 稳定性。`tcp_mtu_probing=1` 只在检测到 PMTU 黑洞时探测，不改变 UDP，也不替代 MSS `clamp-to-PMTU`。

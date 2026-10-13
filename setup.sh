@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.0"
+readonly SCRIPT_VERSION="1.10.1"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -546,7 +546,9 @@ buffer_profile() {
 
 memory_buffer_cap_mib() {
   local memory_mb=$1
-  local cap_mib=$(((memory_mb + 255) / 256))
+  # Keep a 1 GiB proxy node capable of filling a 200 Mbps high-RTT path,
+  # while still bounding the per-socket autotuning ceiling for OOM safety.
+  local cap_mib=$(((memory_mb + 127) / 128))
   (( cap_mib < 4 )) && cap_mib=4
   (( cap_mib > 64 )) && cap_mib=64
   printf '%s\n' "$cap_mib"
@@ -560,13 +562,20 @@ tuning_value() {
 
 calculate_buffer_max() {
   local bandwidth_mbps=$1 rtt_ms=$2 memory_mb=$3
-  local bdp_bytes target_bytes target_mib memory_cap_mib
+  local bdp_bytes target_bytes target_mib memory_cap_mib rounded_mib
   bdp_bytes=$((bandwidth_mbps * 125 * rtt_ms))
   # Reserve 1.5x BDP for ACK compression and moderate loss without making
   # every connection start with a large allocation.
   target_bytes=$((bdp_bytes * 3 / 2))
   target_mib=$(( (target_bytes + 1048575) / 1048576 ))
   (( target_mib < 4 )) && target_mib=4
+  # Power-of-two ceilings avoid awkward values such as 6 MiB and give
+  # autotuning enough headroom for real-world RTT/jitter variation.
+  rounded_mib=4
+  while (( rounded_mib < target_mib && rounded_mib < 64 )); do
+    rounded_mib=$((rounded_mib * 2))
+  done
+  target_mib=$rounded_mib
   memory_cap_mib=$(memory_buffer_cap_mib "$memory_mb")
   (( target_mib > memory_cap_mib )) && target_mib=$memory_cap_mib
   printf '%s\n' "$((target_mib * 1048576))"
