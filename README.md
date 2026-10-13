@@ -5,8 +5,8 @@
 ## 功能
 
 - 持久启用 BBR、FQ 和双向 TCP Fast Open（值为 `3`）。
-- 将 TCP 收发缓冲上限扩大到 16 MiB，并调整连接队列。
-- 根据物理内存自动选择低内存高并发 4 MiB 安全档或标准 16 MiB 长肥管道档；1G 档使用较低 socket 默认缓冲、适度增大监听队列并放宽 TCP keepalive，避免 4000+ 长连接造成额外定时器压力。
+- 根据用户输入的标称带宽和典型 RTT，按约 1.5 倍 BDP 计算 TCP 缓冲上限，再按物理内存设置安全天花板；不把 1C1G 当成唯一硬编码机型。
+- 默认使用保守的 `100 Mbps / 160 ms` 档；缓冲上限受动态物理内存天花板约束（约每 256 MiB RAM 放宽 1 MiB，上限 64 MiB），例如 1/2/4/8/16 GiB 内存分别最多约 4/8/16/32/64 MiB。TCP 缓冲是按连接按需增长，不会启动时预分配全部上限。
 - 面向代理节点设置 TCP 自动接收缓冲和适度连接队列；`tcp_slow_start_after_idle=1` 避免空闲连接恢复时突发发包放大丢包。连接跟踪（conntrack）默认自动判断：有 NAT/状态防火墙才启用，纯 Xray 代理默认不主动加载，减少每包开销。
 - 通过独立 systemd 服务固化 sysctl，避免普通重启后失效。
 - 开启 IPv4 转发；IPv6 转发由用户选择，默认关闭，同时保留普通 IPv6 主机连接能力。
@@ -70,6 +70,8 @@ vps-init status
 vps-init ipv6 on
 ```
 
+首次交互式初始化会询问 VPS 标称带宽（Mbps）和代理用户典型 RTT（毫秒），用于估算单流 BDP 缓冲；无法交互时自动使用 `100 Mbps / 160 ms` 保守档。输入的是线路/套餐上限，不是一次测速结果；测速受出口、目标站点和时段影响，不会由脚本擅自改成测速值。
+
 不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令、开启/禁用 IPv6 转发、3X-UI policy 和卸载套件等选项。这里的“禁用 IPv6”仅关闭内核转发，不会关闭本机 IPv6 出站；也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
 
 如果安装了 3X-UI，完整初始化结束时会提示是否打开 `3X-UI / Xray 连接策略` 菜单；也可以随时执行 `vps-init xui-policy`。首次进入会按需安装 Python 辅助程序。
@@ -81,6 +83,7 @@ vps-init kernel off       # IPv6 转发按需选择 on/off
 vps-init mss clamp       # 推荐按路径 MTU 自动钳制，不固定 1380
 vps-init xui-policy stable
 vps-init diagnose        # CPU、软中断、TCP 重传、conntrack 诊断
+vps-init bandwidth 200 160 # 按 200 Mbps、160 ms 重新计算并立即应用缓冲
 ```
 
 `kernel` 只更新项目自己的 `/etc/sysctl.d/99-vps-init-suite.conf`，不会覆盖 `/etc/sysctl.conf` 或删除其他防火墙规则。检测到 3X-UI 时会写入独立的 `x-ui.service.d/90-vps-init-suite.conf`；文件句柄上限在下次重启 `x-ui.service` 后生效。MSS 规则使用项目专用链，支持 VLESS Reality、SOCKS5 和 UDP，不会清空用户现有规则。
@@ -135,14 +138,16 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 
 | 命令 | 说明 |
 | --- | --- |
-| `sudo ./setup.sh full` | 完整初始化；IPv6 默认关闭，conntrack 自动判断 |
-| `sudo ./setup.sh full auto on off` | 完整初始化并开启 IPv6，明确关闭 conntrack（纯代理） |
-| `sudo ./setup.sh full Asia/Tokyo off on` | 完整初始化并关闭 IPv6，明确开启 conntrack（NAT/防火墙） |
-| `sudo ./setup.sh kernel on auto` | 仅应用内核参数并开启 IPv6，conntrack 自动判断 |
+| `sudo ./setup.sh full` | 完整初始化；交互询问带宽/RTT，IPv6 默认关闭，conntrack 自动判断 |
+| `sudo ./setup.sh full auto on off 200 160` | 完整初始化并开启 IPv6、关闭 conntrack，按 200 Mbps/160 ms 计算缓冲 |
+| `sudo ./setup.sh full Asia/Tokyo off on 500 160` | 完整初始化并关闭 IPv6、开启 conntrack，按 500 Mbps/160 ms 计算缓冲 |
+| `sudo ./setup.sh kernel on auto 200 160` | 仅应用内核参数并开启 IPv6，按带宽/RTT 计算缓冲 |
 | `sudo ./setup.sh ipv6 off` | 关闭 IPv6 转发（默认策略） |
 | `sudo ./setup.sh conntrack off` | 纯代理节点不主动加载 conntrack |
 | `sudo ./setup.sh conntrack on` | VPS 做 NAT/转发或使用状态防火墙时启用 conntrack |
 | `sudo ./setup.sh conntrack auto` | 根据现有 iptables/nat 规则自动选择（默认） |
+| `sudo ./setup.sh bandwidth 200 160` | 保存并立即应用 200 Mbps、160 ms 的 BDP 缓冲档 |
+| `sudo ./setup.sh bandwidth auto auto` | 使用保守默认 100 Mbps、160 ms 档 |
 | `vps-init diagnose` | 查看 Xray、ksoftirqd、CPU steal、TCP 重传、队列和 conntrack 计数 |
 | `vps-init` 菜单中的“禁用 IPv6 转发” | 关闭 IPv6 forwarding，保留普通 IPv6 出站 |
 | `sudo ./setup.sh mss clamp` | 使用路径 MTU 自动钳制 MSS（默认） |
@@ -170,7 +175,8 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/set
 
 - 项目只写入带 `vps-init-suite` 名称的 sysctl、systemd、SWAP 和 iptables 资源，不删除第三方调优文件。
 - 对附件中列出的已知历史 sysctl 碎片会先备份到 `/var/lib/vps-init-suite/backups/`，再删除，避免被旧脚本覆盖；不会覆盖 `/etc/sysctl.conf`。
-- 低于 1500 MiB 内存使用 4 MiB 缓冲和较低队列，高于或等于 1500 MiB 使用 16 MiB 缓冲；这只是内核基准，应用自身仍需按内存规划。
+- 缓冲上限按 `BDP = 带宽(Mbps) × 125 × RTT(ms)` 估算，并使用约 1.5 倍 BDP；物理内存天花板按 `ceil(物理内存 MiB / 256)` 动态计算，最低 4 MiB、最高 64 MiB。若线路需求超过天花板，脚本会明确警告而不是盲目放大。
+- `rmem_default/wmem_default` 仍按内存档保持较小的 64 KiB 或 256 KiB；它们是初始值，不是每条连接预分配的最大缓冲。多连接代理不会因为 `rmem_max=4 MiB` 自动占用 `连接数 × 4 MiB`。
 - 低内存档的监听队列为 `somaxconn=8192`、`tcp_max_syn_backlog=4096`、`netdev_max_backlog=8192`；标准档提升到 `somaxconn=16384`、`tcp_max_syn_backlog=8192`、`netdev_max_backlog=16384`，不是无限增大；若 `ListenOverflows` 持续增长，应优先检查应用监听 backlog、CPU steal 和上游连接突发。
 - 两档 TCP keepalive 均采用 `300/15/3`，减少代理节点上大量空闲长连接的定时器开销；应用层心跳和 NAT 超时可能需要独立调整，内核 keepalive 不替代 Xray/3X-UI 的连接策略。
 - `tcp_slow_start_after_idle=1` 让空闲连接恢复时重新谨慎探测拥塞窗口，降低突发发送、丢包和重传放大风险；这会牺牲极少量恢复瞬时速度，优先保证单核 VPS 稳定性。`tcp_mtu_probing=1` 只在检测到 PMTU 黑洞时探测，不改变 UDP，也不替代 MSS `clamp-to-PMTU`。

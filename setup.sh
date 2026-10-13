@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.9.0"
+readonly SCRIPT_VERSION="1.10.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -14,6 +14,7 @@ readonly SYSCTL_UNIT="/etc/systemd/system/vps-init-suite-sysctl.service"
 readonly SWAP_SYSCTL_FILE="/etc/sysctl.d/99-vps-init-suite-swap.conf"
 readonly SWAP_FILE="/swapfile-vps-init-suite"
 readonly MSS_CONFIG="/etc/default/vps-init-suite"
+readonly TUNING_CONFIG="/etc/default/vps-init-suite-tuning"
 readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
 readonly XUI_LIMITS_DIR="/etc/systemd/system/x-ui.service.d"
@@ -23,7 +24,7 @@ readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
 readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
 readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
 readonly XUI_POLICY_HELPER_VERSION="1.8.0"
-readonly ROOT_COMMANDS=(full kernel ipv6 conntrack mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
+readonly ROOT_COMMANDS=(full kernel ipv6 conntrack bandwidth mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
   99-network-bbr.conf 99-optimal-proxy.conf 99-sysctl.conf 99-tcp-custom.conf
@@ -237,6 +238,7 @@ show_status() {
   local mss="not configured"
   local xui_nofile="未检测到 x-ui.service"
   local xui_pid
+  local tuning_bandwidth tuning_rtt
 
   if command -v timedatectl >/dev/null; then
     timezone=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
@@ -263,6 +265,10 @@ show_status() {
       xui_nofile="未运行（下次启动配置：$(systemctl show x-ui.service --property=LimitNOFILE --value 2>/dev/null || echo 未读取)）"
     fi
   fi
+  tuning_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
+  tuning_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
+  [[ -n "$tuning_bandwidth" ]] || tuning_bandwidth="未设置"
+  [[ -n "$tuning_rtt" ]] || tuning_rtt="未设置"
 
   printf '%s\n' "------------------------------------------------------------"
   printf '版本:                    %s\n' "$SCRIPT_VERSION"
@@ -282,6 +288,7 @@ show_status() {
   printf 'IPv6 转发:               %s\n' "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo unavailable)"
   printf 'IPv6 状态:               %s\n' "$(if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == "1" ]]; then printf '%s' 已开启; else printf '%s' 已关闭; fi)"
   printf 'TCP 缓冲上限:            %s 字节\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unavailable)"
+  printf '带宽/RTT 缓冲档位:       %s Mbps / %s ms\n' "$tuning_bandwidth" "$tuning_rtt"
   printf 'Swap 倾向:               %s\n' "$(sysctl -n vm.swappiness 2>/dev/null || echo unavailable)"
   printf '时区:                    %s\n' "${timezone:-未知}"
   printf 'Swap:                    %s\n' "$swap"
@@ -344,8 +351,11 @@ tune_kernel() {
   apt_install kmod procps
 
   local ipv6_mode requested_ipv6 conntrack_mode requested_conntrack
+  local requested_bandwidth requested_rtt
   requested_ipv6=${1:-}
   requested_conntrack=${2:-${VPS_CONNTRACK:-auto}}
+  requested_bandwidth=${3:-}
+  requested_rtt=${4:-}
   if [[ -z "$requested_ipv6" ]] && [[ -r /proc/sys/net/ipv6/conf/all/forwarding ]]; then
     requested_ipv6=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)
     [[ "$requested_ipv6" == "1" ]] && requested_ipv6=on || requested_ipv6=off
@@ -370,11 +380,12 @@ tune_kernel() {
 
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+  resolve_tuning_profile "$requested_bandwidth" "$requested_rtt" "$memory_mb"
   local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog netdev_backlog syn_backlog tw_buckets keepalive_time keepalive_intvl keepalive_probes conntrack_config ipv6_config
   if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
-    profile="低内存高并发（4 MiB 缓冲）"
-    rmem_max=4194304
-    wmem_max=4194304
+    profile="低内存高并发（${TUNING_BUFFER_MAX} 字节缓冲）"
+    rmem_max=$TUNING_BUFFER_MAX
+    wmem_max=$TUNING_BUFFER_MAX
     rmem_default=65536
     wmem_default=65536
     file_max=$(proxy_nofile_limit "$memory_mb")
@@ -387,9 +398,9 @@ tune_kernel() {
     keepalive_intvl=15
     keepalive_probes=3
   else
-    profile="标准档（16 MiB 缓冲）"
-    rmem_max=16777216
-    wmem_max=16777216
+    profile="标准档（按带宽/RTT计算的 ${TUNING_BUFFER_MAX} 字节缓冲）"
+    rmem_max=$TUNING_BUFFER_MAX
+    wmem_max=$TUNING_BUFFER_MAX
     rmem_default=262144
     wmem_default=262144
     file_max=$(proxy_nofile_limit "$memory_mb")
@@ -428,8 +439,10 @@ net.ipv6.conf.default.accept_ra = 1"
     fi
     conntrack_config+="net.netfilter.nf_conntrack_tcp_timeout_established = 432000"
   fi
-  if [[ -z "$conntrack_config" ]]; then
-    warn "系统没有 nf_conntrack 参数节点，跳过连接跟踪限制。"
+  if [[ "$conntrack_mode" == "off" ]]; then
+    log "Conntrack 配置已关闭，跳过相关 sysctl。"
+  elif [[ -z "$conntrack_config" ]]; then
+    warn "系统没有可用的 nf_conntrack 参数节点，跳过连接跟踪限制。"
   else
     log "已按内核实际暴露的 conntrack 参数应用代理长连接保护。"
   fi
@@ -531,6 +544,102 @@ buffer_profile() {
   fi
 }
 
+memory_buffer_cap_mib() {
+  local memory_mb=$1
+  local cap_mib=$(((memory_mb + 255) / 256))
+  (( cap_mib < 4 )) && cap_mib=4
+  (( cap_mib > 64 )) && cap_mib=64
+  printf '%s\n' "$cap_mib"
+}
+
+tuning_value() {
+  local key=$1 config=${2:-$TUNING_CONFIG}
+  [[ -r "$config" ]] || return 0
+  awk -F= -v wanted="$key" '$1 == wanted {print $2; exit}' "$config"
+}
+
+calculate_buffer_max() {
+  local bandwidth_mbps=$1 rtt_ms=$2 memory_mb=$3
+  local bdp_bytes target_bytes target_mib memory_cap_mib
+  bdp_bytes=$((bandwidth_mbps * 125 * rtt_ms))
+  # Reserve 1.5x BDP for ACK compression and moderate loss without making
+  # every connection start with a large allocation.
+  target_bytes=$((bdp_bytes * 3 / 2))
+  target_mib=$(( (target_bytes + 1048575) / 1048576 ))
+  (( target_mib < 4 )) && target_mib=4
+  memory_cap_mib=$(memory_buffer_cap_mib "$memory_mb")
+  (( target_mib > memory_cap_mib )) && target_mib=$memory_cap_mib
+  printf '%s\n' "$((target_mib * 1048576))"
+}
+
+resolve_tuning_profile() {
+  local requested_bandwidth=${1:-} requested_rtt=${2:-} memory_mb=$3
+  local stored_bandwidth stored_rtt answer bdp_bytes requested_mib memory_cap_mib
+  stored_bandwidth=$(tuning_value BANDWIDTH_MBPS)
+  stored_rtt=$(tuning_value RTT_MS)
+  [[ -n "$requested_bandwidth" ]] || requested_bandwidth="$stored_bandwidth"
+  [[ -n "$requested_rtt" ]] || requested_rtt="$stored_rtt"
+
+  if [[ -z "$requested_bandwidth" && -t 0 ]]; then
+    read -r -p "请输入 VPS 标称带宽 Mbps（输入 auto 使用保守 100 Mbps）[auto]: " answer
+    requested_bandwidth=${answer:-auto}
+  fi
+  if [[ -z "$requested_rtt" && -t 0 ]]; then
+    read -r -p "请输入代理用户到 VPS 的典型 RTT 毫秒（跨洋可填 160）[160]: " answer
+    requested_rtt=${answer:-160}
+  fi
+  [[ -n "$requested_bandwidth" ]] || requested_bandwidth=auto
+  [[ -n "$requested_rtt" ]] || requested_rtt=160
+  [[ "$requested_bandwidth" == "auto" ]] && requested_bandwidth=100
+  [[ "$requested_rtt" == "auto" ]] && requested_rtt=160
+  [[ "$requested_bandwidth" =~ ^[0-9]+$ ]] || die "带宽必须是 1-100000 Mbps 的整数，或输入 auto。"
+  (( 10#$requested_bandwidth >= 1 && 10#$requested_bandwidth <= 100000 )) || die "带宽必须是 1-100000 Mbps 的整数，或输入 auto。"
+  [[ "$requested_rtt" =~ ^[0-9]+$ ]] || die "RTT 必须是 1-2000 毫秒的整数，或输入 auto。"
+  (( 10#$requested_rtt >= 1 && 10#$requested_rtt <= 2000 )) || die "RTT 必须是 1-2000 毫秒的整数，或输入 auto。"
+
+  TUNING_BANDWIDTH=$((10#$requested_bandwidth))
+  TUNING_RTT=$((10#$requested_rtt))
+  TUNING_BUFFER_MAX=$(calculate_buffer_max "$TUNING_BANDWIDTH" "$TUNING_RTT" "$memory_mb")
+  bdp_bytes=$((TUNING_BANDWIDTH * 125 * TUNING_RTT))
+  requested_mib=$(( (bdp_bytes * 3 / 2 + 1048575) / 1048576 ))
+  memory_cap_mib=$(memory_buffer_cap_mib "$memory_mb")
+  if (( requested_mib > memory_cap_mib )); then
+    warn "按 ${TUNING_BANDWIDTH} Mbps/${TUNING_RTT} ms 计算需要约 ${requested_mib} MiB；受 ${memory_mb} MiB 物理内存保护，上限收敛为 ${memory_cap_mib} MiB。"
+  fi
+  assert_not_symlink "$TUNING_CONFIG"
+  capture_original_managed_file "$TUNING_CONFIG"
+  mkdir -p "$(dirname "$TUNING_CONFIG")"
+  local temporary
+  temporary=$(mktemp "$(dirname "$TUNING_CONFIG")/.vps-init-suite-tuning.XXXXXX")
+  cat >"$temporary" <<EOF
+# Managed by vps-init-suite.
+BANDWIDTH_MBPS=${TUNING_BANDWIDTH}
+RTT_MS=${TUNING_RTT}
+BUFFER_MAX=${TUNING_BUFFER_MAX}
+EOF
+  chmod 0644 "$temporary"
+  mv -f -- "$temporary" "$TUNING_CONFIG"
+}
+
+configure_bandwidth_profile() {
+  require_root
+  require_supported_os
+  local memory_mb bandwidth=${1:-} rtt=${2:-} answer current_bandwidth current_rtt
+  memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+  if [[ -z "$bandwidth" && -t 0 ]]; then
+    current_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
+    read -r -p "请输入 VPS 标称带宽 Mbps [${current_bandwidth:-auto}]: " answer
+    bandwidth=${answer:-${current_bandwidth:-auto}}
+  fi
+  if [[ -z "$rtt" && -t 0 ]]; then
+    current_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
+    read -r -p "请输入代理用户到 VPS 的典型 RTT 毫秒 [${current_rtt:-160}]: " answer
+    rtt=${answer:-${current_rtt:-160}}
+  fi
+  tune_kernel "${VPS_IPV6:-}" "${VPS_CONNTRACK:-auto}" "$bandwidth" "$rtt"
+  log "已保存带宽档位：${TUNING_BANDWIDTH} Mbps，RTT：${TUNING_RTT} ms，TCP 缓冲上限：${TUNING_BUFFER_MAX} 字节。"
+}
+
 proxy_nofile_limit() {
   local memory_mb=$1
   if (( memory_mb < 1500 )); then
@@ -621,6 +730,10 @@ normalize_conntrack_mode() {
 
 conntrack_rules_present() {
   local binary
+  if command -v nft >/dev/null 2>&1 &&
+    nft list ruleset 2>/dev/null | grep -Eq -- 'ct (state|status)|type nat'; then
+    return 0
+  fi
   for binary in iptables ip6tables; do
     command -v "$binary" >/dev/null 2>&1 || continue
     if "$binary" -w 2 -S 2>/dev/null | grep -Eq -- ' -m (conntrack|state)( |$)'; then
@@ -1209,7 +1322,7 @@ restore_original_managed_files() {
   local path filename marker original backup
   for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" \
     /etc/modules-load.d/vps-init-suite.conf "$MSS_CONFIG" "$MSS_HELPER" \
-    "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
+    "$TUNING_CONFIG" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
     filename=$(basename "$path")
     marker="${STATE_DIR}/original-${filename}.present"
     original="${STATE_DIR}/original-${filename}"
@@ -1362,7 +1475,7 @@ uninstall_suite() {
   local managed_path
   for managed_path in "$MSS_UNIT" "$SYSCTL_UNIT" \
     /etc/modules-load.d/vps-init-suite.conf \
-    "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" \
+    "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$TUNING_CONFIG" \
     "$MSS_CONFIG" "$MSS_HELPER" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" \
     "$LAUNCHER_PATH" "$INSTALLED_SCRIPT"; do
     remove_managed_file "$managed_path"
@@ -1418,9 +1531,11 @@ full_init() {
   local timezone=${1:-${VPS_TIMEZONE:-auto}}
   local ipv6_mode=${2:-${VPS_IPV6:-}}
   local conntrack_mode=${3:-${VPS_CONNTRACK:-auto}}
+  local bandwidth=${4:-${VPS_BANDWIDTH_MBPS:-}}
+  local rtt=${5:-${VPS_RTT_MS:-}}
   require_root
   require_supported_os
-  tune_kernel "$ipv6_mode" "$conntrack_mode"
+  tune_kernel "$ipv6_mode" "$conntrack_mode" "$bandwidth" "$rtt"
   setup_timezone "$timezone"
   setup_swap
   setup_mss clamp
@@ -1467,12 +1582,14 @@ usage() {
 Usage: setup.sh <command> [option]
 
 Commands:
-  full [auto|keep|ZONE] [on|off] [auto|on|off]
-                           Apply defaults; IPv6 forwarding defaults off; conntrack auto
-  kernel [on|off] [auto|on|off]
-                           Apply BBR, FQ, TFO, TCP, and IPv6 settings
+  full [auto|keep|ZONE] [on|off] [auto|on|off] [Mbps] [RTT_MS]
+                           Apply defaults; IPv6 off, conntrack auto, bandwidth auto
+  kernel [on|off] [auto|on|off] [Mbps] [RTT_MS]
+                           Apply BBR, FQ, TCP, and BDP-sized buffers
   ipv6 [on|off]            Enable or disable IPv6 forwarding (default: off)
   conntrack [auto|on|off]  Select conntrack for NAT/firewall or proxy-only mode
+  bandwidth [Mbps|auto] [RTT_MS|auto]
+                           Save bandwidth/RTT buffer profile without changing MSS
   mss [clamp|dual-fixed|1200..1460] Persist MSS policy (default: clamp)
   swap                     Create managed 2/4 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
@@ -1515,11 +1632,12 @@ menu() {
  10. 开启 IPv6 转发
  11. 关闭 IPv6 转发
  12. 卸载 vps-init-suite（保留 SWAP）
- 13. 3X-UI / Xray 连接策略
- 14. 网络/CPU 诊断
- 15. 退出（也可输入 0）
+  13. 3X-UI / Xray 连接策略
+ 14. 带宽/RTT 缓冲档位
+ 15. 网络/CPU 诊断
+ 16. 退出（也可输入 0）
 EOF
-    read -r -p "请选择 [0-15]: " choice
+    read -r -p "请选择 [0-16]: " choice
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -1534,8 +1652,9 @@ EOF
       11) tune_kernel off; pause_menu ;;
       12) uninstall_suite; return $? ;;
       13) xui_policy_menu ;;
-      14) diagnose_system; pause_menu ;;
-      15|0) return 0 ;;
+      14) configure_bandwidth_profile; pause_menu ;;
+      15) diagnose_system; pause_menu ;;
+      16|0) return 0 ;;
       *) warn "无效选项。"; pause_menu ;;
     esac
   done
@@ -1560,9 +1679,10 @@ select_menu() {
       " 12. 卸载套件（保留 SWAP）" \
       " 13. 卸载套件并删除受管 SWAP" \
       " 14. 3X-UI / Xray 连接策略" \
-      " 15. 网络/CPU 诊断" \
+      " 15. 带宽/RTT 缓冲档位" \
+      " 16. 网络/CPU 诊断" \
       "  0. 退出"
-    read -r -p "请选择 [0-15]: " choice
+    read -r -p "请选择 [0-16]: " choice
     case "$choice" in
       1) full_init ;;
       2) tune_kernel ;;
@@ -1578,7 +1698,8 @@ select_menu() {
       12) uninstall_suite; return $? ;;
       13) uninstall_suite --remove-swap; return $? ;;
       14) xui_policy_menu ;;
-      15) diagnose_system ;;
+      15) configure_bandwidth_profile ;;
+      16) diagnose_system ;;
       0) return 0 ;;
       *) warn "无效选项。" ;;
     esac
@@ -1590,10 +1711,11 @@ main() {
     reexec_as_root "$@"
   fi
   case "${1:-menu}" in
-    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" "${3:-${VPS_IPV6:-}}" "${4:-${VPS_CONNTRACK:-auto}}" ;;
-    kernel) tune_kernel "${2:-${VPS_IPV6:-}}" "${3:-${VPS_CONNTRACK:-auto}}" ;;
+    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" "${3:-${VPS_IPV6:-}}" "${4:-${VPS_CONNTRACK:-auto}}" "${5:-${VPS_BANDWIDTH_MBPS:-}}" "${6:-${VPS_RTT_MS:-}}" ;;
+    kernel) tune_kernel "${2:-${VPS_IPV6:-}}" "${3:-${VPS_CONNTRACK:-auto}}" "${4:-${VPS_BANDWIDTH_MBPS:-}}" "${5:-${VPS_RTT_MS:-}}" ;;
     ipv6) tune_kernel "${2:-}" ;;
     conntrack) tune_kernel "${VPS_IPV6:-}" "${2:-auto}" ;;
+    bandwidth) configure_bandwidth_profile "${2:-}" "${3:-}" ;;
     mss) setup_mss "${2:-clamp}" ;;
     swap) setup_swap ;;
     timezone) setup_timezone "${2:-auto}" ;;

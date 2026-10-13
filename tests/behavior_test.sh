@@ -34,4 +34,8 @@ offer_xui_policy() { FLOW+=(xui-policy); }
 full_init keep off
 [[ "${FLOW[*]}" == "kernel timezone swap mss shortcut status xui-policy" ]] || die "Full initialization did not offer the 3X-UI policy menu at the end: ${FLOW[*]}"
 
+FLOW=()
+full_init keep off auto 200 160
+[[ "${FLOW[*]}" == "kernel timezone swap mss shortcut status xui-policy" ]] || die "Full initialization with an explicit bandwidth profile failed: ${FLOW[*]}"
+
 printf '%s\n' "behavior tests passed"

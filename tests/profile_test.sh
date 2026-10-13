@@ -21,6 +21,14 @@ assert_equal "4" "$(buffer_profile 1024)"
 assert_equal "4" "$(buffer_profile 1499)"
 assert_equal "16" "$(buffer_profile 1500)"
 assert_equal "16" "$(buffer_profile 4096)"
+assert_equal "4" "$(memory_buffer_cap_mib 1024)"
+assert_equal "6" "$(memory_buffer_cap_mib 1499)"
+assert_equal "8" "$(memory_buffer_cap_mib 2048)"
+assert_equal "16" "$(memory_buffer_cap_mib 4096)"
+assert_equal "32" "$(memory_buffer_cap_mib 8192)"
+assert_equal "64" "$(memory_buffer_cap_mib 16384)"
+assert_equal "4194304" "$(calculate_buffer_max 100 160 1024)"
+assert_equal "15728640" "$(calculate_buffer_max 500 160 4096)"
 assert_equal "262144" "$(proxy_nofile_limit 1024)"
 assert_equal "524288" "$(proxy_nofile_limit 4096)"
 assert_equal "on" "$(normalize_ipv6_mode on)"
@@ -45,6 +53,13 @@ fi
 
 TEST_TEMP_DIR=$(mktemp -d)
 trap 'rm -rf -- "$TEST_TEMP_DIR"' EXIT
+assert_equal "" "$(tuning_value BANDWIDTH_MBPS "$TEST_TEMP_DIR/missing-tuning.conf")"
+cat >"$TEST_TEMP_DIR/tuning.conf" <<'EOF'
+BANDWIDTH_MBPS=200
+RTT_MS=160
+EOF
+assert_equal "200" "$(tuning_value BANDWIDTH_MBPS "$TEST_TEMP_DIR/tuning.conf")"
+assert_equal "160" "$(tuning_value RTT_MS "$TEST_TEMP_DIR/tuning.conf")"
 mkdir -p "$TEST_TEMP_DIR/state" "$TEST_TEMP_DIR/backups/20260101" "$TEST_TEMP_DIR/backups/20260201"
 printf '%s\n' 'user setting' >"$TEST_TEMP_DIR/custom.conf"
 capture_original_managed_file "$TEST_TEMP_DIR/custom.conf" "$TEST_TEMP_DIR/state"
