@@ -53,7 +53,7 @@ assert_equal 已生效 "$(mss_family_status iptables fixed 1380 1380)"
 MOCK_RULE_VALUE=1340
 assert_equal 未生效 "$(mss_family_status iptables dual-fixed 1380 1340)"
 
-unset -f ip6tables 2>/dev/null || true
-assert_equal 未安装 "$(mss_family_status ip6tables clamp 1380 1340)"
+ip6tables() { return 1; }
+assert_equal 不支持 "$(mss_family_status ip6tables clamp 1380 1340)"
 
 printf '%s\n' "MSS status tests passed"
