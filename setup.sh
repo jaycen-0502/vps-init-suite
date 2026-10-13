@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.4"
+readonly SCRIPT_VERSION="1.10.5"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -1080,16 +1080,18 @@ EOF
 }
 
 write_mss_helper() {
-  assert_not_symlink "$MSS_HELPER"
-  mkdir -p "$(dirname "$MSS_HELPER")"
-  capture_original_managed_file "$MSS_HELPER"
-  cat >"$MSS_HELPER" <<'EOF'
+  local helper_path=${1:-$MSS_HELPER}
+  local state_dir=${2:-$STATE_DIR}
+  assert_not_symlink "$helper_path"
+  mkdir -p "$(dirname "$helper_path")"
+  capture_original_managed_file "$helper_path" "$state_dir"
+  cat >"$helper_path" <<'EOF'
 #!/usr/bin/env bash
 # Managed by vps-init-suite.
 set -Eeuo pipefail
 
 # shellcheck disable=SC1091
-source /etc/default/vps-init-suite
+source "${VPS_INIT_MSS_CONFIG:-/etc/default/vps-init-suite}"
 
 apply_family() {
   local binary=$1
@@ -1116,12 +1118,12 @@ apply_family() {
     mss_value="$MSS_VALUE6"
   fi
   if [[ "$MSS_MODE" == "fixed" || "$MSS_MODE" == "dual-fixed" ]]; then
-    if ! "$binary" -w 5 -t mangle -A VPS_INIT_MSS -j TCPMSS --set-mss "$mss_value"; then
+    if ! "$binary" -w 5 -t mangle -A VPS_INIT_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_value"; then
       printf 'vps-init-suite: cannot add fixed MSS rule with %s; skipping.\n' "$binary" >&2
       return 0
     fi
   else
-    if ! "$binary" -w 5 -t mangle -A VPS_INIT_MSS -j TCPMSS --clamp-mss-to-pmtu; then
+    if ! "$binary" -w 5 -t mangle -A VPS_INIT_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; then
       printf 'vps-init-suite: cannot add PMTU MSS rule with %s; skipping.\n' "$binary" >&2
       return 0
     fi
@@ -1147,7 +1149,7 @@ fi
 # and report the skipped family instead of making the whole initialization fail.
 exit 0
 EOF
-  chmod 0755 "$MSS_HELPER"
+  chmod 0755 "$helper_path"
 }
 
 mss_family_status() {
@@ -1159,7 +1161,7 @@ mss_family_status() {
 
   case "$mode" in
     clamp)
-      "$binary" -w 2 -t mangle -C VPS_INIT_MSS -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || {
+      "$binary" -w 2 -t mangle -C VPS_INIT_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || {
         printf '%s\n' "未生效"
         return 0
       }
@@ -1168,7 +1170,7 @@ mss_family_status() {
       rule_value=$value
       [[ "$mode" != "dual-fixed" || "$binary" != "ip6tables" ]] || rule_value=$value6
       [[ "$rule_value" =~ ^[0-9]+$ ]] || { printf '%s\n' "未生效"; return 0; }
-      "$binary" -w 2 -t mangle -C VPS_INIT_MSS -j TCPMSS --set-mss "$rule_value" >/dev/null 2>&1 || {
+      "$binary" -w 2 -t mangle -C VPS_INIT_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$rule_value" >/dev/null 2>&1 || {
         printf '%s\n' "未生效"
         return 0
       }
@@ -1547,11 +1549,12 @@ remove_managed_swap() {
 }
 
 remove_managed_mss_rules() {
-  local binary chain rule mode value value6 expected_rule
-  local -a rule_args
-  mode=$(awk -F= '$1 == "MSS_MODE" {print $2; exit}' "$MSS_CONFIG" 2>/dev/null || true)
-  value=$(awk -F= '$1 == "MSS_VALUE" {print $2; exit}' "$MSS_CONFIG" 2>/dev/null || true)
-  value6=$(awk -F= '$1 == "MSS_VALUE6" {print $2; exit}' "$MSS_CONFIG" 2>/dev/null || true)
+  local config_path=${1:-$MSS_CONFIG}
+  local binary chain mode value value6
+  local -a rule_args=()
+  mode=$(awk -F= '$1 == "MSS_MODE" {print $2; exit}' "$config_path" 2>/dev/null || true)
+  value=$(awk -F= '$1 == "MSS_VALUE" {print $2; exit}' "$config_path" 2>/dev/null || true)
+  value6=$(awk -F= '$1 == "MSS_VALUE6" {print $2; exit}' "$config_path" 2>/dev/null || true)
   for binary in iptables ip6tables; do
     command -v "$binary" >/dev/null || continue
     "$binary" -w 5 -t mangle -S >/dev/null 2>&1 || continue
@@ -1561,30 +1564,28 @@ remove_managed_mss_rules() {
       done
     done
     if "$binary" -w 5 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
-      expected_rule=""
+      rule_args=()
       case "$mode:$binary" in
-        clamp:*) expected_rule="-A VPS_INIT_MSS -j TCPMSS --clamp-mss-to-pmtu" ;;
+        clamp:*) rule_args=(-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu) ;;
         fixed:iptables|fixed:ip6tables)
           if [[ "$value" =~ ^[0-9]+$ ]]; then
-            expected_rule="-A VPS_INIT_MSS -j TCPMSS --set-mss ${value}"
+            rule_args=(-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$value")
           fi
           ;;
         dual-fixed:iptables)
           if [[ "$value" =~ ^[0-9]+$ ]]; then
-            expected_rule="-A VPS_INIT_MSS -j TCPMSS --set-mss ${value}"
+            rule_args=(-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$value")
           fi
           ;;
         dual-fixed:ip6tables)
           if [[ "$value6" =~ ^[0-9]+$ ]]; then
-            expected_rule="-A VPS_INIT_MSS -j TCPMSS --set-mss ${value6}"
+            rule_args=(-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$value6")
           fi
           ;;
       esac
-      while IFS= read -r rule; do
-        [[ -n "$expected_rule" && "$rule" == "$expected_rule" ]] || continue
-        read -r -a rule_args <<<"$rule"
-        "$binary" -w 5 -t mangle -D "${rule_args[@]:2}" || break
-      done < <("$binary" -w 5 -t mangle -S VPS_INIT_MSS 2>/dev/null)
+      while ((${#rule_args[@]})) && "$binary" -w 5 -t mangle -C VPS_INIT_MSS "${rule_args[@]}" 2>/dev/null; do
+        "$binary" -w 5 -t mangle -D VPS_INIT_MSS "${rule_args[@]}" || break
+      done
       if [[ -z $("$binary" -w 5 -t mangle -S VPS_INIT_MSS 2>/dev/null | sed -n '2p') ]]; then
         "$binary" -w 5 -t mangle -X VPS_INIT_MSS || true
       else

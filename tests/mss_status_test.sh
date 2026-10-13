@@ -20,6 +20,7 @@ iptables() {
     *" -S VPS_INIT_MSS "*) (( MOCK_CHAIN )) && printf '%s\n' '-N VPS_INIT_MSS' ;;
     *" -C VPS_INIT_MSS "*)
       (( MOCK_RULE )) || return 1
+      [[ "$args" == *" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS "* ]] || return 1
       if [[ "$MOCK_RULE_MODE" == "clamp" ]]; then
         [[ "$args" == *" --clamp-mss-to-pmtu "* ]]
       else
