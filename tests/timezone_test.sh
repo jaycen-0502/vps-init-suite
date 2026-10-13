@@ -4,10 +4,26 @@ set -Eeuo pipefail
 
 TEST_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 readonly TEST_ROOT
+TEST_OUTPUT=$(mktemp)
+trap 'rm -f -- "$TEST_OUTPUT"' EXIT
 # shellcheck disable=SC1091
 source "$TEST_ROOT/setup.sh"
 
+TEST_ZONEINFO=$(mktemp -d)
+mkdir -p "$TEST_ZONEINFO/Asia" "$TEST_ZONEINFO/America"
+: >"$TEST_ZONEINFO/Asia/Tokyo"
+: >"$TEST_ZONEINFO/America/Los_Angeles"
+ZONEINFO_DIR=$TEST_ZONEINFO
+trap 'rm -rf -- "$TEST_ZONEINFO"; rm -f -- "$TEST_OUTPUT"' EXIT
+
 MOCK_MODE="primary"
+TIMEOUT_CALLS=()
+
+timeout() {
+  TIMEOUT_CALLS+=("$*")
+  shift 2
+  "$@"
+}
 
 timedatectl() {
   if [[ "${1:-}" == "list-timezones" ]]; then
@@ -18,6 +34,10 @@ timedatectl() {
       "Asia/Tokyo" \
       "Etc/UTC" \
       "Europe/London"
+    return 0
+  fi
+  if [[ "${1:-}" == "show" ]]; then
+    printf '%s\n' 'Asia/Tokyo'
     return 0
   fi
   return 1
@@ -68,6 +88,14 @@ is_valid_timezone "Asia/Tokyo"
 if is_valid_timezone "../../tmp/evil"; then
   die "Unsafe timezone value passed validation."
 fi
+if is_valid_timezone "Etc/../etc/passwd"; then
+  die "Timezone path traversal passed validation."
+fi
+
+run_timedatectl 5 show --property=Timezone --value >"$TEST_OUTPUT"
+assert_equal "Asia/Tokyo" "$(<"$TEST_OUTPUT")"
+[[ "${TIMEOUT_CALLS[0]}" == "--signal=TERM 5s timedatectl show --property=Timezone --value" ]] ||
+  die "timedatectl should always run with a bounded timeout."
 
 assert_equal "Asia/Tokyo" "$(detect_public_timezone)"
 MOCK_MODE="fallback"

@@ -38,4 +38,11 @@ FLOW=()
 full_init keep off auto 200 160
 [[ "${FLOW[*]}" == "kernel timezone swap mss shortcut status xui-policy" ]] || die "Full initialization with an explicit bandwidth profile failed: ${FLOW[*]}"
 
+if bash "$TEST_ROOT/setup.sh" definitely-not-a-command >/dev/null 2>&1; then
+  die "Unknown command should fail instead of silently running an initialization path."
+else
+  status=$?
+  [[ "$status" -eq 2 ]] || die "Unknown command returned unexpected exit status ${status}."
+fi
+
 printf '%s\n' "behavior tests passed"

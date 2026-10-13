@@ -41,6 +41,17 @@ assert_equal "auto" "$(normalize_conntrack_mode auto)"
 assert_equal "on" "$(normalize_conntrack_mode on)"
 assert_equal "off" "$(normalize_conntrack_mode off)"
 assert_equal "off" "$(resolve_conntrack_mode off)"
+sysctl() {
+  [[ "${1:-}" == "-n" ]] || return 1
+  printf '%s\n' "${MOCK_SYSCTL_VALUE:-}"
+}
+MOCK_SYSCTL_VALUE=bbr
+verify_sysctl_value net.ipv4.tcp_congestion_control bbr
+MOCK_SYSCTL_VALUE=cubic
+if verify_sysctl_value net.ipv4.tcp_congestion_control bbr; then
+  printf '%s\n' "mismatched runtime sysctl value passed verification" >&2
+  exit 1
+fi
 is_root_command uninstall
 is_root_command select
 if is_root_command status; then

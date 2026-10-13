@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.1"
+readonly SCRIPT_VERSION="1.10.2"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -24,6 +24,7 @@ readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
 readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
 readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
 readonly XUI_POLICY_HELPER_VERSION="1.8.0"
+ZONEINFO_DIR="/usr/share/zoneinfo"
 readonly ROOT_COMMANDS=(full kernel ipv6 conntrack bandwidth mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
@@ -45,6 +46,22 @@ XUI_POLICY_SERVICE_STOPPED=0
 
 log() { printf '%s\n' "${GREEN}$*${RESET}"; }
 warn() { printf '%s\n' "${YELLOW}$*${RESET}" >&2; }
+run_with_timeout() {
+  local seconds=$1
+  shift
+  command -v timeout >/dev/null 2>&1 || return 127
+  timeout --signal=TERM "${seconds}s" "$@"
+}
+run_timedatectl() {
+  local seconds=${1:-5}
+  shift || true
+  run_with_timeout "$seconds" timedatectl "$@"
+}
+github_raw_url() {
+  local path=$1
+  printf 'https://raw.githubusercontent.com/%s/main/%s?cache=%s-%s\n' \
+    "$REPO_SLUG" "$path" "$(date +%s)" "$RANDOM"
+}
 die() {
   # Never leave 3X-UI stopped if an explicit error exits this script.
   if (( XUI_POLICY_SERVICE_STOPPED )); then
@@ -238,10 +255,10 @@ show_status() {
   local mss="not configured"
   local xui_nofile="未检测到 x-ui.service"
   local xui_pid
-  local tuning_bandwidth tuning_rtt
+  local tuning_bandwidth tuning_rtt mss_mode mss_value mss_value6 ipv4_mss ipv6_mss
 
   if command -v timedatectl >/dev/null; then
-    timezone=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
+    timezone=$(run_timedatectl 2 show --property=Timezone --value 2>/dev/null || true)
   fi
   if [[ -z "$timezone" || "$timezone" == "unavailable" ]]; then
     if [[ -r /etc/timezone ]]; then
@@ -253,16 +270,21 @@ show_status() {
   if command -v swapon >/dev/null && [[ -n $(swapon --show=NAME --noheadings 2>/dev/null) ]]; then
     swap=$(free -h | awk '/^Swap:/ {print $2 " total, " $3 " used"}')
   fi
-  if command -v iptables >/dev/null && iptables -w 2 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
-    mss=$(awk -F= '/^MSS_MODE=/{mode=$2} /^MSS_VALUE=/{value=$2} /^MSS_VALUE6=/{value6=$2} END {if (mode == "fixed") print mode " (" value ")"; else if (mode == "dual-fixed") print mode " (IPv4 " value ", IPv6 " value6 ")"; else print mode}' "$MSS_CONFIG" 2>/dev/null || true)
+  if [[ -r "$MSS_CONFIG" ]]; then
+    mss_mode=$(awk -F= '$1 == "MSS_MODE" {print $2; exit}' "$MSS_CONFIG")
+    mss_value=$(awk -F= '$1 == "MSS_VALUE" {print $2; exit}' "$MSS_CONFIG")
+    mss_value6=$(awk -F= '$1 == "MSS_VALUE6" {print $2; exit}' "$MSS_CONFIG")
+    ipv4_mss=$(mss_family_status iptables "$mss_mode" "$mss_value" "$mss_value6")
+    ipv6_mss=$(mss_family_status ip6tables "$mss_mode" "$mss_value" "$mss_value6")
+    mss="${mss_mode:-unknown} (IPv4: ${ipv4_mss}, IPv6: ${ipv6_mss})"
   fi
   if xui_service_detected && command -v systemctl >/dev/null; then
-    xui_pid=$(systemctl show x-ui.service --property=MainPID --value 2>/dev/null || true)
+    xui_pid=$(run_with_timeout 3 systemctl show x-ui.service --property=MainPID --value 2>/dev/null || true)
     if [[ "$xui_pid" =~ ^[1-9][0-9]*$ && -r "/proc/${xui_pid}/limits" ]]; then
       xui_nofile=$(awk '$1 == "Max" && $2 == "open" && $3 == "files" {print $4}' "/proc/${xui_pid}/limits")
       [[ -n "$xui_nofile" ]] || xui_nofile="未读取"
     else
-      xui_nofile="未运行（下次启动配置：$(systemctl show x-ui.service --property=LimitNOFILE --value 2>/dev/null || echo 未读取)）"
+      xui_nofile="未运行（下次启动配置：$(run_with_timeout 3 systemctl show x-ui.service --property=LimitNOFILE --value 2>/dev/null || echo 未读取)）"
     fi
   fi
   tuning_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
@@ -513,6 +535,17 @@ WantedBy=multi-user.target
 EOF
 
   sysctl -p "$SYSCTL_FILE"
+  verify_sysctl_value net.core.default_qdisc fq || die "内核未应用 net.core.default_qdisc=fq。"
+  verify_sysctl_value net.ipv4.tcp_congestion_control bbr || die "内核未应用 TCP BBR。"
+  verify_sysctl_value net.ipv4.tcp_fastopen 3 || die "内核未应用 TCP Fast Open=3。"
+  verify_sysctl_value net.core.rmem_max "$rmem_max" || die "内核接收缓冲上限与配置不一致。"
+  verify_sysctl_value net.core.wmem_max "$wmem_max" || die "内核发送缓冲上限与配置不一致。"
+  verify_sysctl_value net.ipv4.ip_forward 1 || die "IPv4 转发未能生效。"
+  if [[ "$ipv6_mode" == "on" ]]; then
+    verify_sysctl_value net.ipv6.conf.all.forwarding 1 || die "IPv6 转发未能生效。"
+  else
+    verify_sysctl_value net.ipv6.conf.all.forwarding 0 || die "IPv6 转发关闭设置未能生效。"
+  fi
   systemctl daemon-reload
   systemctl enable vps-init-suite-sysctl.service >/dev/null
   configure_xui_service_limits "$file_max"
@@ -533,6 +566,12 @@ clean_conflicts() {
   if (( found )); then
     warn "已备份并移除已知的第三方 sysctl 碎片配置。"
   fi
+}
+
+verify_sysctl_value() {
+  local key=$1 expected=$2 actual
+  actual=$(sysctl -n "$key" 2>/dev/null) || return 1
+  [[ "$actual" == "$expected" ]]
 }
 
 buffer_profile() {
@@ -771,10 +810,11 @@ resolve_conntrack_mode() {
 
 is_valid_timezone() {
   local timezone=$1
-  local known_timezones
   [[ "$timezone" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || return 1
-  known_timezones=$(timedatectl list-timezones 2>/dev/null) || return 1
-  grep -Fxq -- "$timezone" <<<"$known_timezones"
+  case "/${timezone}/" in
+    */../*|*/./*) return 1 ;;
+  esac
+  [[ -f "${ZONEINFO_DIR}/${timezone}" ]]
 }
 
 fetch_timezone_text() {
@@ -848,22 +888,24 @@ EOF
 }
 
 enable_network_time() {
-  if timedatectl set-ntp true 2>/dev/null; then
+  if run_timedatectl 5 set-ntp true 2>/dev/null; then
     return 0
   fi
-  if systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1; then
+  if run_with_timeout 10 systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1; then
     warn "D-Bus 时间控制不可用，已直接启用 systemd-timesyncd。"
     return 0
   fi
   warn "systemd-timesyncd 不可用，正在安装 chrony 作为备用校时服务。"
   apt_install chrony
-  systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
-  systemctl enable --now chrony.service
+  run_with_timeout 10 systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+  if ! run_with_timeout 10 systemctl enable --now chrony.service; then
+    warn "chrony 已安装，但启动超时或失败；可稍后检查 systemctl status chrony.service。"
+  fi
 }
 
 set_timezone() {
   local timezone=$1
-  if timedatectl set-timezone "$timezone" 2>/dev/null; then
+  if run_timedatectl 5 set-timezone "$timezone" 2>/dev/null; then
     return 0
   fi
   ln -snf "/usr/share/zoneinfo/${timezone}" /etc/localtime
@@ -1024,6 +1066,45 @@ EOF
   chmod 0755 "$MSS_HELPER"
 }
 
+mss_family_status() {
+  local binary=$1 mode=$2 value=$3 value6=$4 rule_value
+  local chain
+  command -v "$binary" >/dev/null 2>&1 || { printf '%s\n' "未安装"; return 0; }
+  "$binary" -w 2 -t mangle -L >/dev/null 2>&1 || { printf '%s\n' "不支持"; return 0; }
+  "$binary" -w 2 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1 || { printf '%s\n' "未生效"; return 0; }
+
+  case "$mode" in
+    clamp)
+      "$binary" -w 2 -t mangle -C VPS_INIT_MSS -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || {
+        printf '%s\n' "未生效"
+        return 0
+      }
+      ;;
+    fixed|dual-fixed)
+      rule_value=$value
+      [[ "$mode" != "dual-fixed" || "$binary" != "ip6tables" ]] || rule_value=$value6
+      [[ "$rule_value" =~ ^[0-9]+$ ]] || { printf '%s\n' "未生效"; return 0; }
+      "$binary" -w 2 -t mangle -C VPS_INIT_MSS -j TCPMSS --set-mss "$rule_value" >/dev/null 2>&1 || {
+        printf '%s\n' "未生效"
+        return 0
+      }
+      ;;
+    *)
+      printf '%s\n' "未生效"
+      return 0
+      ;;
+  esac
+
+  for chain in OUTPUT FORWARD; do
+    "$binary" -w 2 -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN \
+      -m comment --comment vps-init-suite -j VPS_INIT_MSS >/dev/null 2>&1 || {
+      printf '%s\n' "不完整"
+      return 0
+    }
+  done
+  printf '%s\n' "已生效"
+}
+
 setup_mss() {
   require_root
   require_supported_os
@@ -1082,17 +1163,19 @@ EOF
     systemctl disable vps-init-suite-mss.service >/dev/null 2>&1 || true
     return 0
   fi
-  if iptables -w 5 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
-    if [[ "$mode" == "dual-fixed" ]]; then
-      log "Persistent dual-stack MSS policy applied (IPv4 ${value}, IPv6 ${value6})."
-    elif [[ "$mode" == "fixed" ]]; then
-      log "Persistent MSS policy applied with fixed value ${value}."
-    else
-      log "Persistent path-MTU MSS clamping applied."
-    fi
+  local ipv4_status ipv6_status
+  ipv4_status=$(mss_family_status iptables "$mode" "$value" "$value6")
+  ipv6_status=$(mss_family_status ip6tables "$mode" "$value" "$value6")
+  if [[ "$mode" == "dual-fixed" ]]; then
+    log "MSS 持久化策略：IPv4 ${value}，IPv6 ${value6}。"
+  elif [[ "$mode" == "fixed" ]]; then
+    log "MSS 持久化策略：固定 ${value}。"
   else
-    warn "iptables mangle is unavailable; MSS policy was skipped."
+    log "MSS 持久化策略：clamp-to-PMTU。"
   fi
+  log "MSS 生效校验：IPv4 ${ipv4_status}，IPv6 ${ipv6_status}。"
+  [[ "$ipv4_status" == "已生效" ]] || warn "IPv4 MSS 规则未完整生效；检查 VPS 是否提供 iptables mangle 权限。"
+  [[ "$ipv6_status" == "已生效" ]] || warn "IPv6 MSS 规则不可用或未完整生效；IPv6 未启用时可忽略。"
 }
 
 uninstall_3xui() {
@@ -1133,7 +1216,7 @@ install_xui_policy_helper() {
   else
     command -v curl >/dev/null || apt_install ca-certificates curl
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --silent --show-error --fail \
-      "https://raw.githubusercontent.com/${REPO_SLUG}/main/xui-policy.py" -o "$temporary"
+      "$(github_raw_url xui-policy.py)" -o "$temporary"
     chmod 0755 "$temporary"
   fi
   python3 - "$temporary" <<'PY'
@@ -1525,12 +1608,18 @@ install_shortcut() {
     install -m 0755 "$source_path" "$temporary"
   else
     apt_install ca-certificates curl
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --silent --show-error --fail \
-      "https://raw.githubusercontent.com/${REPO_SLUG}/main/setup.sh" -o "$temporary"
+    if ! curl --location --proto '=https' --proto-redir '=https' --tlsv1.2 --silent --show-error --fail \
+      "$(github_raw_url setup.sh)" -o "$temporary"; then
+      rm -f -- "$temporary"
+      die "Could not download the latest setup script."
+    fi
     chmod 0755 "$temporary"
   fi
 
-  bash -n "$temporary"
+  if ! bash -n "$temporary"; then
+    rm -f -- "$temporary"
+    die "Downloaded setup script failed its Bash syntax check."
+  fi
   mv -f -- "$temporary" "$INSTALLED_SCRIPT"
   ln -sfn "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"
   log "Shortcut installed: ${LAUNCHER_NAME} (privileged actions will request sudo automatically)"
@@ -1576,13 +1665,20 @@ update_self() {
   else
     target="${PWD}/setup.sh"
   fi
+  assert_not_symlink "$target"
   local temporary
-  temporary=$(mktemp)
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 --silent --show-error --fail --location \
-    "https://raw.githubusercontent.com/${REPO_SLUG}/main/setup.sh" -o "$temporary"
-  bash -n "$temporary"
-  install -m 0755 "$temporary" "$target"
-  rm -f -- "$temporary"
+  temporary=$(mktemp "$(dirname -- "$target")/.setup.sh.XXXXXX")
+  if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 --silent --show-error --fail --location \
+    "$(github_raw_url setup.sh)" -o "$temporary"; then
+    rm -f -- "$temporary"
+    die "Could not download the latest setup script."
+  fi
+  if ! bash -n "$temporary"; then
+    rm -f -- "$temporary"
+    die "Downloaded setup script failed its Bash syntax check."
+  fi
+  chmod 0755 "$temporary"
+  mv -f -- "$temporary" "$target"
   log "Downloaded the latest script to ${target}."
 }
 

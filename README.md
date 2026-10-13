@@ -9,11 +9,13 @@
 - 默认使用保守的 `100 Mbps / 160 ms` 档；缓冲上限受动态物理内存天花板约束（约每 128 MiB RAM 放宽 1 MiB，上限 64 MiB），并将 BDP 结果向上取 4/8/16/32/64 MiB 档。例如约 1 GiB 机器输入 200 Mbps、160-200 ms RTT 时可使用 8 MiB。TCP 缓冲按需增长，不会启动时预分配全部上限；但大量同时高速传输的活跃连接仍可能提高内核内存占用，应结合 `vps-init diagnose` 及 `free -h` 观察。
 - 面向代理节点设置 TCP 自动接收缓冲和适度连接队列；`tcp_slow_start_after_idle=1` 避免空闲连接恢复时突发发包放大丢包。连接跟踪（conntrack）默认自动判断：有 NAT/状态防火墙才启用，纯 Xray 代理默认不主动加载，减少每包开销。
 - 通过独立 systemd 服务固化 sysctl，避免普通重启后失效。
+- 写入后立即回读并验证 BBR、FQ、Fast Open、收发缓冲上限和转发状态；若运行时值与目标不符会明确报错，不再只凭配置文件写入成功判断完成。
 - 开启 IPv4 转发；IPv6 转发由用户选择，默认关闭，同时保留普通 IPv6 主机连接能力。
 - 支持 `clamp-to-PMTU` 或固定值 MSS，同时覆盖本机流量和转发流量。
 - 无现有 SWAP 时，根据内存自动创建 2 GiB 或 4 GiB SWAP，设置 `swappiness=10`。
 - 通过三个 HTTPS 地理服务依次探测公网出口时区，并启用网络时间同步。
-- 优先使用 `systemd-timesyncd`，在 D-Bus/timesyncd 不可用时回退到 chrony 和本地时区软链接。
+- 优先使用 `systemd-timesyncd`，在 D-Bus/timesyncd 不可用时回退到 chrony 和本地时区软链接；D-Bus 与服务启动均有超时，时区合法性直接由本地 zoneinfo 校验。
+- MSS 安装后会分别核对 IPv4/IPv6 的 MSS 规则及 `OUTPUT`、`FORWARD` 挂载点，不把“私有链存在”误报为规则已生效；不支持的 IPv6 规则只告警，不阻断 IPv4 调优。
 - 可选彻底清理 3X-UI 服务及已知数据目录。
 - 可选安全调整 3X-UI 的 Xray `policy.levels[0]`：先停面板、备份 SQLite、修改后校验并重启，失败时保留备份并尝试恢复。
 - 完整初始化后安装 `vps-init` 快捷命令，随时打开中文菜单或执行子命令；如果检测到 3X-UI，会在初始化结束时询问是否立即打开 policy 菜单。
@@ -32,7 +34,7 @@
 > 下面的代码块每一行都是一条独立命令，请逐行粘贴并在每行按一次 Enter。不要把多行命令连成一行，否则 `curl` 会把后面的命令误当成 URL。
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh
+curl -fsSL -o setup.sh "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)"
 sed -n '1,260p' setup.sh
 chmod +x setup.sh
 ./setup.sh full
@@ -41,14 +43,14 @@ chmod +x setup.sh
 root 用户也可以使用这一条命令直接下载并执行（不会依赖 `less` 或 `sudo`）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh -o /tmp/vps-init-setup.sh && chmod +x /tmp/vps-init-setup.sh && /tmp/vps-init-setup.sh full
+curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)" -o /tmp/vps-init-setup.sh && chmod +x /tmp/vps-init-setup.sh && /tmp/vps-init-setup.sh full
 ```
 
 如果之前误把多条命令粘成一行，先删除错误下载文件，再重新逐行执行：
 
 ```bash
 rm -f setup.sh
-curl -fsSLO https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh
+curl -fsSL -o setup.sh "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)"
 chmod +x setup.sh
 ./setup.sh full
 ```
@@ -129,7 +131,7 @@ vps-init uninstall --remove-swap
 确认脚本内容后，也可以一行执行完整初始化：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh | bash -s -- full
+curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)" | bash -s -- full
 ```
 
 上面的管道命令仅适用于当前已经是 root 的会话；普通用户请将末尾改为 `| sudo bash -s -- full`。
