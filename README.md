@@ -30,7 +30,7 @@
 
 ## 傻瓜式一键安装（推荐）
 
-在 VPS 的 SSH 终端中，整行复制执行。脚本会先下载到临时文件、检查 Bash 语法，再开始初始化；root 会直接运行，普通用户会自动通过 `sudo` 提权。安装过程中会逐项确认带宽和 RTT，确认一项后才询问下一项。
+在 VPS 的 SSH 终端中，整行复制执行。脚本会先下载到临时文件、检查 Bash 语法，再开始初始化；root 会直接运行，普通用户会自动通过 `sudo` 提权。新机器首次初始化时，如果没有已保存的带宽/RTT 档位，会在安装依赖和修改系统配置前逐项询问；确认一项后才询问下一项。
 
 ```bash
 ( f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)" -o "$f" && bash -n "$f" && if [ "$(id -u)" -eq 0 ]; then bash "$f" full; else sudo bash "$f" full; fi )
@@ -61,7 +61,7 @@ vps-init status
 vps-init ipv6 on
 ```
 
-首次交互式初始化会询问 VPS 标称带宽（Mbps）和代理用户典型 RTT（毫秒），用于估算单流 BDP 缓冲；无法交互时自动使用 `100 Mbps / 160 ms` 保守档。输入的是线路/套餐上限，不是一次测速结果；测速受出口、目标站点和时段影响，不会由脚本擅自改成测速值。
+带宽和 RTT 不会自动识别或测速。首次交互式初始化且没有已保存档位时，会询问 VPS 套餐标称带宽（Mbps）和代理用户到节点的典型 RTT（毫秒），用于估算单流 BDP 缓冲；输入的是线路/套餐信息，不是一次测速结果。无法交互时使用 `100 Mbps / 160 ms` 保守档。已有档位会直接复用；需要更改时运行 `vps-init`，选择“手动设置/修改带宽与 RTT”，或执行 `vps-init bandwidth`。
 
 不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令、开启/禁用 IPv6 转发、3X-UI policy 和卸载套件等选项。这里的“禁用 IPv6”仅关闭内核转发，不会关闭本机 IPv6 出站；也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
 
@@ -121,7 +121,7 @@ vps-init uninstall --remove-swap
 
 | 命令 | 说明 |
 | --- | --- |
-| `sudo ./setup.sh full` | 完整初始化；交互询问带宽/RTT，IPv6 默认关闭，conntrack 自动判断 |
+| `sudo ./setup.sh full` | 完整初始化；首次交互运行且没有已保存档位时，先询问带宽/RTT；IPv6 默认关闭，conntrack 自动判断 |
 | `sudo ./setup.sh full auto on off 200 160` | 完整初始化并开启 IPv6、关闭 conntrack，按 200 Mbps/160 ms 计算缓冲 |
 | `sudo ./setup.sh full Asia/Tokyo off on 500 160` | 完整初始化并关闭 IPv6、开启 conntrack，按 500 Mbps/160 ms 计算缓冲 |
 | `sudo ./setup.sh kernel on auto 200 160` | 仅应用内核参数并开启 IPv6，按带宽/RTT 计算缓冲 |
@@ -129,9 +129,11 @@ vps-init uninstall --remove-swap
 | `sudo ./setup.sh conntrack off` | 纯代理节点不主动加载 conntrack |
 | `sudo ./setup.sh conntrack on` | VPS 做 NAT/转发或使用状态防火墙时启用 conntrack |
 | `sudo ./setup.sh conntrack auto` | 根据现有 iptables/nat 规则自动选择（默认） |
+| `sudo ./setup.sh bandwidth` | 逐项手动输入并保存带宽/RTT，立即应用新的缓冲档 |
 | `sudo ./setup.sh bandwidth 200 160` | 保存并立即应用 200 Mbps、160 ms 的 BDP 缓冲档 |
 | `sudo ./setup.sh bandwidth auto auto` | 使用保守默认 100 Mbps、160 ms 档 |
 | `vps-init diagnose` | 查看 Xray、ksoftirqd、CPU steal、TCP 重传、队列和 conntrack 计数 |
+| `vps-init` 菜单中的“手动设置/修改带宽与 RTT” | 随时录入或更新带宽/延迟档位；不是自动测速 |
 | `vps-init` 菜单中的“禁用 IPv6 转发” | 关闭 IPv6 forwarding，保留普通 IPv6 出站 |
 | `sudo ./setup.sh mss clamp` | 使用路径 MTU 自动钳制 MSS（默认） |
 | `sudo ./setup.sh mss 1380` | 将 MSS 固定为 1380，可使用 1200-1460 |

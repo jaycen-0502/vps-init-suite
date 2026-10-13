@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.3"
+readonly SCRIPT_VERSION="1.10.4"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -367,17 +367,21 @@ diagnose_system() {
 tune_kernel() {
   require_root
   require_supported_os
-  assert_not_symlink "$SYSCTL_FILE"
-  assert_not_symlink "$SYSCTL_UNIT"
-  assert_not_symlink /etc/modules-load.d/vps-init-suite.conf
-  apt_install kmod procps
-
   local ipv6_mode requested_ipv6 conntrack_mode requested_conntrack
   local requested_bandwidth requested_rtt
   requested_ipv6=${1:-}
   requested_conntrack=${2:-${VPS_CONNTRACK:-auto}}
   requested_bandwidth=${3:-}
   requested_rtt=${4:-}
+  if [[ -t 0 ]]; then
+    prompt_missing_tuning_profile requested_bandwidth requested_rtt
+  fi
+
+  assert_not_symlink "$SYSCTL_FILE"
+  assert_not_symlink "$SYSCTL_UNIT"
+  assert_not_symlink /etc/modules-load.d/vps-init-suite.conf
+  apt_install kmod procps
+
   if [[ -z "$requested_ipv6" ]] && [[ -r /proc/sys/net/ipv6/conf/all/forwarding ]]; then
     requested_ipv6=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)
     [[ "$requested_ipv6" == "1" ]] && requested_ipv6=on || requested_ipv6=off
@@ -716,6 +720,35 @@ prompt_tuning_value() {
     printf '已确认%s：%s %s。\n\n' "$label" "$value" "$unit"
     return 0
   done
+}
+
+prompt_missing_tuning_profile() {
+  local bandwidth_var=$1 rtt_var=$2
+  local bandwidth=${!bandwidth_var} rtt=${!rtt_var}
+  local stored_bandwidth stored_rtt
+
+  stored_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
+  stored_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
+  [[ -n "$bandwidth" ]] || bandwidth=$stored_bandwidth
+  [[ -n "$rtt" ]] || rtt=$stored_rtt
+
+  if [[ -z "$bandwidth" || -z "$rtt" ]]; then
+    log "带宽和 RTT 不会自动测速。请按 VPS 套餐标称带宽和用户到节点的典型延迟填写；每项确认后再进入下一项。"
+  fi
+  if [[ -z "$bandwidth" ]]; then
+    prompt_tuning_value bandwidth "VPS 标称带宽" \
+      "请输入 VPS 套餐标称带宽 Mbps（输入 auto 按保守 100 Mbps）[auto]: " \
+      auto 1 100000 1 100 Mbps
+  fi
+  if [[ -z "$rtt" ]]; then
+    prompt_tuning_value rtt "代理 RTT" \
+      "请输入代理用户到 VPS 的典型 RTT 毫秒（跨洋可填 160）[160]: " \
+      160 1 2000 1 160 ms
+  fi
+
+  log "本次缓冲档位：${bandwidth} Mbps / ${rtt} ms；如需修改，可在菜单选择“手动设置/修改带宽与 RTT”。"
+  printf -v "$bandwidth_var" '%s' "$bandwidth"
+  printf -v "$rtt_var" '%s' "$rtt"
 }
 
 configure_bandwidth_profile() {
@@ -1789,7 +1822,7 @@ menu() {
  11. 关闭 IPv6 转发
  12. 卸载 vps-init-suite（保留 SWAP）
   13. 3X-UI / Xray 连接策略
- 14. 带宽/RTT 缓冲档位
+ 14. 手动设置/修改带宽与 RTT
  15. 网络/CPU 诊断
  16. 退出（也可输入 0）
 EOF
@@ -1835,7 +1868,7 @@ select_menu() {
       " 12. 卸载套件（保留 SWAP）" \
       " 13. 卸载套件并删除受管 SWAP" \
       " 14. 3X-UI / Xray 连接策略" \
-      " 15. 带宽/RTT 缓冲档位" \
+      " 15. 手动设置/修改带宽与 RTT" \
       " 16. 网络/CPU 诊断" \
       "  0. 退出"
     read -r -p "请选择 [0-16]: " choice

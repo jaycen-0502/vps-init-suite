@@ -116,6 +116,35 @@ RTT_MS=160
 EOF
 assert_equal "200" "$(tuning_value BANDWIDTH_MBPS "$TEST_TEMP_DIR/tuning.conf")"
 assert_equal "160" "$(tuning_value RTT_MS "$TEST_TEMP_DIR/tuning.conf")"
+
+MOCK_TUNING_BANDWIDTH=""
+MOCK_TUNING_RTT=""
+tuning_value() {
+  case "$1" in
+    BANDWIDTH_MBPS) printf '%s\n' "$MOCK_TUNING_BANDWIDTH" ;;
+    RTT_MS) printf '%s\n' "$MOCK_TUNING_RTT" ;;
+    *) return 1 ;;
+  esac
+}
+PROMPT_INPUTS+=(250 180)
+PROFILE_BANDWIDTH=""
+PROFILE_RTT=""
+prompt_missing_tuning_profile PROFILE_BANDWIDTH PROFILE_RTT >"$TEST_TEMP_DIR/profile-prompt-output"
+assert_equal "250" "$PROFILE_BANDWIDTH"
+assert_equal "180" "$PROFILE_RTT"
+assert_equal "6" "$PROMPT_INDEX"
+assert_equal "请输入 VPS 套餐标称带宽 Mbps（输入 auto 按保守 100 Mbps）[auto]: " "${PROMPT_TEXTS[4]}"
+assert_equal "请输入代理用户到 VPS 的典型 RTT 毫秒（跨洋可填 160）[160]: " "${PROMPT_TEXTS[5]}"
+
+MOCK_TUNING_BANDWIDTH=500
+MOCK_TUNING_RTT=120
+PROFILE_BANDWIDTH=""
+PROFILE_RTT=""
+prompt_missing_tuning_profile PROFILE_BANDWIDTH PROFILE_RTT >"$TEST_TEMP_DIR/saved-profile-output"
+assert_equal "500" "$PROFILE_BANDWIDTH"
+assert_equal "120" "$PROFILE_RTT"
+assert_equal "6" "$PROMPT_INDEX"
+
 mkdir -p "$TEST_TEMP_DIR/state" "$TEST_TEMP_DIR/backups/20260101" "$TEST_TEMP_DIR/backups/20260201"
 printf '%s\n' 'user setting' >"$TEST_TEMP_DIR/custom.conf"
 capture_original_managed_file "$TEST_TEMP_DIR/custom.conf" "$TEST_TEMP_DIR/state"
