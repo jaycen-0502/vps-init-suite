@@ -673,8 +673,11 @@ EOF
 
 prompt_tuning_value() {
   local target=$1 label=$2 prompt=$3 default=$4 minimum=$5 maximum=$6
-  local allow_auto=$7 auto_fallback=$8 unit=$9 answer value digit_limit
+  local allow_auto=$7 auto_fallback=$8 unit=$9 answer value digit_limit auto_hint=""
   digit_limit=${#maximum}
+  if [[ "$allow_auto" == "1" ]]; then
+    auto_hint="，或输入 auto"
+  fi
 
   while true; do
     if ! read -r -p "$prompt" answer; then
@@ -692,7 +695,7 @@ prompt_tuning_value() {
 
     if [[ ! "$value" =~ ^[0-9]+$ ]]; then
       printf '输入无效：请输入 %s-%s 之间的整数%s。请重新输入本项。\n\n' \
-        "$minimum" "$maximum" "$([[ "$allow_auto" == "1" ]] && printf '，或输入 auto' || true)"
+        "$minimum" "$maximum" "$auto_hint"
       continue
     fi
 

@@ -74,7 +74,7 @@ read() {
     [[ "$arg" == "-p" ]] && has_prompt=1
   done
   if (( !has_prompt )); then
-    builtin read "$@"
+    builtin read -r "$@"
     return $?
   fi
   while (($#)); do
