@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.5"
+readonly SCRIPT_VERSION="1.10.6"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -972,18 +972,29 @@ EOF
 }
 
 enable_network_time() {
-  if run_timedatectl 5 set-ntp true 2>/dev/null; then
+  # Use chrony as the primary synchronizer.  A running timesyncd can race
+  # chrony for the NTP socket, so stop it before starting chrony.
+  if ! apt_install chrony; then
+    warn "chrony 安装失败；保留当前时间，稍后可手动安装 chrony。"
     return 0
   fi
-  if run_with_timeout 10 systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1; then
-    warn "D-Bus 时间控制不可用，已直接启用 systemd-timesyncd。"
-    return 0
-  fi
-  warn "systemd-timesyncd 不可用，正在安装 chrony 作为备用校时服务。"
-  apt_install chrony
   run_with_timeout 10 systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
-  if ! run_with_timeout 10 systemctl enable --now chrony.service; then
-    warn "chrony 已安装，但启动超时或失败；可稍后检查 systemctl status chrony.service。"
+  if ! run_with_timeout 15 systemctl enable --now chrony.service >/dev/null 2>&1; then
+    warn "chrony 启动失败；可检查 systemctl status chrony.service。"
+    return 0
+  fi
+  if ! run_with_timeout 15 systemctl restart chrony.service >/dev/null 2>&1; then
+    warn "chrony 重启失败；保留后台校时服务继续运行。"
+    return 0
+  fi
+  if command -v chronyc >/dev/null 2>&1; then
+    if run_with_timeout 15 chronyc -n makestep >/dev/null 2>&1; then
+      log "chrony 已立即校准系统时间。"
+    else
+      warn "chrony 尚未完成立即校时；后台服务会继续重试。"
+    fi
+  else
+    warn "未找到 chronyc，无法立即校时；chrony 服务仍已启用。"
   fi
 }
 

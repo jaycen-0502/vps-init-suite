@@ -105,4 +105,18 @@ if detect_public_timezone >/dev/null; then
   die "Invalid provider responses should not produce a timezone."
 fi
 
+TIME_SYNC_CALLS=()
+apt_install() { TIME_SYNC_CALLS+=("install:$*"); }
+run_with_timeout() {
+  local seconds=$1
+  shift
+  TIME_SYNC_CALLS+=("${seconds}:$*")
+  "$@"
+}
+systemctl() { return 0; }
+chronyc() { return 0; }
+enable_network_time
+[[ "${TIME_SYNC_CALLS[*]}" == "install:chrony 10:systemctl disable --now systemd-timesyncd.service 15:systemctl enable --now chrony.service 15:systemctl restart chrony.service 15:chronyc -n makestep" ]] ||
+  die "Network time setup should enable chrony and request an immediate step correction."
+
 printf '%s\n' "timezone tests passed"

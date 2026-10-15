@@ -15,7 +15,7 @@
 - 支持 `clamp-to-PMTU` 或固定值 MSS，同时覆盖本机流量和转发流量。
 - 无现有 SWAP 时，根据内存自动创建 2 GiB 或 4 GiB SWAP，设置 `swappiness=10`。
 - 通过三个 HTTPS 地理服务依次探测公网出口时区，并启用网络时间同步。
-- 优先使用 `systemd-timesyncd`，在 D-Bus/timesyncd 不可用时回退到 chrony 和本地时区软链接；D-Bus 与服务启动均有超时，时区合法性直接由本地 zoneinfo 校验。
+- 使用 `chrony` 作为网络校时服务：禁用可能冲突的 `systemd-timesyncd`，重启 chrony 后执行一次 `chronyc makestep` 立即校准；如果精简系统暂时无法安装或启动 chrony，会保留当前时间并给出检查提示。
 - MSS 安装后会分别核对 IPv4/IPv6 的 MSS 规则及 `OUTPUT`、`FORWARD` 挂载点，不把“私有链存在”误报为规则已生效；不支持的 IPv6 规则只告警，不阻断 IPv4 调优。
 - 可选彻底清理 3X-UI 服务及已知数据目录。
 - 可选安全调整 3X-UI 的 Xray `policy.levels[0]`：先停面板、备份 SQLite、修改后校验并重启，失败时保留备份并尝试恢复。
