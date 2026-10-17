@@ -402,6 +402,7 @@ tune_kernel() {
 
   capture_original_sysctl_state
   capture_original_managed_file "$SYSCTL_FILE"
+  restore_system_sysctl_link
   clean_conflicts
 
   local memory_mb
@@ -554,6 +555,17 @@ EOF
   systemctl enable vps-init-suite-sysctl.service >/dev/null
   configure_xui_service_limits "$file_max"
   log "内核配置已生效，并已设置为开机自动应用。"
+}
+
+restore_system_sysctl_link() {
+  local path=/etc/sysctl.d/99-sysctl.conf
+  # Older releases treated this distribution-managed entry point as a
+  # removable conflict. Restore it only when absent; never overwrite a user
+  # file or symlink.
+  [[ -e "$path" || -L "$path" ]] && return 0
+  [[ -f /etc/sysctl.conf ]] || return 0
+  ln -s ../sysctl.conf "$path"
+  log "已恢复系统默认的 /etc/sysctl.d/99-sysctl.conf 软链接。"
 }
 
 clean_conflicts() {

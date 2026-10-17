@@ -175,6 +175,7 @@ vps-init uninstall --remove-swap
 - 每次重写项目自己的 sysctl 文件前，旧版本都会备份到 `/var/lib/vps-init-suite/backups/`。
 - MSS 使用专用 `VPS_INIT_MSS` 链和注释标记，只处理 `FORWARD` 中的 TCP SYN，不保存或覆盖整套防火墙规则。
 - 不会执行 `iptables -F`、不会覆盖 `/etc/sysctl.conf`，也不会删除系统用于加载 `/etc/sysctl.conf` 的 `99-sysctl.conf` 软链接，也不会覆盖已有的非本项目 `x-ui.service` drop-in；同名受管文件升级前会进入备份目录。
+- 如果旧版本曾误删该系统软链接，重新执行 `vps-init kernel` 时会在目标不存在且 `/etc/sysctl.conf` 存在的情况下安全恢复；已有文件或用户软链接不会被覆盖。
 - 完整初始化默认使用 `clamp-to-PMTU`（仅 `FORWARD`）；只有明确执行 `mss dual-fixed` 才会使用 IPv4 1380 / IPv6 1340 固定值。
 - `net.ipv4.tcp_fastopen=3` 只开启内核对 TFO 的客户端/服务端能力，应用仍需显式使用 TFO；普通 SSH 握手不因此携带 TFO 数据。脚本保留该值以兼顾代理性能，如需排查特定线路可单独将其设为 0，不应把它作为 SSH 断连的默认结论。
 - `net.ipv4.ip_local_port_range` 不会让临时端口抢占已监听的 SSH 端口；Linux 绑定监听端口时会进行冲突检查，因此保留宽端口池用于高并发代理连接。
