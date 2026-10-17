@@ -175,6 +175,7 @@ vps-init uninstall --remove-swap
 - 每次重写项目自己的 sysctl 文件前，旧版本都会备份到 `/var/lib/vps-init-suite/backups/`。
 - MSS 使用专用 `VPS_INIT_MSS` 链和注释标记，只处理 `FORWARD` 中的 TCP SYN，不保存或覆盖整套防火墙规则。
 - 升级/安装快捷命令时会迁移旧版启动配置：停用重复的 sysctl 自定义服务、将 MSS 改为开机后延迟 timer，不阻塞网络就绪，并清理本项目旧版的 `OUTPUT` MSS 挂载。
+- 可选写入受管的 systemd manager drop-in，将全局服务停止等待上限设为 10 秒，减少 VPS 关机/重启时因代理连接迟迟不释放而长时间挂起；卸载时会恢复安装前的同名配置。
 - 不会执行 `iptables -F`、不会覆盖 `/etc/sysctl.conf`，也不会删除系统用于加载 `/etc/sysctl.conf` 的 `99-sysctl.conf` 软链接，也不会覆盖已有的非本项目 `x-ui.service` drop-in；同名受管文件升级前会进入备份目录。
 - 如果旧版本曾误删该系统软链接，重新执行 `vps-init kernel` 时会在目标不存在且 `/etc/sysctl.conf` 存在的情况下安全恢复；已有文件或用户软链接不会被覆盖。
 - 完整初始化默认使用 `clamp-to-PMTU`（仅 `FORWARD`）；只有明确执行 `mss dual-fixed` 才会使用 IPv4 1380 / IPv6 1340 固定值。

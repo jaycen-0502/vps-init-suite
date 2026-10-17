@@ -18,6 +18,7 @@ readonly TUNING_CONFIG="/etc/default/vps-init-suite-tuning"
 readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
 readonly MSS_TIMER="/etc/systemd/system/vps-init-suite-mss.timer"
+readonly SYSTEMD_TIMEOUT_FILE="/etc/systemd/system.conf.d/90-vps-init-suite-timeout.conf"
 readonly XUI_LIMITS_DIR="/etc/systemd/system/x-ui.service.d"
 readonly XUI_LIMITS_FILE="${XUI_LIMITS_DIR}/90-vps-init-suite.conf"
 readonly STATE_DIR="/var/lib/vps-init-suite/state"
@@ -232,6 +233,7 @@ is_suite_managed_file() {
       vps-init-suite-mss.service) grep -qF 'Apply vps-init-suite TCP MSS policy' "$1" ;;
       vps-init-suite-mss.timer) grep -qF 'Apply vps-init-suite TCP MSS policy after boot' "$1" ;;
       vps-init-suite-sysctl.service) grep -qF 'Apply vps-init-suite kernel parameters' "$1" ;;
+      90-vps-init-suite-timeout.conf) grep -qF 'DefaultTimeoutStopSec=10s' "$1" ;;
       apply-mss.sh) grep -qF '/etc/default/vps-init-suite' "$1" ;;
       xui-policy.py) grep -qF 'SETTING_KEY = "xrayTemplateConfig"' "$1" ;;
       *) return 1 ;;
@@ -541,6 +543,7 @@ EOF
   # not add a second boot-time unit or place sysctl behind network-online.
   migrate_legacy_boot_services
   systemctl daemon-reload
+  configure_systemd_shutdown_timeout
   configure_xui_service_limits "$file_max"
   log "内核配置已生效，并已设置为开机自动应用。"
 }
@@ -554,6 +557,29 @@ restore_system_sysctl_link() {
   [[ -f /etc/sysctl.conf ]] || return 0
   ln -s ../sysctl.conf "$path"
   log "已恢复系统默认的 /etc/sysctl.d/99-sysctl.conf 软链接。"
+}
+
+configure_systemd_shutdown_timeout() {
+  # Keep the scope limited to the suite-owned manager drop-in. Do not alter
+  # individual services or block network-online during boot.
+  if [[ -e "$SYSTEMD_TIMEOUT_FILE" ]] && ! is_suite_managed_file "$SYSTEMD_TIMEOUT_FILE"; then
+    warn "发现非本项目的 systemd 停机超时配置，保持原文件不变。"
+    return 0
+  fi
+  assert_not_symlink "$SYSTEMD_TIMEOUT_FILE"
+  capture_original_managed_file "$SYSTEMD_TIMEOUT_FILE"
+  mkdir -p "$(dirname "$SYSTEMD_TIMEOUT_FILE")"
+  local temporary
+  temporary=$(mktemp "$(dirname "$SYSTEMD_TIMEOUT_FILE")/.90-vps-init-suite-timeout.XXXXXX")
+  cat >"$temporary" <<'EOF'
+# Managed by vps-init-suite.
+[Manager]
+DefaultTimeoutStopSec=10s
+EOF
+  chmod 0644 "$temporary"
+  mv -f -- "$temporary" "$SYSTEMD_TIMEOUT_FILE"
+  systemctl daemon-reload
+  log "已设置 systemd 停机超时为 10 秒，避免代理服务停止时长时间挂起。"
 }
 
 write_mss_unit() {
@@ -1576,7 +1602,7 @@ restore_conflict_backups() {
 
 restore_original_managed_files() {
   local path filename marker original backup
-  for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" "$MSS_TIMER" \
+  for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" "$MSS_TIMER" "$SYSTEMD_TIMEOUT_FILE" \
     /etc/modules-load.d/vps-init-suite.conf "$MSS_CONFIG" "$MSS_HELPER" \
     "$TUNING_CONFIG" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
     filename=$(basename "$path")
@@ -1733,6 +1759,7 @@ uninstall_suite() {
   fi
   local managed_path
   for managed_path in "$MSS_UNIT" "$MSS_TIMER" "$SYSCTL_UNIT" \
+    "$SYSTEMD_TIMEOUT_FILE" \
     /etc/modules-load.d/vps-init-suite.conf \
     "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$TUNING_CONFIG" \
     "$MSS_CONFIG" "$MSS_HELPER" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" \
