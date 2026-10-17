@@ -41,6 +41,10 @@ assert_equal "auto" "$(normalize_conntrack_mode auto)"
 assert_equal "on" "$(normalize_conntrack_mode on)"
 assert_equal "off" "$(normalize_conntrack_mode off)"
 assert_equal "off" "$(resolve_conntrack_mode off)"
+[[ " ${CONFLICT_FILES[*]} " != *" 99-sysctl.conf "* ]] || {
+  printf '%s\n' "The system 99-sysctl.conf link must not be treated as a conflict." >&2
+  exit 1
+}
 sysctl() {
   [[ "${1:-}" == "-n" ]] || return 1
   printf '%s\n' "${MOCK_SYSCTL_VALUE:-}"

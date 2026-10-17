@@ -61,8 +61,8 @@ EOF
     exit 1
   }
   ! grep -qF 'RULE_APPEND failed' "$TEST_TEMP_DIR/helper.stderr" || die "MSS helper attempted an invalid TCPMSS rule."
-  grep -qF ' -t mangle -I OUTPUT ' "$TEST_TEMP_DIR/iptables.log" || die "MSS helper did not attach OUTPUT."
   grep -qF ' -t mangle -I FORWARD ' "$TEST_TEMP_DIR/iptables.log" || die "MSS helper did not attach FORWARD."
+  ! grep -qF ' -t mangle -I OUTPUT ' "$TEST_TEMP_DIR/iptables.log" || die "MSS helper must not attach OUTPUT."
 }
 
 run_mss_case clamp 1380 1340 --clamp-mss-to-pmtu --clamp-mss-to-pmtu

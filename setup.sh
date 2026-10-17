@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.6"
+readonly SCRIPT_VERSION="1.10.7"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -28,7 +28,7 @@ ZONEINFO_DIR="/usr/share/zoneinfo"
 readonly ROOT_COMMANDS=(full kernel ipv6 conntrack bandwidth mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
-  99-network-bbr.conf 99-optimal-proxy.conf 99-sysctl.conf 99-tcp-custom.conf
+  99-network-bbr.conf 99-optimal-proxy.conf 99-tcp-custom.conf
   99-tfo.conf 99-japan-vps.conf 99-us-vps.conf 99-vps-tuning.conf
 )
 
@@ -1140,7 +1140,17 @@ apply_family() {
     fi
   fi
 
-  for chain in OUTPUT FORWARD; do
+  # Remove OUTPUT attachments created by older releases.  Only rules carrying
+  # the suite comment are touched; unrelated firewall rules remain unchanged.
+  while "$binary" -w 5 -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN \
+    -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; do
+    "$binary" -w 5 -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN \
+      -m comment --comment vps-init-suite -j VPS_INIT_MSS || break
+  done
+
+  # Limit MSS rewriting to forwarded traffic.  Locally generated SYN/SYN-ACK
+  # packets (including SSH and Xray) must not be rewritten by this policy.
+  for chain in FORWARD; do
     if ! "$binary" -w 5 -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; then
       if ! "$binary" -w 5 -t mangle -I "$chain" 1 -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS; then
         printf 'vps-init-suite: cannot attach MSS rule to %s/%s; skipping.\n' "$binary" "$chain" >&2
@@ -1192,7 +1202,7 @@ mss_family_status() {
       ;;
   esac
 
-  for chain in OUTPUT FORWARD; do
+  for chain in FORWARD; do
     "$binary" -w 2 -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN \
       -m comment --comment vps-init-suite -j VPS_INIT_MSS >/dev/null 2>&1 || {
       printf '%s\n' "不完整"
@@ -1569,6 +1579,7 @@ remove_managed_mss_rules() {
   for binary in iptables ip6tables; do
     command -v "$binary" >/dev/null || continue
     "$binary" -w 5 -t mangle -S >/dev/null 2>&1 || continue
+    # Remove both current and legacy suite attachments during uninstall.
     for chain in OUTPUT FORWARD; do
       while "$binary" -w 5 -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; do
         "$binary" -w 5 -t mangle -D "$chain" -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS || break
