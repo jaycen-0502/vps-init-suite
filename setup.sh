@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.9"
+readonly SCRIPT_VERSION="1.10.10"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -1136,6 +1136,7 @@ setup_timezone() {
 setup_swap() {
   require_root
   require_supported_os
+  [[ -f /etc/fstab && ! -L /etc/fstab && -w /etc/fstab ]] || die "/etc/fstab is missing, not a regular file, or not writable; refusing to create swap."
   assert_not_symlink "$SWAP_SYSCTL_FILE"
   apt_install util-linux
 
@@ -1168,10 +1169,10 @@ setup_swap() {
   fi
   chmod 600 "$SWAP_FILE"
   mkswap "$SWAP_FILE"
-  swapon "$SWAP_FILE"
-  grep -qF "$SWAP_FILE none swap sw 0 0" /etc/fstab || printf '%s\n' "$SWAP_FILE none swap sw 0 0" >>/etc/fstab
   mkdir -p "$STATE_DIR"
   : >"${STATE_DIR}/managed-swap.present"
+  ensure_managed_swap_fstab_entry
+  swapon "$SWAP_FILE"
 
   capture_original_sysctl_state
   capture_original_managed_file "$SWAP_SYSCTL_FILE"
@@ -1181,6 +1182,39 @@ vm.swappiness = 10
 EOF
   sysctl -p "$SWAP_SYSCTL_FILE"
   log "已创建 ${swap_gib} GiB SWAP，swappiness 设置为 10。"
+}
+
+ensure_fstab_trailing_newline() {
+  local fstab=${1:-/etc/fstab}
+  [[ -s "$fstab" ]] || return 0
+  if [[ -n "$(tail -c 1 -- "$fstab")" ]]; then
+    printf '\n' >>"$fstab"
+  fi
+}
+
+ensure_managed_swap_fstab_entry() {
+  local fstab=${1:-/etc/fstab}
+  local entry="${SWAP_FILE} none swap sw,nofail 0 0"
+  [[ -f "$fstab" && ! -L "$fstab" ]] || die "${fstab} is missing or is not a regular file; refusing to modify swap configuration."
+
+  ensure_fstab_trailing_newline "$fstab"
+  if grep -qFx -- "$entry" "$fstab"; then
+    return 0
+  fi
+
+  # Replace only stale entries for this exact suite-owned swap path, including
+  # the legacy entry without nofail; leave every other fstab row untouched.
+  sed -i '\|^/swapfile-vps-init-suite[[:space:]].*|d' "$fstab"
+  ensure_fstab_trailing_newline "$fstab"
+  printf '%s\n' "$entry" >>"$fstab"
+}
+
+remove_managed_swap_fstab_entry() {
+  local fstab=${1:-/etc/fstab}
+  [[ -f "$fstab" && ! -L "$fstab" ]] || return 0
+  # Match the suite-owned path and swap filesystem type, regardless of whether
+  # an older entry used `sw` or the current `sw,nofail` options.
+  sed -i '\|^/swapfile-vps-init-suite[[:space:]].*[[:space:]]swap[[:space:]]|d' "$fstab"
 }
 
 write_mss_helper() {
@@ -1647,7 +1681,7 @@ remove_managed_swap() {
     fi
     rm -f -- "$SWAP_FILE"
   fi
-  sed -i '\|^/swapfile-vps-init-suite none swap sw 0 0$|d' /etc/fstab
+  remove_managed_swap_fstab_entry
   rm -f -- "${STATE_DIR}/managed-swap.present"
   log "Managed swap file and fstab entry removed."
 }

@@ -182,6 +182,7 @@ vps-init uninstall --remove-swap
 - `net.ipv4.tcp_fastopen=0` 默认关闭 TFO。需要使用 TFO 的用户可在确认线路兼容后手动改为 `3`；普通 SSH/Xray 连接不依赖该内核开关。
 - `net.ipv4.ip_local_port_range` 不会让临时端口抢占已监听的 SSH 端口；Linux 绑定监听端口时会进行冲突检查，因此保留宽端口池用于高并发代理连接。
 - 已存在任何活动 SWAP 时不会修改；磁盘余量不足时不会创建新文件。
+- 新建受管 SWAP 时会先确保 `/etc/fstab` 末尾换行，并使用 `sw,nofail` 持久化；卸载可兼容清理旧版 `sw` 条目，避免 fstab 行粘连或异常挂载阻断开机。
 - 3X-UI policy 工具只支持 SQLite，默认读取 `/etc/x-ui/x-ui.db`，也会识别 `XUI_DB_FOLDER`；检测到 PostgreSQL 等其他后端时会拒绝修改。若面板还没有保存 Xray 模板，会提示先在面板设置中保存一次，而不是报不明确的数据库错误。
 - 3X-UI policy 工具只修改 `xrayTemplateConfig` 中的 `policy.levels[0]`，不会覆盖入站、出站、路由或用户数据；修改前会停止 `x-ui.service` 并创建完整性校验过的备份。
 - `connIdle` 是空闲连接超时，不是连接总生命周期；活跃流量、LINE/Telegram/WebSocket/HTTP2 心跳可能让连接继续保持。过短的 `uplinkOnly` 或 `downlinkOnly` 可能造成正常长连接重连，建议先使用稳定档。
