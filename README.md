@@ -9,13 +9,13 @@
 - 交互输入带宽/RTT 时逐项询问：每项先校验并显示确认值，再出现下一项；范围错误会留在当前项重新输入，避免两个提示挤在一行造成误解。
 - 默认使用保守的 `100 Mbps / 160 ms` 档；缓冲上限受动态物理内存天花板约束（约每 128 MiB RAM 放宽 1 MiB，上限 64 MiB），并将 BDP 结果向上取 4/8/16/32/64 MiB 档。例如约 1 GiB 机器输入 200 Mbps、160-200 ms RTT 时可使用 8 MiB。TCP 缓冲按需增长，不会启动时预分配全部上限；但大量同时高速传输的活跃连接仍可能提高内核内存占用，应结合 `vps-init diagnose` 及 `free -h` 观察。
 - 面向代理节点设置 TCP 自动接收缓冲和适度连接队列；`tcp_slow_start_after_idle=1` 避免空闲连接恢复时突发发包放大丢包。连接跟踪（conntrack）默认自动判断：有 NAT/状态防火墙才启用，纯 Xray 代理默认不主动加载，减少每包开销。
-- 通过独立 systemd 服务固化 sysctl，避免普通重启后失效。
+- 通过发行版原生 `systemd-sysctl` 加载项目自己的 sysctl 文件，避免额外服务参与开机网络依赖。
 - 写入后立即回读并验证 BBR、FQ、Fast Open、收发缓冲上限和转发状态；若运行时值与目标不符会明确报错，不再只凭配置文件写入成功判断完成。
 - 开启 IPv4 转发；IPv6 转发由用户选择，默认关闭，同时保留普通 IPv6 主机连接能力。
 - 支持 `clamp-to-PMTU` 或固定值 MSS，默认只作用于 `FORWARD` 转发流量，不改写本机 SSH/Xray 等 `OUTPUT` 握手。
 - 无现有 SWAP 时，根据内存自动创建 2 GiB 或 4 GiB SWAP，设置 `swappiness=10`。
 - 通过三个 HTTPS 地理服务依次探测公网出口时区，并启用网络时间同步。
-- 使用 `chrony` 作为网络校时服务：禁用可能冲突的 `systemd-timesyncd`，重启 chrony 后执行一次 `chronyc makestep` 立即校准；如果精简系统暂时无法安装或启动 chrony，会保留当前时间并给出检查提示。
+- 优先使用发行版自带 `systemd-timesyncd`；只有该服务不可用时才安装 chrony，重启后执行一次 `chronyc makestep` 立即校准。校时失败只提示，不阻断开机。
 - MSS 安装后会分别核对 IPv4/IPv6 的 MSS 规则及 `FORWARD` 挂载点，不把“私有链存在”误报为规则已生效；不支持的 IPv6 规则只告警，不阻断 IPv4 调优。
 - 可选彻底清理 3X-UI 服务及已知数据目录。
 - 可选安全调整 3X-UI 的 Xray `policy.levels[0]`：先停面板、备份 SQLite、修改后校验并重启，失败时保留备份并尝试恢复。
@@ -167,20 +167,21 @@ vps-init uninstall --remove-swap
 - `tcp_slow_start_after_idle=1` 让空闲连接恢复时重新谨慎探测拥塞窗口，降低突发发送、丢包和重传放大风险；这会牺牲极少量恢复瞬时速度，优先保证单核 VPS 稳定性。`tcp_mtu_probing=1` 只在检测到 PMTU 黑洞时探测，不改变 UDP，也不替代 MSS `clamp-to-PMTU`。
 - IPv6 默认不做路由转发；选择 `on` 时开启 forwarding 并使用 `accept_ra=2`，适合中转/路由节点。该选项不会关闭普通 IPv6 出站连接。
 - `nf_conntrack` 默认使用 `auto`：检测到现有 NAT 或 conntrack/state 防火墙规则才加载并配置；纯 Xray/VLESS/Reality/SOCKS 代理不主动加载。需要 NAT、iptables 状态匹配或复杂转发时用 `vps-init conntrack on`。启用时 established 超时为 432000 秒（5 天）；如果仅代理且 `conntrack_count` 不断增长，应优先关闭它而不是继续扩大表。
-- MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；默认只挂载到 `FORWARD`，避免影响本机发起或回复的 SSH/Xray 握手。受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。
+- MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；默认只挂载到 `FORWARD`，避免影响本机发起或回复的 SSH/Xray 握手。MSS 通过开机后 30 秒触发的 timer 延迟应用，不参与网络就绪链，服务设置 20 秒启动超时。受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。
 - 快捷入口为 `/usr/local/bin/vps-init`，实际脚本保存在 `/usr/local/lib/vps-init-suite/setup.sh`。
 - 时区探测依次查询 `ipwho.is`、`ipinfo.io` 和 `ipapi.co`；这些服务会看到 VPS 的公网出口 IP，但脚本不会向其发送其他机器数据。
 - 所有探测请求强制使用 HTTPS，返回值必须存在于本机 IANA 时区数据库中才会应用。
 - 无人值守模式探测失败时会保留当前时区；交互模式提供常用地区、任意 IANA 时区及保留现状选项。
 - 每次重写项目自己的 sysctl 文件前，旧版本都会备份到 `/var/lib/vps-init-suite/backups/`。
 - MSS 使用专用 `VPS_INIT_MSS` 链和注释标记，只处理 `FORWARD` 中的 TCP SYN，不保存或覆盖整套防火墙规则。
+- 升级/安装快捷命令时会迁移旧版启动配置：停用重复的 sysctl 自定义服务、将 MSS 改为开机后延迟 timer，不阻塞网络就绪，并清理本项目旧版的 `OUTPUT` MSS 挂载。
 - 不会执行 `iptables -F`、不会覆盖 `/etc/sysctl.conf`，也不会删除系统用于加载 `/etc/sysctl.conf` 的 `99-sysctl.conf` 软链接，也不会覆盖已有的非本项目 `x-ui.service` drop-in；同名受管文件升级前会进入备份目录。
 - 如果旧版本曾误删该系统软链接，重新执行 `vps-init kernel` 时会在目标不存在且 `/etc/sysctl.conf` 存在的情况下安全恢复；已有文件或用户软链接不会被覆盖。
 - 完整初始化默认使用 `clamp-to-PMTU`（仅 `FORWARD`）；只有明确执行 `mss dual-fixed` 才会使用 IPv4 1380 / IPv6 1340 固定值。
 - `net.ipv4.tcp_fastopen=3` 只开启内核对 TFO 的客户端/服务端能力，应用仍需显式使用 TFO；普通 SSH 握手不因此携带 TFO 数据。脚本保留该值以兼顾代理性能，如需排查特定线路可单独将其设为 0，不应把它作为 SSH 断连的默认结论。
 - `net.ipv4.ip_local_port_range` 不会让临时端口抢占已监听的 SSH 端口；Linux 绑定监听端口时会进行冲突检查，因此保留宽端口池用于高并发代理连接。
 - 已存在任何活动 SWAP 时不会修改；磁盘余量不足时不会创建新文件。
-- 3X-UI policy 工具只支持 SQLite，默认读取 `/etc/x-ui/x-ui.db`，也会识别 `XUI_DB_FOLDER`；检测到 PostgreSQL 等其他后端时会拒绝修改。
+- 3X-UI policy 工具只支持 SQLite，默认读取 `/etc/x-ui/x-ui.db`，也会识别 `XUI_DB_FOLDER`；检测到 PostgreSQL 等其他后端时会拒绝修改。若面板还没有保存 Xray 模板，会提示先在面板设置中保存一次，而不是报不明确的数据库错误。
 - 3X-UI policy 工具只修改 `xrayTemplateConfig` 中的 `policy.levels[0]`，不会覆盖入站、出站、路由或用户数据；修改前会停止 `x-ui.service` 并创建完整性校验过的备份。
 - `connIdle` 是空闲连接超时，不是连接总生命周期；活跃流量、LINE/Telegram/WebSocket/HTTP2 心跳可能让连接继续保持。过短的 `uplinkOnly` 或 `downlinkOnly` 可能造成正常长连接重连，建议先使用稳定档。
 - policy 修改会重启 `x-ui.service`，现有代理连接可能短暂重连；若重启失败，脚本会尝试恢复之前的 policy 并重新启动服务。备份保留在 `/var/lib/vps-init-suite/backups/3xui/`。

@@ -89,6 +89,17 @@ class XuiPolicyTests(unittest.TestCase):
         )
         self.assertEqual(values, {"XUI_DB_TYPE": "sqlite", "XUI_DB_FOLDER": "/srv/custom xui"})
 
+    def test_missing_template_has_actionable_error(self):
+        empty_database = Path(self.temporary.name) / "empty.db"
+        with closing(sqlite3.connect(empty_database)) as connection:
+            connection.execute(
+                "CREATE TABLE settings (id INTEGER PRIMARY KEY, key TEXT NOT NULL, value TEXT NOT NULL)"
+            )
+            connection.commit()
+        with closing(sqlite3.connect(empty_database)) as connection:
+            with self.assertRaisesRegex(RuntimeError, "尚未保存 Xray 模板"):
+                XUI_POLICY.load_config(connection)
+
 
 if __name__ == "__main__":
     unittest.main()

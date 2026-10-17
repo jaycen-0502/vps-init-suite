@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.7"
+readonly SCRIPT_VERSION="1.10.8"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -17,6 +17,7 @@ readonly MSS_CONFIG="/etc/default/vps-init-suite"
 readonly TUNING_CONFIG="/etc/default/vps-init-suite-tuning"
 readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
+readonly MSS_TIMER="/etc/systemd/system/vps-init-suite-mss.timer"
 readonly XUI_LIMITS_DIR="/etc/systemd/system/x-ui.service.d"
 readonly XUI_LIMITS_FILE="${XUI_LIMITS_DIR}/90-vps-init-suite.conf"
 readonly STATE_DIR="/var/lib/vps-init-suite/state"
@@ -228,6 +229,7 @@ is_suite_managed_file() {
       vps-init-suite.conf) grep -qx 'tcp_bbr' "$1" ;;
       vps-init-suite) grep -q '^MSS_MODE=' "$1" ;;
       vps-init-suite-mss.service) grep -qF 'Apply vps-init-suite TCP MSS policy' "$1" ;;
+      vps-init-suite-mss.timer) grep -qF 'Apply vps-init-suite TCP MSS policy after boot' "$1" ;;
       vps-init-suite-sysctl.service) grep -qF 'Apply vps-init-suite kernel parameters' "$1" ;;
       apply-mss.sh) grep -qF '/etc/default/vps-init-suite' "$1" ;;
       xui-policy.py) grep -qF 'SETTING_KEY = "xrayTemplateConfig"' "$1" ;;
@@ -522,23 +524,6 @@ EOF
     printf '%s\n' nf_conntrack >>/etc/modules-load.d/vps-init-suite.conf
   fi
 
-  capture_original_managed_file "$SYSCTL_UNIT"
-  cat >"$SYSCTL_UNIT" <<EOF
-# Managed by vps-init-suite.
-[Unit]
-Description=Apply vps-init-suite kernel parameters
-After=systemd-sysctl.service
-Before=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/sysctl -p ${SYSCTL_FILE}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
   sysctl -p "$SYSCTL_FILE"
   verify_sysctl_value net.core.default_qdisc fq || die "内核未应用 net.core.default_qdisc=fq。"
   verify_sysctl_value net.ipv4.tcp_congestion_control bbr || die "内核未应用 TCP BBR。"
@@ -551,8 +536,10 @@ EOF
   else
     verify_sysctl_value net.ipv6.conf.all.forwarding 0 || die "IPv6 转发关闭设置未能生效。"
   fi
+  # /etc/sysctl.d is loaded by the distro-provided systemd-sysctl unit. Do
+  # not add a second boot-time unit or place sysctl behind network-online.
+  migrate_legacy_boot_services
   systemctl daemon-reload
-  systemctl enable vps-init-suite-sysctl.service >/dev/null
   configure_xui_service_limits "$file_max"
   log "内核配置已生效，并已设置为开机自动应用。"
 }
@@ -566,6 +553,68 @@ restore_system_sysctl_link() {
   [[ -f /etc/sysctl.conf ]] || return 0
   ln -s ../sysctl.conf "$path"
   log "已恢复系统默认的 /etc/sysctl.d/99-sysctl.conf 软链接。"
+}
+
+write_mss_unit() {
+  cat >"$MSS_UNIT" <<EOF
+# Managed by vps-init-suite.
+[Unit]
+Description=Apply vps-init-suite TCP MSS policy
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${MSS_HELPER}
+RemainAfterExit=yes
+TimeoutStartSec=20s
+TimeoutStopSec=5s
+
+EOF
+}
+
+write_mss_timer() {
+  cat >"$MSS_TIMER" <<EOF
+# Managed by vps-init-suite.
+[Unit]
+Description=Apply vps-init-suite TCP MSS policy after boot
+
+[Timer]
+OnBootSec=30s
+Unit=vps-init-suite-mss.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+migrate_legacy_boot_services() {
+  restore_system_sysctl_link
+  if is_suite_managed_file "$SYSCTL_UNIT"; then
+    run_with_timeout 10 systemctl disable --now vps-init-suite-sysctl.service >/dev/null 2>&1 || true
+    rm -f -- "$SYSCTL_UNIT"
+    log "已移除旧版开机 sysctl 服务，改用系统原生 systemd-sysctl。"
+  fi
+  if is_suite_managed_file "$MSS_UNIT"; then
+    assert_not_symlink "$MSS_UNIT"
+    write_mss_unit
+    systemctl disable vps-init-suite-mss.service >/dev/null 2>&1 || true
+    assert_not_symlink "$MSS_TIMER"
+    write_mss_timer
+    systemctl enable --now vps-init-suite-mss.timer >/dev/null 2>&1 || true
+    log "已迁移 MSS 到延迟启动计时器，不再占用系统开机目标。"
+  fi
+  # Remove only legacy suite-owned OUTPUT attachments. This lets an upgrade
+  # take effect immediately even when setup_mss is not run afterwards.
+  local binary
+  for binary in iptables ip6tables; do
+    command -v "$binary" >/dev/null 2>&1 || continue
+    while "$binary" -w 2 -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN \
+      -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; do
+      "$binary" -w 2 -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN \
+        -m comment --comment vps-init-suite -j VPS_INIT_MSS || break
+    done
+  done
+  systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 clean_conflicts() {
@@ -984,8 +1033,13 @@ EOF
 }
 
 enable_network_time() {
-  # Use chrony as the primary synchronizer.  A running timesyncd can race
-  # chrony for the NTP socket, so stop it before starting chrony.
+  # Prefer the distribution's native timesyncd. It adds no package or boot
+  # dependency. Fall back to chrony only when timesyncd is unavailable.
+  if run_timedatectl 5 set-ntp true 2>/dev/null ||
+    run_with_timeout 10 systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "systemd-timesyncd 不可用，正在安装 chrony 作为备用校时服务。"
   if ! apt_install chrony; then
     warn "chrony 安装失败；保留当前时间，稍后可手动安装 chrony。"
     return 0
@@ -1259,25 +1313,15 @@ EOF
   write_mss_helper
 
   capture_original_managed_file "$MSS_UNIT"
-  cat >"$MSS_UNIT" <<EOF
-# Managed by vps-init-suite.
-[Unit]
-Description=Apply vps-init-suite TCP MSS policy
-After=network-pre.target
-Before=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${MSS_HELPER}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
+  write_mss_unit
+  assert_not_symlink "$MSS_TIMER"
+  capture_original_managed_file "$MSS_TIMER"
+  write_mss_timer
 
   systemctl daemon-reload
-  systemctl enable vps-init-suite-mss.service >/dev/null
-  if ! systemctl restart vps-init-suite-mss.service; then
+  systemctl disable vps-init-suite-mss.service >/dev/null 2>&1 || true
+  systemctl enable --now vps-init-suite-mss.timer >/dev/null
+  if ! run_with_timeout 20 systemctl start vps-init-suite-mss.service; then
     warn "MSS 服务未能启动，将继续完成其他配置；检查命令：systemctl status vps-init-suite-mss.service"
     systemctl disable vps-init-suite-mss.service >/dev/null 2>&1 || true
     return 0
@@ -1531,7 +1575,7 @@ restore_conflict_backups() {
 
 restore_original_managed_files() {
   local path filename marker original backup
-  for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" \
+  for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" "$MSS_TIMER" \
     /etc/modules-load.d/vps-init-suite.conf "$MSS_CONFIG" "$MSS_HELPER" \
     "$TUNING_CONFIG" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
     filename=$(basename "$path")
@@ -1680,11 +1724,14 @@ uninstall_suite() {
   if is_suite_managed_file "$MSS_UNIT"; then
     systemctl disable --now vps-init-suite-mss.service >/dev/null 2>&1 || true
   fi
+  if is_suite_managed_file "$MSS_TIMER"; then
+    systemctl disable --now vps-init-suite-mss.timer >/dev/null 2>&1 || true
+  fi
   if is_suite_managed_file "$SYSCTL_UNIT"; then
     systemctl disable --now vps-init-suite-sysctl.service >/dev/null 2>&1 || true
   fi
   local managed_path
-  for managed_path in "$MSS_UNIT" "$SYSCTL_UNIT" \
+  for managed_path in "$MSS_UNIT" "$MSS_TIMER" "$SYSCTL_UNIT" \
     /etc/modules-load.d/vps-init-suite.conf \
     "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$TUNING_CONFIG" \
     "$MSS_CONFIG" "$MSS_HELPER" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" \
@@ -1741,6 +1788,7 @@ install_shortcut() {
   fi
   mv -f -- "$temporary" "$INSTALLED_SCRIPT"
   ln -sfn "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"
+  migrate_legacy_boot_services
   log "Shortcut installed: ${LAUNCHER_NAME} (privileged actions will request sudo automatically)"
 }
 
@@ -1798,6 +1846,7 @@ update_self() {
   fi
   chmod 0755 "$temporary"
   mv -f -- "$temporary" "$target"
+  migrate_legacy_boot_services
   log "Downloaded the latest script to ${target}."
 }
 

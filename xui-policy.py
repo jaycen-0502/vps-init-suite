@@ -30,6 +30,11 @@ def db_rows(connection):
     rows = connection.execute(
         "SELECT id, value FROM settings WHERE key = ? ORDER BY id", (SETTING_KEY,)
     ).fetchall()
+    if not rows:
+        fail(
+            "3X-UI 尚未保存 Xray 模板，请先在面板设置中点击一次“保存配置”，"
+            "再运行本功能。"
+        )
     if len(rows) != 1:
         fail(f"3X-UI 数据库应有一条 {SETTING_KEY} 记录，实际找到 {len(rows)} 条。")
     return rows[0]

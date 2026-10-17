@@ -114,9 +114,8 @@ run_with_timeout() {
   "$@"
 }
 systemctl() { return 0; }
-chronyc() { return 0; }
 enable_network_time
-[[ "${TIME_SYNC_CALLS[*]}" == "install:chrony 10:systemctl disable --now systemd-timesyncd.service 15:systemctl enable --now chrony.service 15:systemctl restart chrony.service 15:chronyc -n makestep" ]] ||
-  die "Network time setup should enable chrony and request an immediate step correction."
+[[ "${TIME_SYNC_CALLS[*]}" == "5:timedatectl set-ntp true 10:systemctl enable --now systemd-timesyncd.service" ]] ||
+  die "Network time setup should prefer the native timesyncd service."
 
 printf '%s\n' "timezone tests passed"
