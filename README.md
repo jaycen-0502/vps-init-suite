@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 持久启用 BBR、FQ 和双向 TCP Fast Open（值为 `3`）。
+- 持久启用 BBR、FQ，并默认关闭 TCP Fast Open（值为 `0`，降低特殊线路上的握手兼容性风险）。
 - 根据用户输入的标称带宽和典型 RTT，按约 1.5 倍 BDP 计算 TCP 缓冲上限，再按物理内存设置安全天花板；不把 1C1G 当成唯一硬编码机型。
 - 交互输入带宽/RTT 时逐项询问：每项先校验并显示确认值，再出现下一项；范围错误会留在当前项重新输入，避免两个提示挤在一行造成误解。
 - 默认使用保守的 `100 Mbps / 160 ms` 档；缓冲上限受动态物理内存天花板约束（约每 128 MiB RAM 放宽 1 MiB，上限 64 MiB），并将 BDP 结果向上取 4/8/16/32/64 MiB 档。例如约 1 GiB 机器输入 200 Mbps、160-200 ms RTT 时可使用 8 MiB。TCP 缓冲按需增长，不会启动时预分配全部上限；但大量同时高速传输的活跃连接仍可能提高内核内存占用，应结合 `vps-init diagnose` 及 `free -h` 观察。
@@ -178,7 +178,7 @@ vps-init uninstall --remove-swap
 - 不会执行 `iptables -F`、不会覆盖 `/etc/sysctl.conf`，也不会删除系统用于加载 `/etc/sysctl.conf` 的 `99-sysctl.conf` 软链接，也不会覆盖已有的非本项目 `x-ui.service` drop-in；同名受管文件升级前会进入备份目录。
 - 如果旧版本曾误删该系统软链接，重新执行 `vps-init kernel` 时会在目标不存在且 `/etc/sysctl.conf` 存在的情况下安全恢复；已有文件或用户软链接不会被覆盖。
 - 完整初始化默认使用 `clamp-to-PMTU`（仅 `FORWARD`）；只有明确执行 `mss dual-fixed` 才会使用 IPv4 1380 / IPv6 1340 固定值。
-- `net.ipv4.tcp_fastopen=3` 只开启内核对 TFO 的客户端/服务端能力，应用仍需显式使用 TFO；普通 SSH 握手不因此携带 TFO 数据。脚本保留该值以兼顾代理性能，如需排查特定线路可单独将其设为 0，不应把它作为 SSH 断连的默认结论。
+- `net.ipv4.tcp_fastopen=0` 默认关闭 TFO。需要使用 TFO 的用户可在确认线路兼容后手动改为 `3`；普通 SSH/Xray 连接不依赖该内核开关。
 - `net.ipv4.ip_local_port_range` 不会让临时端口抢占已监听的 SSH 端口；Linux 绑定监听端口时会进行冲突检查，因此保留宽端口池用于高并发代理连接。
 - 已存在任何活动 SWAP 时不会修改；磁盘余量不足时不会创建新文件。
 - 3X-UI policy 工具只支持 SQLite，默认读取 `/etc/x-ui/x-ui.db`，也会识别 `XUI_DB_FOLDER`；检测到 PostgreSQL 等其他后端时会拒绝修改。若面板还没有保存 Xray 模板，会提示先在面板设置中保存一次，而不是报不明确的数据库错误。

@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.8"
+readonly SCRIPT_VERSION="1.10.9"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -140,10 +140,11 @@ apt_install() {
   done
   ((${#missing[@]} == 0)) && return 0
   if [[ $APT_UPDATED -eq 0 ]]; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -y
+    # Wait for unattended apt jobs instead of failing on the transient dpkg lock.
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 update -y
     APT_UPDATED=1
   fi
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 install -y --no-install-recommends "${missing[@]}"
 }
 
 backup_existing() {
@@ -304,7 +305,7 @@ show_status() {
   fi
   printf '拥塞控制:                %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
   printf '默认队列:                %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
-  printf 'TCP Fast Open:           %s（目标值: 3）\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
+  printf 'TCP Fast Open:           %s（目标值: 0，默认关闭）\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
   printf 'TCP MTU 探测:            %s（目标值: 1）\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unavailable)"
   printf 'TCP 监听队列:            %s（SYN: %s）\n' "$(sysctl -n net.core.somaxconn 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo unavailable)"
   printf 'TCP Keepalive:           %s/%s/%s 秒\n' "$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo unavailable)"
@@ -480,7 +481,7 @@ net.ipv6.conf.default.accept_ra = 1"
 # Managed by vps-init-suite.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_fastopen = 0
 net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${wmem_max}
 net.core.rmem_default = ${rmem_default}
@@ -527,7 +528,7 @@ EOF
   sysctl -p "$SYSCTL_FILE"
   verify_sysctl_value net.core.default_qdisc fq || die "内核未应用 net.core.default_qdisc=fq。"
   verify_sysctl_value net.ipv4.tcp_congestion_control bbr || die "内核未应用 TCP BBR。"
-  verify_sysctl_value net.ipv4.tcp_fastopen 3 || die "内核未应用 TCP Fast Open=3。"
+  verify_sysctl_value net.ipv4.tcp_fastopen 0 || die "内核未应用 TCP Fast Open=0。"
   verify_sysctl_value net.core.rmem_max "$rmem_max" || die "内核接收缓冲上限与配置不一致。"
   verify_sysctl_value net.core.wmem_max "$wmem_max" || die "内核发送缓冲上限与配置不一致。"
   verify_sysctl_value net.ipv4.ip_forward 1 || die "IPv4 转发未能生效。"

@@ -18,8 +18,8 @@ apt_install ca-certificates curl
 APT_UPDATED=0
 apt_install curl jq
 [[ ${#APT_CALLS[@]} -eq 2 ]] || die "Missing dependencies should update package lists once, then install."
-[[ "${APT_CALLS[0]}" == "update -y" ]] || die "Unexpected apt update call: ${APT_CALLS[0]}"
-[[ "${APT_CALLS[1]}" == "install -y --no-install-recommends jq" ]] || die "Unexpected apt install call: ${APT_CALLS[1]}"
+[[ "${APT_CALLS[0]}" == "-o DPkg::Lock::Timeout=60 update -y" ]] || die "Unexpected apt update call: ${APT_CALLS[0]}"
+[[ "${APT_CALLS[1]}" == "-o DPkg::Lock::Timeout=60 install -y --no-install-recommends jq" ]] || die "Unexpected apt install call: ${APT_CALLS[1]}"
 
 FLOW=()
 require_root() { :; }
