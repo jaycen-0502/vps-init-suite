@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.10"
+readonly SCRIPT_VERSION="1.10.11"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -1136,14 +1136,20 @@ setup_timezone() {
 setup_swap() {
   require_root
   require_supported_os
-  [[ -f /etc/fstab && ! -L /etc/fstab && -w /etc/fstab ]] || die "/etc/fstab is missing, not a regular file, or not writable; refusing to create swap."
   assert_not_symlink "$SWAP_SYSCTL_FILE"
   apt_install util-linux
 
-  if [[ -n $(swapon --show=NAME --noheadings 2>/dev/null) ]]; then
+  local active_swaps
+  active_swaps=$(swapon --show=NAME --noheadings 2>/dev/null || true)
+  if [[ -n "$active_swaps" ]]; then
+    if [[ -e "${STATE_DIR}/managed-swap.present" ]] && grep -Fxq -- "$SWAP_FILE" <<<"$active_swaps"; then
+      ensure_managed_swap_fstab_entry
+      log "已为现有受管 SWAP 确认 /etc/fstab 使用 nofail。"
+    fi
     warn "系统已有活动 SWAP，保持现状不修改。"
     return 0
   fi
+  [[ -f /etc/fstab && ! -L /etc/fstab && -w /etc/fstab ]] || die "/etc/fstab is missing, not a regular file, or not writable; refusing to create swap."
 
   local memory_mb swap_gib required_bytes available_bytes
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
