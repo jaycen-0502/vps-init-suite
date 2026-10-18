@@ -8,7 +8,9 @@
 - 根据用户输入的标称带宽和典型 RTT，按约 1.5 倍 BDP 计算 TCP 缓冲上限，再按物理内存设置安全天花板；不把 1C1G 当成唯一硬编码机型。
 - 交互输入带宽/RTT 时逐项询问：每项先校验并显示确认值，再出现下一项；范围错误会留在当前项重新输入，避免两个提示挤在一行造成误解。
 - 默认使用保守的 `100 Mbps / 160 ms` 档；缓冲上限受动态物理内存天花板约束（约每 128 MiB RAM 放宽 1 MiB，上限 64 MiB），并将 BDP 结果向上取 4/8/16/32/64 MiB 档。例如约 1 GiB 机器输入 200 Mbps、160-200 ms RTT 时可使用 8 MiB。TCP 缓冲按需增长，不会启动时预分配全部上限；但大量同时高速传输的活跃连接仍可能提高内核内存占用，应结合 `vps-init diagnose` 及 `free -h` 观察。
-- 面向代理节点设置 TCP 自动接收缓冲和适度连接队列；`tcp_slow_start_after_idle=1` 避免空闲连接恢复时突发发包放大丢包。连接跟踪（conntrack）默认自动判断：有 NAT/状态防火墙才启用，纯 Xray 代理默认不主动加载，减少每包开销。
+- 面向代理节点深度防断流与防积压：设置 `tcp_slow_start_after_idle=0`（连接空闲后不折叠拥塞窗口，消除网页浏览或短暂静默后的 1~2 秒卡顿感）；启用 `tcp_notsent_lowat=16384`（将未发送队列上限限制为 16KB，从内核层面遏制 bufferbloat 与高延迟峰值，显著改善软银、Lumen 及跨洋晚高峰丢包与抖动）；配置 `tcp_retries2=8`（死链超时缩短至约 30 秒，遭遇线路丢包或阻断时客户端能秒级感知并快速故障切换）；设置 `tcp_reordering=6` 与 `tcp_frto=2`（容忍跨洋多路径偶发乱序，启用 F-RTO 规避虚假重传）；配置 `tcp_no_metrics_save=1`（关闭历史路由指标缓存，避免偶发丢包污染后续连接）。
+- 自动检测 QEMU / KVM / Proxmox VE 虚拟机环境：在 `/etc/default/grub.d/` 写入独立引导配置注入 `reboot=pci` 并更新 GRUB，彻底根治 PVE 宿主机下软重启黑屏卡死挂起、必须手动强制重置的问题。
+- 连接跟踪（conntrack）默认自动判断：有 NAT/状态防火墙才启用，纯 Xray 代理默认不主动加载，减少每包开销。
 - 通过发行版原生 `systemd-sysctl` 加载项目自己的 sysctl 文件，避免额外服务参与开机网络依赖。
 - 写入后立即回读并验证 BBR、FQ、Fast Open、收发缓冲上限和转发状态；若运行时值与目标不符会明确报错，不再只凭配置文件写入成功判断完成。
 - 开启 IPv4 转发；IPv6 转发由用户选择，默认关闭，同时保留普通 IPv6 主机连接能力。
@@ -149,9 +151,9 @@ vps-init uninstall --remove-swap
 | `vps-init uninstall --remove-swap` | 卸载并删除空闲的本套件 SWAP |
 | `./setup.sh status` | 查看当前状态 |
 | `vps-init xui-policy status` | 查看 3X-UI Xray policy（只读） |
-| `vps-init xui-policy stable` | 设置稳定长连接档：`connIdle=300`、`uplinkOnly=2`、`downlinkOnly=5` |
-| `vps-init xui-policy high-concurrency` | 设置 1G 高并发档：`connIdle=120`、`uplinkOnly=2`、`downlinkOnly=5` |
-| `vps-init xui-policy set 120 2 5` | 交互确认后设置自定义 policy 值 |
+| `vps-init xui-policy stable` | 设置稳定长连接档：`connIdle=300`、`uplinkOnly=2`、`downlinkOnly=5`、`handshake=4` |
+| `vps-init xui-policy high-concurrency` | 设置 1G 高并发档：`connIdle=120`、`uplinkOnly=2`、`downlinkOnly=5`、`handshake=4` |
+| `vps-init xui-policy set 120 2 5 4` | 交互确认后设置自定义 policy 值（支持握手超时） |
 | `vps-init xui-policy restore` | 交互确认后恢复最近一次已验证的 policy 备份 |
 | `sudo ./setup.sh uninstall-3xui` | 交互确认后清理 3X-UI |
 | `sudo ./setup.sh update` | 更新仓库或下载最新脚本 |
@@ -164,7 +166,8 @@ vps-init uninstall --remove-swap
 - `rmem_default/wmem_default` 仍按内存档保持较小的 64 KiB 或 256 KiB；它们是初始值，不是每条连接预分配的最大缓冲。多连接代理不会因为较高的 `rmem_max/wmem_max` 上限而在启动时按连接数预分配内存；但很多连接同时跑满带宽时，实际内存仍会随活跃 socket 缓冲增长。
 - 低内存档的监听队列为 `somaxconn=8192`、`tcp_max_syn_backlog=4096`、`netdev_max_backlog=8192`；标准档提升到 `somaxconn=16384`、`tcp_max_syn_backlog=8192`、`netdev_max_backlog=16384`，不是无限增大；若 `ListenOverflows` 持续增长，应优先检查应用监听 backlog、CPU steal 和上游连接突发。
 - 两档 TCP keepalive 均采用 `300/15/3`，减少代理节点上大量空闲长连接的定时器开销；应用层心跳和 NAT 超时可能需要独立调整，内核 keepalive 不替代 Xray/3X-UI 的连接策略。
-- `tcp_slow_start_after_idle=1` 让空闲连接恢复时重新谨慎探测拥塞窗口，降低突发发送、丢包和重传放大风险；这会牺牲极少量恢复瞬时速度，优先保证单核 VPS 稳定性。`tcp_mtu_probing=1` 只在检测到 PMTU 黑洞时探测，不改变 UDP，也不替代 MSS `clamp-to-PMTU`。
+- `tcp_slow_start_after_idle=0` 保持空闲连接的拥塞窗口不回退，消除间歇性网页浏览与长连接唤醒时的断流感；配合 `tcp_notsent_lowat=16384` 限制未发送数据积压，有效平抑跨洋线路上因大缓冲突发造成的延迟激增（Bufferbloat）。`tcp_mtu_probing=1` 只在检测到 PMTU 黑洞时探测，不改变 UDP，也不替代 MSS `clamp-to-PMTU`。
+- 自动识别 QEMU/KVM 虚拟化环境并注入 `reboot=pci` 引导参数，解决 Proxmox VE (PVE) 等宿主机软重启卡死黑屏问题；卸载套件时会自动清理该配置文件并重新生成 GRUB。
 - IPv6 默认不做路由转发；选择 `on` 时开启 forwarding 并使用 `accept_ra=2`，适合中转/路由节点。该选项不会关闭普通 IPv6 出站连接。
 - `nf_conntrack` 默认使用 `auto`：检测到现有 NAT 或 conntrack/state 防火墙规则才加载并配置；纯 Xray/VLESS/Reality/SOCKS 代理不主动加载。需要 NAT、iptables 状态匹配或复杂转发时用 `vps-init conntrack on`。启用时 established 超时为 432000 秒（5 天）；如果仅代理且 `conntrack_count` 不断增长，应优先关闭它而不是继续扩大表。
 - MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；默认只挂载到 `FORWARD`，避免影响本机发起或回复的 SSH/Xray 握手。MSS 通过开机后 30 秒触发的 timer 延迟应用，不参与网络就绪链，服务设置 20 秒启动超时。受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。

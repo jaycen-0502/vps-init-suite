@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.12"
+readonly SCRIPT_VERSION="1.11.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -19,13 +19,14 @@ readonly MSS_HELPER="/usr/local/lib/vps-init-suite/apply-mss.sh"
 readonly MSS_UNIT="/etc/systemd/system/vps-init-suite-mss.service"
 readonly MSS_TIMER="/etc/systemd/system/vps-init-suite-mss.timer"
 readonly SYSTEMD_TIMEOUT_FILE="/etc/systemd/system.conf.d/90-vps-init-suite-timeout.conf"
+readonly GRUB_QUIRK_FILE="/etc/default/grub.d/99-vps-init-suite-reboot.cfg"
 readonly XUI_LIMITS_DIR="/etc/systemd/system/x-ui.service.d"
 readonly XUI_LIMITS_FILE="${XUI_LIMITS_DIR}/90-vps-init-suite.conf"
 readonly STATE_DIR="/var/lib/vps-init-suite/state"
 readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
 readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
 readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
-readonly XUI_POLICY_HELPER_VERSION="1.8.0"
+readonly XUI_POLICY_HELPER_VERSION="1.9.0"
 ZONEINFO_DIR="/usr/share/zoneinfo"
 readonly ROOT_COMMANDS=(full kernel ipv6 conntrack bandwidth mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
 readonly CONFLICT_FILES=(
@@ -178,6 +179,8 @@ capture_original_sysctl_state() {
     net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
     net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_window_scaling
     net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_mtu_probing
+    net.ipv4.tcp_notsent_lowat net.ipv4.tcp_retries2 net.ipv4.tcp_reordering net.ipv4.tcp_frto
+    net.ipv4.tcp_no_metrics_save
     net.ipv4.tcp_timestamps net.ipv4.tcp_tw_reuse
     net.core.somaxconn net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog
     net.ipv4.tcp_syncookies net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_fin_timeout
@@ -234,6 +237,7 @@ is_suite_managed_file() {
       vps-init-suite-mss.timer) grep -qF 'Apply vps-init-suite TCP MSS policy after boot' "$1" ;;
       vps-init-suite-sysctl.service) grep -qF 'Apply vps-init-suite kernel parameters' "$1" ;;
       90-vps-init-suite-timeout.conf) grep -qF 'DefaultTimeoutStopSec=10s' "$1" ;;
+      99-vps-init-suite-reboot.cfg) grep -qF 'reboot=pci' "$1" ;;
       apply-mss.sh) grep -qF '/etc/default/vps-init-suite' "$1" ;;
       xui-policy.py) grep -qF 'SETTING_KEY = "xrayTemplateConfig"' "$1" ;;
       *) return 1 ;;
@@ -308,6 +312,8 @@ show_status() {
   printf '拥塞控制:                %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
   printf '默认队列:                %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
   printf 'TCP Fast Open:           %s（目标值: 0，默认关闭）\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
+  printf 'TCP 空闲防断流:          %s（目标值: 0，空闲不降速）\n' "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo unavailable)"
+  printf 'TCP 队列防积压:          %s 字节（notsent_lowat）\n' "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo unavailable)"
   printf 'TCP MTU 探测:            %s（目标值: 1）\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unavailable)"
   printf 'TCP 监听队列:            %s（SYN: %s）\n' "$(sysctl -n net.core.somaxconn 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo unavailable)"
   printf 'TCP Keepalive:           %s/%s/%s 秒\n' "$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo unavailable)" "$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo unavailable)"
@@ -498,7 +504,12 @@ net.ipv6.conf.lo.disable_ipv6 = 0
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_slow_start_after_idle = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_reordering = 6
+net.ipv4.tcp_frto = 2
+net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_timestamps = 1
@@ -530,6 +541,7 @@ EOF
   verify_sysctl_value net.core.default_qdisc fq || die "内核未应用 net.core.default_qdisc=fq。"
   verify_sysctl_value net.ipv4.tcp_congestion_control bbr || die "内核未应用 TCP BBR。"
   verify_sysctl_value net.ipv4.tcp_fastopen 0 || die "内核未应用 TCP Fast Open=0。"
+  verify_sysctl_value net.ipv4.tcp_slow_start_after_idle 0 || die "内核未应用 TCP 空闲防断流设置。"
   verify_sysctl_value net.core.rmem_max "$rmem_max" || die "内核接收缓冲上限与配置不一致。"
   verify_sysctl_value net.core.wmem_max "$wmem_max" || die "内核发送缓冲上限与配置不一致。"
   verify_sysctl_value net.ipv4.ip_forward 1 || die "IPv4 转发未能生效。"
@@ -544,6 +556,7 @@ EOF
   systemctl daemon-reload
   configure_systemd_shutdown_timeout
   configure_xui_service_limits "$file_max"
+  configure_pve_reboot_quirk
   log "内核配置已生效，并已设置为开机自动应用。"
 }
 
@@ -579,6 +592,70 @@ EOF
   mv -f -- "$temporary" "$SYSTEMD_TIMEOUT_FILE"
   systemctl daemon-reload
   log "已设置 systemd 停机超时为 10 秒，避免代理服务停止时长时间挂起。"
+}
+
+is_pve_or_qemu_vm() {
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    # In container environments, GRUB is not applicable.
+    if systemd-detect-virt --container >/dev/null 2>&1; then
+      return 1
+    fi
+    local virt
+    virt=$(systemd-detect-virt 2>/dev/null || true)
+    case "$virt" in
+      qemu|kvm|bochs) return 0 ;;
+    esac
+  fi
+  local vendor product dmi_pattern
+  vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
+  product=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
+  dmi_pattern='QEMU|Proxmox|Bochs|Standard PC'
+  if [[ "$vendor $product" =~ $dmi_pattern ]]; then
+    return 0
+  fi
+  if grep -qiE 'QEMU|KVM' /proc/cpuinfo 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+configure_pve_reboot_quirk() {
+  is_pve_or_qemu_vm || return 0
+  command -v update-grub >/dev/null 2>&1 || return 0
+
+  # If reboot= is already set in /proc/cmdline or /etc/default/grub, do not interfere.
+  if grep -qE '(^|[[:space:]])reboot=' /proc/cmdline 2>/dev/null; then
+    return 0
+  fi
+  if [[ -r /etc/default/grub ]] && grep -qE '(^|[[:space:]])reboot=' /etc/default/grub 2>/dev/null; then
+    return 0
+  fi
+  if [[ -f "$GRUB_QUIRK_FILE" ]] && grep -qF 'reboot=pci' "$GRUB_QUIRK_FILE" 2>/dev/null; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$GRUB_QUIRK_FILE")"
+  assert_not_symlink "$GRUB_QUIRK_FILE"
+
+  local temporary
+  temporary=$(mktemp "$(dirname "$GRUB_QUIRK_FILE")/.99-vps-init-suite-reboot.XXXXXX")
+  cat >"$temporary" <<'EOF'
+# Managed by vps-init-suite.
+# Prevent ACPI soft-reboot black screen freeze on QEMU / KVM / Proxmox VE.
+case "${GRUB_CMDLINE_LINUX_DEFAULT:-}" in
+  *reboot=*) ;;
+  *) GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:+$GRUB_CMDLINE_LINUX_DEFAULT }reboot=pci" ;;
+esac
+EOF
+  chmod 0644 "$temporary"
+  mv -f -- "$temporary" "$GRUB_QUIRK_FILE"
+
+  if run_with_timeout 30 update-grub >/dev/null 2>&1; then
+    log "检测到 QEMU/KVM 虚拟化环境，已自动配置 reboot=pci 避免重启卡死黑屏。"
+  else
+    warn "更新 GRUB 配置超时或失败，已移除 reboot=pci 补丁文件。"
+    rm -f -- "$GRUB_QUIRK_FILE"
+  fi
 }
 
 write_mss_unit() {
@@ -1488,7 +1565,7 @@ xui_policy_start_service() {
 }
 
 xui_policy_apply() {
-  local seconds=$1 uplink=$2 downlink=$3
+  local seconds=$1 uplink=$2 downlink=$3 handshake=${4:-4}
   local database backup
   [[ -t 0 ]] || die "修改 3X-UI 数据库前需要交互式确认。"
   database=$(xui_policy_database) || die "找不到 3X-UI SQLite 数据库。"
@@ -1505,7 +1582,7 @@ xui_policy_apply() {
     xui_policy_start_service || true
     die "无法创建并校验 3X-UI 数据库备份，未修改 policy。"
   fi
-  if ! python3 "$XUI_POLICY_HELPER" set "$database" "$seconds" "$uplink" "$downlink"; then
+  if ! python3 "$XUI_POLICY_HELPER" set "$database" "$seconds" "$uplink" "$downlink" "$handshake"; then
     python3 "$XUI_POLICY_HELPER" restore-policy "$database" "$backup" >/dev/null 2>&1 || true
     xui_policy_start_service || true
     die "无法更新 3X-UI policy，备份仍保留在：${backup}"
@@ -1561,13 +1638,13 @@ offer_xui_policy() {
 }
 
 xui_policy_menu() {
-  local choice seconds uplink downlink
+  local choice seconds uplink downlink handshake
   while true; do
     printf '\n========== 3X-UI / Xray 连接策略 ==========\n'
     printf '%s\n' \
       "  1. 查看当前 policy（只读）" \
-      "  2. 稳定长连接：connIdle=300，uplinkOnly=2，downlinkOnly=5" \
-      "  3. 1G 高并发：connIdle=120，uplinkOnly=2，downlinkOnly=5" \
+      "  2. 稳定长连接：connIdle=300，uplinkOnly=2，downlinkOnly=5，handshake=4" \
+      "  3. 1G 高并发：connIdle=120，uplinkOnly=2，downlinkOnly=5，handshake=4" \
       "  4. 自定义 policy 参数" \
       "  5. 恢复最近一次已验证备份" \
       "  0. 返回上一级"
@@ -1578,15 +1655,17 @@ xui_policy_menu() {
         database=$(xui_policy_database) || die "找不到 3X-UI SQLite 数据库。"
         python3 "$XUI_POLICY_HELPER" show "$database"
         ;;
-      2) xui_policy_apply 300 2 5 ;;
-      3) xui_policy_apply 120 2 5 ;;
+      2) xui_policy_apply 300 2 5 4 ;;
+      3) xui_policy_apply 120 2 5 4 ;;
       4)
         read -r -p "请输入 connIdle 秒数 [60-86400]: " seconds
         read -r -p "请输入 uplinkOnly 秒数 [1-86400]: " uplink
         read -r -p "请输入 downlinkOnly 秒数 [1-86400]: " downlink
-        [[ "$seconds" =~ ^[0-9]+$ && "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ ]] || { warn "参数必须是整数。"; continue; }
-        (( seconds >= 60 && seconds <= 86400 && uplink >= 1 && uplink <= 86400 && downlink >= 1 && downlink <= 86400 )) || { warn "参数超出允许范围。"; continue; }
-        xui_policy_apply "$seconds" "$uplink" "$downlink"
+        read -r -p "请输入 handshake 秒数 [1-300，默认 4]: " handshake
+        handshake=${handshake:-4}
+        [[ "$seconds" =~ ^[0-9]+$ && "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ && "$handshake" =~ ^[0-9]+$ ]] || { warn "参数必须是整数。"; continue; }
+        (( seconds >= 60 && seconds <= 86400 && uplink >= 1 && uplink <= 86400 && downlink >= 1 && downlink <= 86400 && handshake >= 1 && handshake <= 300 )) || { warn "参数超出允许范围。"; continue; }
+        xui_policy_apply "$seconds" "$uplink" "$downlink" "$handshake"
         ;;
       5) xui_policy_restore_latest ;;
       0) return 0 ;;
@@ -1605,15 +1684,15 @@ xui_policy() {
       database=$(xui_policy_database) || die "找不到 3X-UI SQLite 数据库。"
       python3 "$XUI_POLICY_HELPER" show "$database"
       ;;
-    stable) xui_policy_apply 300 2 5 ;;
-    high-concurrency) xui_policy_apply 120 2 5 ;;
+    stable) xui_policy_apply 300 2 5 4 ;;
+    high-concurrency) xui_policy_apply 120 2 5 4 ;;
     set)
-      [[ $# -ge 2 && $# -le 4 ]] || die "用法：vps-init xui-policy set CONN_IDLE [UPLINK_ONLY DOWNLINK_ONLY]"
+      [[ $# -ge 2 && $# -le 5 ]] || die "用法：vps-init xui-policy set CONN_IDLE [UPLINK_ONLY DOWNLINK_ONLY HANDSHAKE]"
       [[ "$2" =~ ^[0-9]+$ ]] || die "connIdle 必须是整数。"
-      local uplink=${3:-2} downlink=${4:-5}
-      [[ "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ ]] || die "uplinkOnly/downlinkOnly 必须是整数。"
-      (( 60 <= 10#$2 && 10#$2 <= 86400 && 1 <= 10#$uplink && 10#$uplink <= 86400 && 1 <= 10#$downlink && 10#$downlink <= 86400 )) || die "policy 参数超出允许范围。"
-      xui_policy_apply "$2" "$uplink" "$downlink"
+      local uplink=${3:-2} downlink=${4:-5} handshake=${5:-4}
+      [[ "$uplink" =~ ^[0-9]+$ && "$downlink" =~ ^[0-9]+$ && "$handshake" =~ ^[0-9]+$ ]] || die "uplinkOnly/downlinkOnly/handshake 必须是整数。"
+      (( 60 <= 10#$2 && 10#$2 <= 86400 && 1 <= 10#$uplink && 10#$uplink <= 86400 && 1 <= 10#$downlink && 10#$downlink <= 86400 && 1 <= 10#$handshake && 10#$handshake <= 300 )) || die "policy 参数超出允许范围。"
+      xui_policy_apply "$2" "$uplink" "$downlink" "$handshake"
       ;;
     restore) xui_policy_restore_latest ;;
     *) die "用法：vps-init xui-policy [status|stable|high-concurrency|set|restore|menu]" ;;
@@ -1642,6 +1721,7 @@ restore_conflict_backups() {
 restore_original_managed_files() {
   local path filename marker original backup
   for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" "$MSS_TIMER" "$SYSTEMD_TIMEOUT_FILE" \
+    "$GRUB_QUIRK_FILE" \
     /etc/modules-load.d/vps-init-suite.conf "$MSS_CONFIG" "$MSS_HELPER" \
     "$TUNING_CONFIG" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
     filename=$(basename "$path")
@@ -1798,13 +1878,16 @@ uninstall_suite() {
   fi
   local managed_path
   for managed_path in "$MSS_UNIT" "$MSS_TIMER" "$SYSCTL_UNIT" \
-    "$SYSTEMD_TIMEOUT_FILE" \
+    "$SYSTEMD_TIMEOUT_FILE" "$GRUB_QUIRK_FILE" \
     /etc/modules-load.d/vps-init-suite.conf \
     "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$TUNING_CONFIG" \
     "$MSS_CONFIG" "$MSS_HELPER" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" \
     "$LAUNCHER_PATH" "$INSTALLED_SCRIPT"; do
     remove_managed_file "$managed_path"
   done
+  if command -v update-grub >/dev/null 2>&1; then
+    run_with_timeout 30 update-grub >/dev/null 2>&1 || true
+  fi
   rmdir "$XUI_LIMITS_DIR" 2>/dev/null || true
   systemctl daemon-reload
   systemctl reset-failed vps-init-suite-mss.service vps-init-suite-sysctl.service >/dev/null 2>&1 || true

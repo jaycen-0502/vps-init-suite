@@ -50,17 +50,20 @@ class XuiPolicyTests(unittest.TestCase):
         return json.loads(raw)
 
     def test_set_policy_only_updates_default_level(self):
-        XUI_POLICY.set_policy(self.database, 120, 2, 5)
+        XUI_POLICY.set_policy(self.database, 120, 2, 5, 8)
         config = self.read_template()
         self.assertEqual(config["policy"]["levels"]["0"]["connIdle"], 120)
         self.assertEqual(config["policy"]["levels"]["0"]["uplinkOnly"], 2)
         self.assertEqual(config["policy"]["levels"]["0"]["downlinkOnly"], 5)
+        self.assertEqual(config["policy"]["levels"]["0"]["handshake"], 8)
         self.assertEqual(config["policy"]["system"], {"statsUserOnline": True})
         self.assertEqual(config["inbounds"], self.original_config["inbounds"])
 
     def test_invalid_policy_does_not_write(self):
         with self.assertRaises(RuntimeError):
             XUI_POLICY.set_policy(self.database, 120, 0, 5)
+        with self.assertRaises(RuntimeError):
+            XUI_POLICY.set_policy(self.database, 120, 2, 5, 0)
         self.assertEqual(self.read_template(), self.original_config)
 
     def test_backup_and_restore_only_policy(self):
