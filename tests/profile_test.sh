@@ -32,6 +32,10 @@ assert_equal "8388608" "$(calculate_buffer_max 200 160 1024)"
 assert_equal "16777216" "$(calculate_buffer_max 500 160 4096)"
 assert_equal "262144" "$(proxy_nofile_limit 1024)"
 assert_equal "524288" "$(proxy_nofile_limit 4096)"
+if grep -Eq '^[[:space:]]*fs\.nr_open[[:space:]]*=' "$TEST_ROOT/setup.sh"; then
+  printf '%s\n' "The suite must not override the system-wide fs.nr_open ceiling." >&2
+  exit 1
+fi
 assert_equal "on" "$(normalize_ipv6_mode on)"
 assert_equal "on" "$(normalize_ipv6_mode enabled)"
 assert_equal "off" "$(normalize_ipv6_mode disabled)"

@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.10.11"
+readonly SCRIPT_VERSION="1.10.12"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -184,7 +184,7 @@ capture_original_sysctl_state() {
     net.ipv4.ip_local_port_range net.ipv4.tcp_keepalive_time
     net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes
     net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_tcp_timeout_established
-    fs.file-max fs.nr_open vm.swappiness
+    fs.file-max vm.swappiness
   )
   mkdir -p "$STATE_DIR"
   : >"$ORIGINAL_SYSCTL_STATE"
@@ -515,7 +515,6 @@ net.ipv4.tcp_keepalive_intvl = ${keepalive_intvl}
 net.ipv4.tcp_keepalive_probes = ${keepalive_probes}
 ${conntrack_config}
 fs.file-max = ${file_max}
-fs.nr_open = ${file_max}
 vm.swappiness = 10
 EOF
 
