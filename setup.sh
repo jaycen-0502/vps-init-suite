@@ -910,7 +910,7 @@ prompt_missing_tuning_profile() {
       160 1 2000 1 160 ms
   fi
 
-  log "本次缓冲档位：${bandwidth} Mbps / ${rtt} ms；如需修改，可在菜单选择“手动设置/修改带宽与 RTT”。"
+  log "本次缓冲档位：${bandwidth} Mbps / ${rtt} ms；如需修改，可在菜单选择\"手动设置/修改带宽与 RTT\"。"
   printf -v "$bandwidth_var" '%s' "$bandwidth"
   printf -v "$rtt_var" '%s' "$rtt"
 }
@@ -1274,6 +1274,7 @@ ensure_fstab_trailing_newline() {
   fi
 }
 
+# shellcheck disable=SC2120
 ensure_managed_swap_fstab_entry() {
   local fstab=${1:-/etc/fstab}
   local entry="${SWAP_FILE} none swap sw,nofail 0 0"
@@ -1291,6 +1292,7 @@ ensure_managed_swap_fstab_entry() {
   printf '%s\n' "$entry" >>"$fstab"
 }
 
+# shellcheck disable=SC2120
 remove_managed_swap_fstab_entry() {
   local fstab=${1:-/etc/fstab}
   [[ -f "$fstab" && ! -L "$fstab" ]] || return 0
@@ -1299,6 +1301,7 @@ remove_managed_swap_fstab_entry() {
   sed -i '\|^/swapfile-vps-init-suite[[:space:]].*[[:space:]]swap[[:space:]]|d' "$fstab"
 }
 
+# shellcheck disable=SC2120
 write_mss_helper() {
   local helper_path=${1:-$MSS_HELPER}
   local state_dir=${2:-$STATE_DIR}
@@ -1411,13 +1414,12 @@ mss_family_status() {
       ;;
   esac
 
-  for chain in FORWARD; do
-    "$binary" -w 2 -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN \
-      -m comment --comment vps-init-suite -j VPS_INIT_MSS >/dev/null 2>&1 || {
-      printf '%s\n' "不完整"
-      return 0
-    }
-  done
+  local chain="FORWARD"
+  "$binary" -w 2 -t mangle -C "$chain" -p tcp --tcp-flags "SYN,RST" SYN \
+    -m comment --comment vps-init-suite -j VPS_INIT_MSS >/dev/null 2>&1 || {
+    printf '%s\n' "不完整"
+    return 0
+  }
   printf '%s\n' "已生效"
 }
 
@@ -1771,6 +1773,7 @@ remove_managed_swap() {
   log "Managed swap file and fstab entry removed."
 }
 
+# shellcheck disable=SC2120
 remove_managed_mss_rules() {
   local config_path=${1:-$MSS_CONFIG}
   local binary chain mode value value6
@@ -1783,27 +1786,27 @@ remove_managed_mss_rules() {
     "$binary" -w 5 -t mangle -S >/dev/null 2>&1 || continue
     # Remove both current and legacy suite attachments during uninstall.
     for chain in OUTPUT FORWARD; do
-      while "$binary" -w 5 -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; do
-        "$binary" -w 5 -t mangle -D "$chain" -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS || break
+      while "$binary" -w 5 -t mangle -C "$chain" -p tcp --tcp-flags "SYN,RST" SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; do
+        "$binary" -w 5 -t mangle -D "$chain" -p tcp --tcp-flags "SYN,RST" SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS || break
       done
     done
     if "$binary" -w 5 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1; then
       rule_args=()
       case "$mode:$binary" in
-        clamp:*) rule_args=(-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu) ;;
+        clamp:*) rule_args=(-p tcp --tcp-flags "SYN,RST" SYN -j TCPMSS --clamp-mss-to-pmtu) ;;
         fixed:iptables|fixed:ip6tables)
           if [[ "$value" =~ ^[0-9]+$ ]]; then
-            rule_args=(-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$value")
+            rule_args=(-p tcp --tcp-flags "SYN,RST" SYN -j TCPMSS --set-mss "$value")
           fi
           ;;
         dual-fixed:iptables)
           if [[ "$value" =~ ^[0-9]+$ ]]; then
-            rule_args=(-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$value")
+            rule_args=(-p tcp --tcp-flags "SYN,RST" SYN -j TCPMSS --set-mss "$value")
           fi
           ;;
         dual-fixed:ip6tables)
           if [[ "$value6" =~ ^[0-9]+$ ]]; then
-            rule_args=(-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$value6")
+            rule_args=(-p tcp --tcp-flags "SYN,RST" SYN -j TCPMSS --set-mss "$value6")
           fi
           ;;
       esac
