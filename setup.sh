@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.13.0"
+readonly SCRIPT_VERSION="1.13.1"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
