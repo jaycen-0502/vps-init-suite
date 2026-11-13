@@ -169,7 +169,7 @@ vps-init uninstall --remove-swap
 - `tcp_slow_start_after_idle=0` 保持空闲连接的拥塞窗口不回退，消除间歇性网页浏览与长连接唤醒时的断流感；配合 `tcp_notsent_lowat=16384` 限制未发送数据积压，有效平抑跨洋线路上因大缓冲突发造成的延迟激增（Bufferbloat）。`tcp_mtu_probing=1` 只在检测到 PMTU 黑洞时探测，不改变 UDP，也不替代 MSS `clamp-to-PMTU`。
 - 自动识别 QEMU/KVM 虚拟化环境并注入 `reboot=pci` 引导参数，解决 Proxmox VE (PVE) 等宿主机软重启卡死黑屏问题；卸载套件时会自动清理该配置文件并重新生成 GRUB。
 - IPv6 默认关闭（`off`）并彻底禁用 IPv6 协议栈（`disable_ipv6=1`），杜绝跨国公网因缺乏 IPv6 优质路由而引发的假死黑洞（防止 YouTube 4K 播放转圈及连接超时）；选择 `on` 时完整开启协议栈与转发。
-- 自动将默认路由初始发包窗口提升为 `initcwnd 64 initrwnd 64`（开机持久化），首个 RTT 即可直发 90KB 数据，大幅提升网页与社交媒体首屏加载速度。
+- 自动将默认路由初始发包窗口提升为 `initcwnd 64 initrwnd 64` 并将主网卡发送队列深度提升为 `txqueuelen 5000`（开机持久化），首个 RTT 即可直发 90KB 数据并消除高突发大视频拉取时的驱动级丢包，大幅提升网页与社交媒体首屏加载速度。
 - 引入 `net.ipv4.tcp_adv_win_scale=2` 与 `net.ipv4.tcp_base_mss=1024`，消除跨洋长肥管道 `rwnd_limited` 窗口堵塞，并锁定 MTU 探测保底基准包，防止暴跌至 512 碎包引发恶性限速。
 - `net.ipv4.tcp_fastopen=2` 默认采用安全服务端模式：客户端连入享受 0-RTT 握手省 160ms 往返，出站连接外部目标网站走标准握手，彻底杜绝目标 CDN 丢包罚站。
 - 提供 `vps-init dns` 命令一键写入全球纯净 IPv4 DNS（`8.8.8.8` / `1.1.1.1`），彻底消灭海外 CDN 域名解析卡顿与图片空白。

@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.12.0"
+readonly SCRIPT_VERSION="1.13.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -314,6 +314,7 @@ show_status() {
   printf '默认队列:                %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
   printf 'TCP Fast Open:           %s（目标值: 2，服务端加速模式）\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
   printf 'TCP 初始窗口 (initcwnd): %s\n' "$(ip route show default 2>/dev/null | grep -o "initcwnd [0-9]*" | awk '{print $2}' || echo 默认)"
+  printf '网卡发送队列 (txqueuelen):%s（目标值: 5000）\n' "$(cat "/sys/class/net/$(ip route show default 2>/dev/null | awk '{print $5; exit}')/tx_queue_len" 2>/dev/null || echo unavailable)"
   printf 'TCP 通告窗口比例:        %s（目标值: 2，adv_win_scale）\n' "$(sysctl -n net.ipv4.tcp_adv_win_scale 2>/dev/null || echo unavailable)"
   printf 'TCP 基准包 (base_mss):   %s（目标值: 1024）\n' "$(sysctl -n net.ipv4.tcp_base_mss 2>/dev/null || echo unavailable)"
   printf 'TCP 空闲防断流:          %s（目标值: 0，空闲不降速）\n' "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo unavailable)"
@@ -589,6 +590,7 @@ setup_initcwnd() {
   gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
   if [[ -n "$dev" && -n "$gw" ]]; then
     ip route change default via "$gw" dev "$dev" initcwnd 64 initrwnd 64 2>/dev/null || true
+    ip link set dev "$dev" txqueuelen 5000 2>/dev/null || true
     mkdir -p /etc/network/if-up.d
     local initcwnd_file="/etc/network/if-up.d/99-initcwnd"
     cat >"$initcwnd_file" <<'EOF'
@@ -597,10 +599,11 @@ dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
 gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
 if [ -n "$dev" ] && [ -n "$gw" ]; then
   ip route change default via "$gw" dev "$dev" initcwnd 64 initrwnd 64 2>/dev/null || true
+  ip link set dev "$dev" txqueuelen 5000 2>/dev/null || true
 fi
 EOF
     chmod +x "$initcwnd_file" 2>/dev/null || true
-    log "已优化网卡初始窗口: initcwnd 64, initrwnd 64（首屏秒开，开机自动生效）。"
+    log "已优化网卡初始窗口与队列: initcwnd 64, initrwnd 64, txqueuelen 5000（首屏秒开，开机自动生效）。"
   fi
 }
 
