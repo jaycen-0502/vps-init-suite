@@ -104,7 +104,7 @@ is_root_command() {
 
 reexec_as_root() {
   command -v sudo >/dev/null || die "This command needs root privileges. Install sudo or run as root."
-  local source_path=${BASH_SOURCE[0]}
+  local source_path=${BASH_SOURCE[0]:-}
   local executable="$INSTALLED_SCRIPT"
   if [[ -f "$source_path" && "$source_path" != "/dev/stdin" ]]; then
     executable=$(readlink -f -- "$source_path")
@@ -2023,8 +2023,13 @@ update_self() {
   require_root
   require_supported_os
   apt_install ca-certificates curl git
+  local source_path=${BASH_SOURCE[0]:-}
   local script_dir
-  script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  if [[ -n "$source_path" && "$source_path" != "/dev/stdin" && -f "$source_path" ]]; then
+    script_dir=$(cd -- "$(dirname -- "$source_path")" && pwd)
+  else
+    script_dir="$PWD"
+  fi
 
   if [[ -d "$script_dir/.git" ]]; then
     git -C "$script_dir" pull --ff-only
@@ -2036,7 +2041,7 @@ update_self() {
   fi
 
   local target
-  if [[ $(readlink -f -- "${BASH_SOURCE[0]}") == "$INSTALLED_SCRIPT" ]]; then
+  if [[ -n "$source_path" && "$source_path" != "/dev/stdin" && -f "$source_path" && $(readlink -f -- "$source_path") == "$INSTALLED_SCRIPT" ]]; then
     target="$INSTALLED_SCRIPT"
   else
     target="${PWD}/setup.sh"
@@ -2222,6 +2227,6 @@ main() {
   esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-}" == "$0" || -z "${BASH_SOURCE[0]:-}" ]]; then
   main "$@"
 fi
