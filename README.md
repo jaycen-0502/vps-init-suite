@@ -168,7 +168,11 @@ vps-init uninstall --remove-swap
 - 两档 TCP keepalive 均采用 `300/15/3`，减少代理节点上大量空闲长连接的定时器开销；应用层心跳和 NAT 超时可能需要独立调整，内核 keepalive 不替代 Xray/3X-UI 的连接策略。
 - `tcp_slow_start_after_idle=0` 保持空闲连接的拥塞窗口不回退，消除间歇性网页浏览与长连接唤醒时的断流感；配合 `tcp_notsent_lowat=16384` 限制未发送数据积压，有效平抑跨洋线路上因大缓冲突发造成的延迟激增（Bufferbloat）。`tcp_mtu_probing=1` 只在检测到 PMTU 黑洞时探测，不改变 UDP，也不替代 MSS `clamp-to-PMTU`。
 - 自动识别 QEMU/KVM 虚拟化环境并注入 `reboot=pci` 引导参数，解决 Proxmox VE (PVE) 等宿主机软重启卡死黑屏问题；卸载套件时会自动清理该配置文件并重新生成 GRUB。
-- IPv6 默认不做路由转发；选择 `on` 时开启 forwarding 并使用 `accept_ra=2`，适合中转/路由节点。该选项不会关闭普通 IPv6 出站连接。
+- IPv6 默认关闭（`off`）并彻底禁用 IPv6 协议栈（`disable_ipv6=1`），杜绝跨国公网因缺乏 IPv6 优质路由而引发的假死黑洞（防止 YouTube 4K 播放转圈及连接超时）；选择 `on` 时完整开启协议栈与转发。
+- 自动将默认路由初始发包窗口提升为 `initcwnd 64 initrwnd 64`（开机持久化），首个 RTT 即可直发 90KB 数据，大幅提升网页与社交媒体首屏加载速度。
+- 引入 `net.ipv4.tcp_adv_win_scale=2` 与 `net.ipv4.tcp_base_mss=1024`，消除跨洋长肥管道 `rwnd_limited` 窗口堵塞，并锁定 MTU 探测保底基准包，防止暴跌至 512 碎包引发恶性限速。
+- `net.ipv4.tcp_fastopen=2` 默认采用安全服务端模式：客户端连入享受 0-RTT 握手省 160ms 往返，出站连接外部目标网站走标准握手，彻底杜绝目标 CDN 丢包罚站。
+- 提供 `vps-init dns` 命令一键写入全球纯净 IPv4 DNS（`8.8.8.8` / `1.1.1.1`），彻底消灭海外 CDN 域名解析卡顿与图片空白。
 - `nf_conntrack` 默认使用 `auto`：检测到现有 NAT 或 conntrack/state 防火墙规则才加载并配置；纯 Xray/VLESS/Reality/SOCKS 代理不主动加载。需要 NAT、iptables 状态匹配或复杂转发时用 `vps-init conntrack on`。启用时 established 超时为 432000 秒（5 天）；如果仅代理且 `conntrack_count` 不断增长，应优先关闭它而不是继续扩大表。
 - MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；默认只挂载到 `FORWARD`，避免影响本机发起或回复的 SSH/Xray 握手。MSS 通过开机后 30 秒触发的 timer 延迟应用，不参与网络就绪链，服务设置 20 秒启动超时。受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。
 - 快捷入口为 `/usr/local/bin/vps-init`，实际脚本保存在 `/usr/local/lib/vps-init-suite/setup.sh`。
@@ -182,7 +186,7 @@ vps-init uninstall --remove-swap
 - 不会执行 `iptables -F`、不会覆盖 `/etc/sysctl.conf`，也不会删除系统用于加载 `/etc/sysctl.conf` 的 `99-sysctl.conf` 软链接，也不会覆盖已有的非本项目 `x-ui.service` drop-in；同名受管文件升级前会进入备份目录。
 - 如果旧版本曾误删该系统软链接，重新执行 `vps-init kernel` 时会在目标不存在且 `/etc/sysctl.conf` 存在的情况下安全恢复；已有文件或用户软链接不会被覆盖。
 - 完整初始化默认使用 `clamp-to-PMTU`（仅 `FORWARD`）；只有明确执行 `mss dual-fixed` 才会使用 IPv4 1380 / IPv6 1340 固定值。
-- `net.ipv4.tcp_fastopen=0` 默认关闭 TFO。需要使用 TFO 的用户可在确认线路兼容后手动改为 `3`；普通 SSH/Xray 连接不依赖该内核开关。
+- `net.ipv4.tcp_fastopen=2` 采用服务端 TFO 加速，手机与客户端连入可免除 160ms 握手，同时避免了改为 `3` 时出站向外部目标服务器握手遭骨干网丢弃的风险。
 - `net.ipv4.ip_local_port_range` 不会让临时端口抢占已监听的 SSH 端口；Linux 绑定监听端口时会进行冲突检查，因此保留宽端口池用于高并发代理连接。
 - 已存在任何活动 SWAP 时不会修改；磁盘余量不足时不会创建新文件。
 - 新建或再次配置已有受管 SWAP 时会先确保 `/etc/fstab` 末尾换行，并使用 `sw,nofail` 持久化；卸载可兼容清理旧版 `sw` 条目，避免 fstab 行粘连或异常挂载阻断开机。

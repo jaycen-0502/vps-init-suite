@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.11.0"
+readonly SCRIPT_VERSION="1.12.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -28,7 +28,7 @@ readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
 readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
 readonly XUI_POLICY_HELPER_VERSION="1.9.0"
 ZONEINFO_DIR="/usr/share/zoneinfo"
-readonly ROOT_COMMANDS=(full kernel ipv6 conntrack bandwidth mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade)
+readonly ROOT_COMMANDS=(full kernel ipv6 conntrack bandwidth mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade dns)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
   99-network-bbr.conf 99-optimal-proxy.conf 99-tcp-custom.conf
@@ -172,6 +172,7 @@ capture_original_sysctl_state() {
   local keys=(
     net.core.default_qdisc
     net.ipv4.tcp_congestion_control net.ipv4.tcp_fastopen
+    net.ipv4.tcp_adv_win_scale net.ipv4.tcp_base_mss
     net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default
     net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.ip_forward
     net.ipv6.conf.all.forwarding net.ipv6.conf.default.forwarding
@@ -311,7 +312,10 @@ show_status() {
   fi
   printf '拥塞控制:                %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)"
   printf '默认队列:                %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
-  printf 'TCP Fast Open:           %s（目标值: 0，默认关闭）\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
+  printf 'TCP Fast Open:           %s（目标值: 2，服务端加速模式）\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unavailable)"
+  printf 'TCP 初始窗口 (initcwnd): %s\n' "$(ip route show default 2>/dev/null | grep -o "initcwnd [0-9]*" | awk '{print $2}' || echo 默认)"
+  printf 'TCP 通告窗口比例:        %s（目标值: 2，adv_win_scale）\n' "$(sysctl -n net.ipv4.tcp_adv_win_scale 2>/dev/null || echo unavailable)"
+  printf 'TCP 基准包 (base_mss):   %s（目标值: 1024）\n' "$(sysctl -n net.ipv4.tcp_base_mss 2>/dev/null || echo unavailable)"
   printf 'TCP 空闲防断流:          %s（目标值: 0，空闲不降速）\n' "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo unavailable)"
   printf 'TCP 队列防积压:          %s 字节（notsent_lowat）\n' "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo unavailable)"
   printf 'TCP MTU 探测:            %s（目标值: 1）\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unavailable)"
@@ -320,6 +324,7 @@ show_status() {
   printf 'IPv4 转发:               %s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unavailable)"
   printf 'IPv6 转发:               %s\n' "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo unavailable)"
   printf 'IPv6 状态:               %s\n' "$(if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == "1" ]]; then printf '%s' 已开启; else printf '%s' 已关闭; fi)"
+  printf 'IPv6 假死黑洞防护:       %s\n' "$(if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)" == "1" ]]; then printf '%s' '已禁用（防假死黑洞）'; else printf '%s' '未禁用'; fi)"
   printf 'TCP 缓冲上限:            %s 字节\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unavailable)"
   printf '带宽/RTT 缓冲档位:       %s Mbps / %s ms\n' "$tuning_bandwidth" "$tuning_rtt"
   printf 'Swap 倾向:               %s\n' "$(sysctl -n vm.swappiness 2>/dev/null || echo unavailable)"
@@ -454,17 +459,20 @@ tune_kernel() {
   log "检测到 ${memory_mb} MiB 内存，正在应用 ${profile} 配置。"
 
   if [[ "$ipv6_mode" == "on" ]]; then
-    ipv6_config="net.ipv6.conf.all.forwarding = 1
+    ipv6_config="net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.default.forwarding = 1
 net.ipv6.conf.all.accept_ra = 2
 net.ipv6.conf.default.accept_ra = 2"
-    log "已按选择开启 IPv6 转发。"
+    log "已按选择开启 IPv6 协议栈与转发。"
   else
-    ipv6_config="net.ipv6.conf.all.forwarding = 0
-net.ipv6.conf.default.forwarding = 0
-net.ipv6.conf.all.accept_ra = 1
-net.ipv6.conf.default.accept_ra = 1"
-    warn "IPv6 转发已关闭（默认）；本机普通 IPv6 出站连接仍保留。"
+    ipv6_config="net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0"
+    warn "IPv6 已彻底禁用（默认），杜绝假死黑洞并锁定 IPv4 专线。"
   fi
 
   conntrack_config=""
@@ -489,7 +497,8 @@ net.ipv6.conf.default.accept_ra = 1"
 # Managed by vps-init-suite.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 0
+net.ipv4.tcp_fastopen = 2
+net.ipv4.tcp_adv_win_scale = 2
 net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${wmem_max}
 net.core.rmem_default = ${rmem_default}
@@ -498,9 +507,6 @@ net.ipv4.tcp_rmem = 4096 ${rmem_default} ${rmem_max}
 net.ipv4.tcp_wmem = 4096 ${wmem_default} ${wmem_max}
 net.ipv4.ip_forward = 1
 ${ipv6_config}
-net.ipv6.conf.all.disable_ipv6 = 0
-net.ipv6.conf.default.disable_ipv6 = 0
-net.ipv6.conf.lo.disable_ipv6 = 0
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 net.ipv4.tcp_window_scaling = 1
@@ -511,6 +517,7 @@ net.ipv4.tcp_reordering = 6
 net.ipv4.tcp_frto = 2
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_tw_reuse = 1
@@ -540,19 +547,24 @@ EOF
   sysctl -p "$SYSCTL_FILE"
   verify_sysctl_value net.core.default_qdisc fq || die "内核未应用 net.core.default_qdisc=fq。"
   verify_sysctl_value net.ipv4.tcp_congestion_control bbr || die "内核未应用 TCP BBR。"
-  verify_sysctl_value net.ipv4.tcp_fastopen 0 || die "内核未应用 TCP Fast Open=0。"
+  verify_sysctl_value net.ipv4.tcp_fastopen 2 || die "内核未应用 TCP Fast Open=2。"
+  verify_sysctl_value net.ipv4.tcp_adv_win_scale 2 || die "内核未应用 TCP 通告窗口比例=2。"
+  verify_sysctl_value net.ipv4.tcp_base_mss 1024 || die "内核未应用 TCP 基准包=1024。"
   verify_sysctl_value net.ipv4.tcp_slow_start_after_idle 0 || die "内核未应用 TCP 空闲防断流设置。"
   verify_sysctl_value net.core.rmem_max "$rmem_max" || die "内核接收缓冲上限与配置不一致。"
   verify_sysctl_value net.core.wmem_max "$wmem_max" || die "内核发送缓冲上限与配置不一致。"
   verify_sysctl_value net.ipv4.ip_forward 1 || die "IPv4 转发未能生效。"
   if [[ "$ipv6_mode" == "on" ]]; then
     verify_sysctl_value net.ipv6.conf.all.forwarding 1 || die "IPv6 转发未能生效。"
+    verify_sysctl_value net.ipv6.conf.all.disable_ipv6 0 || die "IPv6 启用未能生效。"
   else
     verify_sysctl_value net.ipv6.conf.all.forwarding 0 || die "IPv6 转发关闭设置未能生效。"
+    verify_sysctl_value net.ipv6.conf.all.disable_ipv6 1 || die "IPv6 禁用设置未能生效。"
   fi
   # /etc/sysctl.d is loaded by the distro-provided systemd-sysctl unit. Do
   # not add a second boot-time unit or place sysctl behind network-online.
   migrate_legacy_boot_services
+  setup_initcwnd
   systemctl daemon-reload
   configure_systemd_shutdown_timeout
   configure_xui_service_limits "$file_max"
@@ -569,6 +581,46 @@ restore_system_sysctl_link() {
   [[ -f /etc/sysctl.conf ]] || return 0
   ln -s ../sysctl.conf "$path"
   log "已恢复系统默认的 /etc/sysctl.d/99-sysctl.conf 软链接。"
+}
+
+setup_initcwnd() {
+  local dev gw
+  dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+  gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+  if [[ -n "$dev" && -n "$gw" ]]; then
+    ip route change default via "$gw" dev "$dev" initcwnd 64 initrwnd 64 2>/dev/null || true
+    mkdir -p /etc/network/if-up.d
+    local initcwnd_file="/etc/network/if-up.d/99-initcwnd"
+    cat >"$initcwnd_file" <<'EOF'
+#!/bin/sh
+dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+if [ -n "$dev" ] && [ -n "$gw" ]; then
+  ip route change default via "$gw" dev "$dev" initcwnd 64 initrwnd 64 2>/dev/null || true
+fi
+EOF
+    chmod +x "$initcwnd_file" 2>/dev/null || true
+    log "已优化网卡初始窗口: initcwnd 64, initrwnd 64（首屏秒开，开机自动生效）。"
+  fi
+}
+
+setup_dns() {
+  require_root
+  require_supported_os
+  local target="/etc/resolv.conf"
+  if [[ -L "$target" ]]; then
+    warn "${target} 为软链接（可能由 systemd-resolved 托管），正在备份并创建独立纯净配置。"
+    capture_original_managed_file "$target"
+    rm -f -- "$target"
+  else
+    capture_original_managed_file "$target"
+  fi
+  cat >"$target" <<'EOF'
+# Managed by vps-init-suite.
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
+  log "已成功配置纯净公共 IPv4 DNS (8.8.8.8 / 1.1.1.1)，解决海外 CDN 解析缓慢与图片空白。"
 }
 
 configure_systemd_shutdown_timeout() {
@@ -1885,6 +1937,7 @@ uninstall_suite() {
     /etc/modules-load.d/vps-init-suite.conf \
     "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$TUNING_CONFIG" \
     "$MSS_CONFIG" "$MSS_HELPER" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" \
+    /etc/network/if-up.d/99-initcwnd /etc/resolv.conf \
     "$LAUNCHER_PATH" "$INSTALLED_SCRIPT"; do
     remove_managed_file "$managed_path"
   done
@@ -2023,6 +2076,7 @@ Commands:
   select                   Choose an action interactively
   status                   Show current settings
   diagnose                 Show CPU, retransmission, softirq, and conntrack counters
+  dns                      Configure clean public IPv4 DNS (8.8.8.8 / 1.1.1.1)
   uninstall [--remove-swap] Remove suite (preserves swap by default)
   remove                   Alias for uninstall
   uninstall-3xui [--yes]   Permanently remove 3X-UI and known data paths
@@ -2061,9 +2115,10 @@ menu() {
   13. 3X-UI / Xray 连接策略
  14. 手动设置/修改带宽与 RTT
  15. 网络/CPU 诊断
- 16. 退出（也可输入 0）
+ 16. 优化纯净 DNS（8.8.8.8 / 1.1.1.1）
+ 17. 退出（也可输入 0）
 EOF
-    read -r -p "请选择 [0-16]: " choice
+    read -r -p "请选择 [0-17]: " choice
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -2080,7 +2135,8 @@ EOF
       13) xui_policy_menu ;;
       14) configure_bandwidth_profile; pause_menu ;;
       15) diagnose_system; pause_menu ;;
-      16|0) return 0 ;;
+      16) setup_dns; pause_menu ;;
+      17|0) return 0 ;;
       *) warn "无效选项。"; pause_menu ;;
     esac
   done
@@ -2107,8 +2163,9 @@ select_menu() {
       " 14. 3X-UI / Xray 连接策略" \
       " 15. 手动设置/修改带宽与 RTT" \
       " 16. 网络/CPU 诊断" \
+      " 17. 优化纯净 DNS（8.8.8.8 / 1.1.1.1）" \
       "  0. 退出"
-    read -r -p "请选择 [0-16]: " choice
+    read -r -p "请选择 [0-17]: " choice
     case "$choice" in
       1) full_init ;;
       2) tune_kernel ;;
@@ -2126,6 +2183,7 @@ select_menu() {
       14) xui_policy_menu ;;
       15) configure_bandwidth_profile ;;
       16) diagnose_system ;;
+      17) setup_dns ;;
       0) return 0 ;;
       *) warn "无效选项。" ;;
     esac
@@ -2150,6 +2208,7 @@ main() {
     uninstall|remove) uninstall_suite "${@:2}" ;;
     status) show_status ;;
     diagnose) diagnose_system ;;
+    dns) setup_dns ;;
     uninstall-3xui) uninstall_3xui "${2:-}" ;;
     xui-policy|xray-policy) xui_policy "${@:2}" ;;
     update|upgrade) update_self ;;
