@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.13.1"
+readonly SCRIPT_VERSION="1.13.2"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -381,6 +381,24 @@ diagnose_system() {
   printf '%s\n' '================================================='
 }
 
+has_working_ipv6() {
+  command -v ip >/dev/null 2>&1 || return 1
+  # 1. 检查是否存在除 lo 和 link-local(fe80) 以外的 global IPv6 地址
+  ip -6 addr show scope global 2>/dev/null | grep -qw "inet6" || return 1
+  # 2. 检查是否有默认 IPv6 路由
+  ip -6 route show default 2>/dev/null | grep -qw "default" || return 1
+  # 3. 快速网络连通性探测（限时 1 秒），测试公网著名 IPv6 DNS
+  if command -v ping6 >/dev/null 2>&1; then
+    ping6 -c 1 -W 1 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
+  elif command -v ping >/dev/null 2>&1; then
+    ping -6 -c 1 -W 1 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    curl -6 -s -m 2 "https://ip.sb" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
 tune_kernel() {
   require_root
   require_supported_os
@@ -399,9 +417,14 @@ tune_kernel() {
   assert_not_symlink /etc/modules-load.d/vps-init-suite.conf
   apt_install kmod procps
 
-  if [[ -z "$requested_ipv6" ]] && [[ -r /proc/sys/net/ipv6/conf/all/forwarding ]]; then
-    requested_ipv6=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)
-    [[ "$requested_ipv6" == "1" ]] && requested_ipv6=on || requested_ipv6=off
+  if [[ -z "$requested_ipv6" ]]; then
+    if has_working_ipv6; then
+      requested_ipv6=on
+      log "检测到本机具备正常可达的公网 IPv6，保留 IPv6 支持。"
+    else
+      requested_ipv6=off
+      log "检测到本机 IPv6 无可用公网出口或网络不可达，自动启用「防假死黑洞防护」（禁用 IPv6）。"
+    fi
   fi
   ipv6_mode=$(resolve_ipv6_mode "$requested_ipv6")
 
