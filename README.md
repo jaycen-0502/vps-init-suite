@@ -81,6 +81,19 @@ vps-init bandwidth 200 160 # 按 200 Mbps、160 ms 重新计算并立即应用�
 
 `kernel` 只更新项目自己的 `/etc/sysctl.d/99-vps-init-suite.conf`，不会覆盖 `/etc/sysctl.conf` 或删除其他防火墙规则。检测到 3X-UI 时会写入独立的 `x-ui.service.d/90-vps-init-suite.conf`；文件句柄上限在下次重启 `x-ui.service` 后生效。MSS 规则使用项目专用链，支持 VLESS Reality、SOCKS5 和 UDP，不会清空用户现有规则。
 
+### 高并发与小内存自适应调优（high-conn）
+
+针对 1GB 内存及多并发（如 3,000+ 连接）代理节点，提供三合一自适应防爆引擎：
+
+```bash
+vps-init high-conn
+```
+
+- **自适应 Swap 守护**：若无 Swap 且物理内存 ≤ 3.5GB，按磁盘余量自适应分配 1~2 GiB Swap 并配置 `swappiness=10` 与 `nofail` 引导保护；容器或已有 Swap 机器自动跳过。
+- **内核 TCP 协议栈收敛**：低内存机型初始读写缓冲收紧至 16 KB（原 64 KB，底噪内存节约 75%），全局 TCP 内存硬上限锁定 256 MB，避免高并发流量突发挤爆物理内存。
+- **Go 运行时智能限额**：为 `x-ui` 注入 `GOMEMLIMIT=350MiB`、`GOGC=75` 与 `GODEBUG=madvdontneed=1`，彻底消除 Go 频繁 GC 引起的 90% CPU 尖峰，并强制将闲置内存立即归还系统，面板内存占用即时下降。
+- **日志防膨胀**：锁定 `systemd-journald` 最大内存/磁盘占用至 30MB，避免系统日志长期驻留挤占 RAM。
+
 快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。常规只读的 `status`、`version`、`help` 不需要 root；`xui-policy` 还要读取通常仅 root 可读的 3X-UI 数据库，因此会自动请求 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
 
 ## 已安装机器：选择操作或卸载

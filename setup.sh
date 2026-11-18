@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.14.0"
+readonly SCRIPT_VERSION="1.15.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -22,6 +22,8 @@ readonly SYSTEMD_TIMEOUT_FILE="/etc/systemd/system.conf.d/90-vps-init-suite-time
 readonly GRUB_QUIRK_FILE="/etc/default/grub.d/99-vps-init-suite-reboot.cfg"
 readonly XUI_LIMITS_DIR="/etc/systemd/system/x-ui.service.d"
 readonly XUI_LIMITS_FILE="${XUI_LIMITS_DIR}/90-vps-init-suite.conf"
+readonly JOURNALD_LIMITS_DIR="/etc/systemd/journald.conf.d"
+readonly JOURNALD_LIMITS_FILE="${JOURNALD_LIMITS_DIR}/90-vps-init-suite.conf"
 readonly STATE_DIR="/var/lib/vps-init-suite/state"
 readonly ORIGINAL_SYSCTL_STATE="${STATE_DIR}/initial-sysctl.conf"
 readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
@@ -345,6 +347,15 @@ show_status() {
   printf 'MSS 策略:                %s\n' "${mss:-未配置}"
   printf 'Conntrack:               %s\n' "$(if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then printf '已加载 (%s/%s)' "$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo '?')" "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '?')"; else printf '%s' 未加载; fi)"
   printf 'x-ui 文件句柄上限:       %s\n' "$xui_nofile"
+  local xui_env_limit=""
+  if xui_service_detected && command -v systemctl >/dev/null; then
+    xui_env_limit=$(run_with_timeout 3 systemctl show x-ui.service --property=Environment --value 2>/dev/null || true)
+  fi
+  if [[ -n "$xui_env_limit" && "$xui_env_limit" == *"GOMEMLIMIT"* ]]; then
+    local gomem=$(grep -o 'GOMEMLIMIT=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2)
+    local gogc=$(grep -o 'GOGC=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2)
+    printf 'x-ui Go 内存限制:        %s (GOGC: %s, madvdontneed=1)\n' "${gomem:-未设定}" "${gogc:-默认}"
+  fi
   printf '%s\n' "------------------------------------------------------------"
 }
 
@@ -608,6 +619,7 @@ EOF
   setup_initcwnd
   systemctl daemon-reload
   configure_systemd_shutdown_timeout
+  configure_journald_limits
   configure_xui_service_limits "$file_max"
   configure_pve_reboot_quirk
   log "内核配置已生效，并已设置为开机自动应用。"
@@ -687,6 +699,30 @@ EOF
   mv -f -- "$temporary" "$SYSTEMD_TIMEOUT_FILE"
   systemctl daemon-reload
   log "已设置 systemd 停机超时为 10 秒，避免代理服务停止时长时间挂起。"
+}
+
+configure_journald_limits() {
+  require_root
+  [[ -d /etc/systemd ]] || return 0
+  if [[ -e "$JOURNALD_LIMITS_FILE" ]] && ! is_suite_managed_file "$JOURNALD_LIMITS_FILE"; then
+    warn "发现非本项目的 journald 配置，保持原文件不变。"
+    return 0
+  fi
+  assert_not_symlink "$JOURNALD_LIMITS_FILE"
+  capture_original_managed_file "$JOURNALD_LIMITS_FILE"
+  mkdir -p "$JOURNALD_LIMITS_DIR"
+  local temporary
+  temporary=$(mktemp "${JOURNALD_LIMITS_DIR}/.90-vps-init-suite.XXXXXX")
+  cat >"$temporary" <<'EOF'
+# Managed by vps-init-suite.
+[Journal]
+SystemMaxUse=30M
+RuntimeMaxUse=15M
+EOF
+  chmod 0644 "$temporary"
+  mv -f -- "$temporary" "$JOURNALD_LIMITS_FILE"
+  systemctl restart systemd-journald >/dev/null 2>&1 || true
+  log "已限制 systemd-journald 日志内存与磁盘占用 (上限 30M)。"
 }
 
 is_pve_or_qemu_vm() {
@@ -1034,11 +1070,41 @@ configure_bandwidth_profile() {
 tune_high_concurrency() {
   require_root
   require_supported_os
-  log "正在应用 1GB 内存 / 3,000 高并发防爆专属调优..."
+  log "正在启动高并发自适应调优引擎 (Swap + TCP + Go/x-ui + 日志)..."
 
-  TUNING_BANDWIDTH=200
-  TUNING_RTT=40
-  TUNING_BUFFER_MAX=1048576
+  # 1. 自动挂载 Swap 守护防 OOM
+  setup_swap
+
+  # 2. 读取物理内存并自适应分档 (四档自适应)
+  local memory_mb
+  memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+
+  local bandwidth=200 rtt=40 tcp_buf_max xui_mem_limit xui_gogc
+  if (( memory_mb <= 600 )); then
+    bandwidth=100
+    tcp_buf_max=1048576    # 1MB
+    xui_mem_limit="180MiB"
+    xui_gogc=50
+  elif (( memory_mb <= 1500 )); then
+    bandwidth=200
+    tcp_buf_max=2097152    # 2MB
+    xui_mem_limit="350MiB"
+    xui_gogc=75
+  elif (( memory_mb <= 3000 )); then
+    bandwidth=500
+    tcp_buf_max=8388608    # 8MB
+    xui_mem_limit="800MiB"
+    xui_gogc=100
+  else
+    bandwidth=1000
+    tcp_buf_max=8388608    # 8MB
+    xui_mem_limit="1600MiB"
+    xui_gogc=100
+  fi
+
+  TUNING_BANDWIDTH=$bandwidth
+  TUNING_RTT=$rtt
+  TUNING_BUFFER_MAX=$tcp_buf_max
   assert_not_symlink "$TUNING_CONFIG"
   capture_original_managed_file "$TUNING_CONFIG"
   mkdir -p "$(dirname "$TUNING_CONFIG")"
@@ -1055,24 +1121,21 @@ EOF
       current_ipv6="on"
     fi
   fi
-  tune_kernel "$current_ipv6" auto 200 40
+  tune_kernel "$current_ipv6" auto "$TUNING_BANDWIDTH" "$TUNING_RTT"
 
-  configure_xui_service_limits 65535
-  if xui_service_detected && systemctl is-active --quiet x-ui.service 2>/dev/null; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    if systemctl restart x-ui.service 2>/dev/null; then
-      log "已平滑重启 x-ui.service，LimitNOFILE=65535 已生效（保留现有 GOMEMLIMIT 等环境变量）。"
-    fi
-  fi
+  configure_journald_limits
+
+  configure_xui_service_limits 65535 "$xui_mem_limit" "$xui_gogc" "now"
 
   log "============================================================"
-  log "1G 内存高并发防爆调优已成功生效！"
-  log "• 单连接初始读写缓冲已收紧至: 16 KB / 16 KB (原 64 KB，节约 75% 初始底噪内存)"
-  log "• 单连接缓冲最大上限压至: 1 MB (1048576 字节)"
-  log "• 内核 TCP 协议栈全局硬上限: 256 MB (16384 32768 65536 页)"
-  log "• 临时端口范围扩展至: 1024 65535"
-  log "• 监听队列与 SYN 队列: 4096 / 4096"
-  log "• x-ui 文件描述符限制: 65535 (已保留 GOMEMLIMIT 环境变量)"
+  log "自适应高并发防爆调优已成功生效！(物理内存: ${memory_mb} MB)"
+  log "• TCP 缓冲上限: $((TUNING_BUFFER_MAX / 1048576)) MB (${TUNING_BUFFER_MAX} 字节)"
+  log "• 初始单连接读写缓冲: $(sysctl -n net.core.rmem_default 2>/dev/null || echo 16384) 字节"
+  log "• 内核 TCP 协议栈全局硬上限: $(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo '16384 32768 65536') 页"
+  log "• 临时端口范围: 1024 65535 | 监听与SYN队列: 4096 / 4096"
+  log "• x-ui Go 内存限制: ${xui_mem_limit} (GOGC: ${xui_gogc}, madvdontneed=1)"
+  log "• x-ui 文件句柄与进程限制: 65535"
+  log "• 日志守护: journald 最大占用锁定 30MB"
   log "============================================================"
   show_status
 }
@@ -1088,6 +1151,10 @@ proxy_nofile_limit() {
 
 configure_xui_service_limits() {
   local file_limit=${1:?missing x-ui file limit}
+  local gomemlimit=${2:-}
+  local gogc=${3:-}
+  local restart_mode=${4:-prompt}
+
   xui_service_detected || return 0
   systemctl cat x-ui.service >/dev/null 2>&1 || return 0
   if [[ -L "$XUI_LIMITS_DIR" ]]; then
@@ -1100,39 +1167,71 @@ configure_xui_service_limits() {
     return 0
   fi
 
+  local memory_mb
+  memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || echo 1024)
+  if [[ -z "$gomemlimit" ]]; then
+    if (( memory_mb <= 600 )); then
+      gomemlimit="180MiB"
+      gogc=50
+    elif (( memory_mb <= 1500 )); then
+      gomemlimit="350MiB"
+      gogc=75
+    elif (( memory_mb <= 3000 )); then
+      gomemlimit="800MiB"
+      gogc=100
+    else
+      gomemlimit="1600MiB"
+      gogc=100
+    fi
+  fi
+  [[ -n "$gogc" ]] || gogc=75
+
   mkdir -p "$XUI_LIMITS_DIR"
   capture_original_managed_file "$XUI_LIMITS_FILE"
   local temporary
   temporary=$(mktemp "${XUI_LIMITS_DIR}/.90-vps-init-suite.XXXXXX")
   cat >"$temporary" <<EOF
 # Managed by vps-init-suite.
-# Proxy-node service limit; takes effect on the next x-ui.service restart.
+# Proxy-node service limits; takes effect on the next x-ui.service restart.
 [Service]
 LimitNOFILE=${file_limit}
+LimitNPROC=${file_limit}
+Environment="GOMEMLIMIT=${gomemlimit}"
+Environment="GOGC=${gogc}"
+Environment="GODEBUG=madvdontneed=1"
+Restart=always
+RestartSec=3s
 EOF
   chmod 0644 "$temporary"
   mv -f -- "$temporary" "$XUI_LIMITS_FILE"
   systemctl daemon-reload
   if systemctl is-active --quiet x-ui.service; then
-    if [[ -t 0 ]]; then
+    if [[ "$restart_mode" == "now" ]]; then
+      if systemctl restart x-ui.service; then
+        log "已平滑重启 x-ui.service，LimitNOFILE=${file_limit} 与 Go 限制 (${gomemlimit}, GOGC=${gogc}) 已生效。"
+      else
+        warn "x-ui.service 重启失败，正在尝试启动服务；设置将在下次成功启动时生效。"
+        systemctl start x-ui.service >/dev/null 2>&1 || true
+      fi
+    elif [[ -t 0 ]]; then
       local answer
-      read -r -p "是否现在重启 x-ui.service 使文件句柄上限生效？现有代理连接会短暂重连 [y/N]: " answer
+      read -r -p "是否现在重启 x-ui.service 使新设置生效？现有代理连接会短暂重连 [y/N]: " answer
       case "${answer:-n}" in
         y|Y|yes|YES)
           if systemctl restart x-ui.service; then
-            log "已为 x-ui.service 应用 LimitNOFILE=${file_limit}。"
+            log "已为 x-ui.service 应用 LimitNOFILE=${file_limit} 与 Go 限制 (${gomemlimit}, GOGC=${gogc})。"
           else
-            warn "x-ui.service 重启失败，正在尝试启动服务；文件句柄设置将在下次成功启动时生效。"
+            warn "x-ui.service 重启失败，正在尝试启动服务；设置将在下次成功启动时生效。"
             systemctl start x-ui.service >/dev/null 2>&1 || true
           fi
           ;;
-        *) log "已为 x-ui.service 保存 LimitNOFILE=${file_limit}；下次重启面板服务后生效。" ;;
+        *) log "已为 x-ui.service 保存设置；下次重启面板服务后生效。" ;;
       esac
     else
-      log "已为 x-ui.service 保存 LimitNOFILE=${file_limit}；下次重启面板服务后生效。"
+      log "已为 x-ui.service 保存设置；下次重启面板服务后生效。"
     fi
   else
-    log "已为 x-ui.service 设置 LimitNOFILE=${file_limit}；服务下次启动时生效。"
+    log "已为 x-ui.service 设置 LimitNOFILE=${file_limit} 与 Go 限制 (${gomemlimit})；服务下次启动时生效。"
   fi
 }
 
@@ -1356,6 +1455,15 @@ setup_swap() {
   assert_not_symlink "$SWAP_SYSCTL_FILE"
   apt_install util-linux
 
+  local virt_type="none"
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    virt_type=$(systemd-detect-virt 2>/dev/null || echo "none")
+  fi
+  if [[ "$virt_type" == "openvz" || "$virt_type" == "lxc" ]]; then
+    log "容器虚拟化环境 (${virt_type}) 不支持挂载内核 Swap，安全跳过。"
+    return 0
+  fi
+
   local active_swaps
   active_swaps=$(swapon --show=NAME --noheadings 2>/dev/null || true)
   if [[ -n "$active_swaps" ]]; then
@@ -1368,16 +1476,28 @@ setup_swap() {
   fi
   [[ -f /etc/fstab && ! -L /etc/fstab && -w /etc/fstab ]] || die "/etc/fstab is missing, not a regular file, or not writable; refusing to create swap."
 
-  local memory_mb swap_gib required_bytes available_bytes
+  local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
-  if (( memory_mb <= 2048 )); then
-    swap_gib=2
-  else
-    swap_gib=4
+  if (( memory_mb > 3500 )); then
+    log "物理内存充足 (${memory_mb} MB > 3.5GB)，跳过自动创建 Swap。"
+    return 0
   fi
-  required_bytes=$(( (swap_gib + 1) * 1024 * 1024 * 1024 ))
+
+  local swap_gib=2
+  local available_bytes
   available_bytes=$(df -PB1 / | awk 'NR == 2 {print $4}')
-  (( available_bytes >= required_bytes )) || die "Not enough free disk space for ${swap_gib} GiB swap plus 1 GiB headroom."
+  local required_2g=$(( 3 * 1024 * 1024 * 1024 ))  # 2 GiB swap + 1 GiB headroom
+  local required_1g=$(( 2 * 1024 * 1024 * 1024 ))  # 1 GiB swap + 1 GiB headroom
+
+  if (( available_bytes >= required_2g )); then
+    swap_gib=2
+  elif (( available_bytes >= required_1g )); then
+    swap_gib=1
+    log "根分区剩余空间适中，自适应分配 1 GiB SWAP 以预留安全余量。"
+  else
+    warn "根分区剩余可用空间不足 2 GiB，为保障系统安全，跳过自动创建 Swap。"
+    return 0
+  fi
 
   if [[ -e "$SWAP_FILE" ]]; then
     if [[ -e "${STATE_DIR}/managed-swap.present" ]]; then
@@ -2026,6 +2146,7 @@ uninstall_suite() {
     /etc/modules-load.d/vps-init-suite.conf \
     "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$TUNING_CONFIG" \
     "$MSS_CONFIG" "$MSS_HELPER" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" \
+    "$JOURNALD_LIMITS_FILE" \
     /etc/network/if-up.d/99-initcwnd /etc/resolv.conf \
     "$LAUNCHER_PATH" "$INSTALLED_SCRIPT"; do
     remove_managed_file "$managed_path"
@@ -2033,7 +2154,9 @@ uninstall_suite() {
   if command -v update-grub >/dev/null 2>&1; then
     run_with_timeout 30 update-grub >/dev/null 2>&1 || true
   fi
+  rmdir "$JOURNALD_LIMITS_DIR" 2>/dev/null || true
   rmdir "$XUI_LIMITS_DIR" 2>/dev/null || true
+  systemctl restart systemd-journald >/dev/null 2>&1 || true
   systemctl daemon-reload
   systemctl reset-failed vps-init-suite-mss.service vps-init-suite-sysctl.service >/dev/null 2>&1 || true
 
@@ -2163,7 +2286,7 @@ Commands:
   conntrack [auto|on|off]  Select conntrack for NAT/firewall or proxy-only mode
   bandwidth [Mbps|auto] [RTT_MS|auto]
                            Save bandwidth/RTT buffer profile without changing MSS
-  high-conn                Apply 1GB RAM / 3000-conn low-buffer profile (16KB/1MB/256MB)
+  high-conn                Apply adaptive high-concurrency profile (Swap + TCP + Go/x-ui bounds + journald)
   mss [clamp|dual-fixed|1200..1460] Persist MSS policy (default: clamp)
   swap                     Create managed 2/4 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
@@ -2211,7 +2334,7 @@ menu() {
  14. 手动设置/修改带宽与 RTT
  15. 网络/CPU 诊断
  16. 优化纯净 DNS（8.8.8.8 / 1.1.1.1）
- 17. 1G 内存高并发专属调优 (3,000 并发/防爆内存/锁 256MB)
+ 17. 自适应高并发专属调优 (Swap + TCP + Go/x-ui 防爆 + 日志)
  18. 退出（也可输入 0）
 EOF
     read -r -p "请选择 [0-18]: " choice
@@ -2261,7 +2384,7 @@ select_menu() {
       " 15. 手动设置/修改带宽与 RTT" \
       " 16. 网络/CPU 诊断" \
       " 17. 优化纯净 DNS（8.8.8.8 / 1.1.1.1）" \
-      " 18. 1G 内存高并发专属调优 (3,000 并发/防爆内存/锁 256MB)" \
+      " 18. 自适应高并发专属调优 (Swap + TCP + Go/x-ui 防爆 + 日志)" \
       "  0. 退出"
     read -r -p "请选择 [0-18]: " choice
     case "$choice" in
