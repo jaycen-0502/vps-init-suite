@@ -89,11 +89,12 @@ vps-init bandwidth 200 160 # 按 200 Mbps、160 ms 重新计算并立即应用�
 # 1. 交互式选择场景（在终端中弹出菜单选择 1~5）
 vps-init high-conn
 
-# 2. 或直接指定线路预设（支持命令行直接传入）：
-vps-init high-conn intl   # 日本/亚太国际互联（纯海外中转/国际落地，1000M/30ms 跑满千兆极速）
-vps-init high-conn cn     # 亚太优化直连国内（面向国内直连，200M/40ms 兼顾 3000 并发防爆）
-vps-init high-conn us     # 美西跨洋大带宽（1000M/160ms 跨太平洋大口子）
-vps-init high-conn eu     # 欧洲长途跨洋（500M/200ms）
+# 2. 或直接指定线路预设与自定义带宽（支持直接传参）：
+vps-init high-conn us 200 160 # 美国 200M 带宽 / 160ms 延迟（自动精准分配 4MB 缓冲）
+vps-init high-conn intl       # 日本/亚太国际互联（纯海外中转/国际落地，1000M/30ms 跑满千兆极速）
+vps-init high-conn cn         # 亚太优化直连国内（面向国内直连，200M/40ms 兼顾 3000 并发防爆）
+vps-init high-conn us         # 美西跨洋千兆大带宽（1000M/160ms 跨太平洋大口子）
+vps-init high-conn eu         # 欧洲长途跨洋（500M/200ms）
 ```
 
 - **业务场景精准适配**：

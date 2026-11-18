@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.16.0"
+readonly SCRIPT_VERSION="1.17.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -425,11 +425,12 @@ tune_kernel() {
   require_root
   require_supported_os
   local ipv6_mode requested_ipv6 conntrack_mode requested_conntrack
-  local requested_bandwidth requested_rtt
+  local requested_bandwidth requested_rtt requested_buffer_max
   requested_ipv6=${1:-}
   requested_conntrack=${2:-${VPS_CONNTRACK:-auto}}
   requested_bandwidth=${3:-}
   requested_rtt=${4:-}
+  requested_buffer_max=${5:-}
   if [[ -t 0 ]]; then
     prompt_missing_tuning_profile requested_bandwidth requested_rtt
   fi
@@ -469,7 +470,7 @@ tune_kernel() {
 
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
-  resolve_tuning_profile "$requested_bandwidth" "$requested_rtt" "$memory_mb"
+  resolve_tuning_profile "$requested_bandwidth" "$requested_rtt" "$memory_mb" "$requested_buffer_max"
   local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog netdev_backlog syn_backlog tw_buckets keepalive_time keepalive_intvl keepalive_probes conntrack_config ipv6_config tcp_mem_config
   if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
     profile="低内存高并发（${TUNING_BUFFER_MAX} 字节缓冲，16KB初始/锁256MB）"
@@ -920,7 +921,7 @@ calculate_buffer_max() {
 }
 
 resolve_tuning_profile() {
-  local requested_bandwidth=${1:-} requested_rtt=${2:-} memory_mb=$3
+  local requested_bandwidth=${1:-} requested_rtt=${2:-} memory_mb=$3 requested_buffer_max=${4:-}
   local stored_bandwidth stored_rtt bdp_bytes requested_mib memory_cap_mib
   stored_bandwidth=$(tuning_value BANDWIDTH_MBPS)
   stored_rtt=$(tuning_value RTT_MS)
@@ -948,7 +949,11 @@ resolve_tuning_profile() {
 
   TUNING_BANDWIDTH=$((10#$requested_bandwidth))
   TUNING_RTT=$((10#$requested_rtt))
-  TUNING_BUFFER_MAX=$(calculate_buffer_max "$TUNING_BANDWIDTH" "$TUNING_RTT" "$memory_mb")
+  if [[ -n "$requested_buffer_max" && "$requested_buffer_max" =~ ^[0-9]+$ ]]; then
+    TUNING_BUFFER_MAX=$requested_buffer_max
+  else
+    TUNING_BUFFER_MAX=$(calculate_buffer_max "$TUNING_BANDWIDTH" "$TUNING_RTT" "$memory_mb")
+  fi
   bdp_bytes=$((TUNING_BANDWIDTH * 125 * TUNING_RTT))
   requested_mib=$(( (bdp_bytes * 3 / 2 + 1048575) / 1048576 ))
   memory_cap_mib=$(memory_buffer_cap_mib "$memory_mb")
@@ -1092,140 +1097,149 @@ tune_high_concurrency() {
   require_root
   require_supported_os
   local requested_mode=${1:-}
+  local custom_bw=${2:-}
+  local custom_rtt=${3:-}
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
 
   # 1. 自动挂载 Swap 守护防 OOM
   setup_swap
 
-  # 2. 读取或交互选择业务场景预设
-  local scenario="cn"
+  # 2. 如果第 1 个参数是纯数字（例如 high-conn 200 160），自动识别为自定义带宽
+  if [[ "$requested_mode" =~ ^[0-9]+$ ]]; then
+    custom_rtt=${custom_bw:-160}
+    custom_bw=$requested_mode
+    requested_mode="custom"
+  fi
+
+  local default_bw=200 default_rtt=40 scenario="cn"
   local mode_lower
   mode_lower=$(printf '%s' "$requested_mode" | tr '[:upper:]' '[:lower:]')
   case "$mode_lower" in
-    intl|global|jp-intl|japan-intl|international|1|jp)
-      scenario="intl"
-      ;;
-    cn|direct|china|asia|2)
-      scenario="cn"
-      ;;
     us|us-west|america|3)
       scenario="us"
+      default_bw=1000
+      default_rtt=160
+      ;;
+    intl|global|jp-intl|japan-intl|international|1|jp)
+      scenario="intl"
+      default_bw=1000
+      default_rtt=30
+      ;;
+    hk|hk-intl|hongkong|sg|singapore)
+      scenario="hk"
+      default_bw=1000
+      default_rtt=20
       ;;
     eu|europe|4)
       scenario="eu"
+      default_bw=500
+      default_rtt=220
       ;;
-    "")
-      if [[ -t 0 ]]; then
-        printf '\n%s\n' "请选择高并发业务场景与线路预设："
-        printf '%s\n' \
-          "  1. 日本/亚太国际互联 (1000 Mbps / 30 ms) - 纯海外节点中转/国际落地，跑满千兆极速" \
-          "  2. 亚太优化直连国内 (200 Mbps / 40 ms)  - 面向国内直连，兼顾 3000 高并发防爆 [默认]" \
-          "  3. 美西跨洋大带宽   (1000 Mbps / 160 ms) - 美西 1G 跨太平洋长距离线路" \
-          "  4. 欧洲/远距离跨洋   (500 Mbps / 200 ms)  - 欧洲高延迟长途互联" \
-          "  5. 完全自适应物理内存 (默认安全档)"
-        local choice
-        read -r -p "请选择 [1-5，直接回车默认 2]: " choice
-        case "${choice:-2}" in
-          1) scenario="intl" ;;
-          2) scenario="cn" ;;
-          3) scenario="us" ;;
-          4) scenario="eu" ;;
-          *) scenario="cn" ;;
-        esac
-      else
-        scenario="cn"
-      fi
+    custom|5)
+      scenario="custom"
+      default_bw=200
+      default_rtt=160
+      ;;
+    cn|direct|china|asia|2|"")
+      scenario="cn"
+      default_bw=200
+      default_rtt=40
       ;;
     *)
-      warn "未知预设 '${requested_mode}'，回退至亚太直连自适应档。"
+      warn "未知预设 '${requested_mode}'，回退至自适应直连档。"
       scenario="cn"
+      default_bw=200
+      default_rtt=40
       ;;
   esac
 
-  local bandwidth=200 rtt=40 tcp_buf_max xui_mem_limit xui_gogc scenario_name
-  case "$scenario" in
-    intl)
-      scenario_name="日本/亚太国际互联 (1000 Mbps / 30 ms - 纯海外中转/落地跑满千兆)"
-      bandwidth=1000
-      rtt=30
-      if (( memory_mb <= 600 )); then
-        tcp_buf_max=2097152    # 2MB
-        xui_mem_limit="180MiB"
-        xui_gogc=50
-      elif (( memory_mb <= 1500 )); then
-        tcp_buf_max=8388608    # 8MB (1GB 物理内存上限，30ms 下可跑满 2.1 Gbps 单流)
-        xui_mem_limit="350MiB"
-        xui_gogc=75
-      else
-        tcp_buf_max=16777216   # 16MB (大内存直接放开 16MB)
-        xui_mem_limit="800MiB"
-        xui_gogc=100
-      fi
-      ;;
-    us)
-      scenario_name="美西跨洋大带宽 (1000 Mbps / 160 ms - 跨太平洋大口子)"
-      bandwidth=1000
-      rtt=160
-      if (( memory_mb <= 600 )); then
-        tcp_buf_max=2097152    # 2MB
-        xui_mem_limit="180MiB"
-        xui_gogc=50
-      elif (( memory_mb <= 1500 )); then
-        tcp_buf_max=8388608    # 8MB (1GB 受保护上限，160ms 下可跑 400M+ 单流，多流跑满 1G)
-        xui_mem_limit="350MiB"
-        xui_gogc=75
-      else
-        tcp_buf_max=16777216   # 16MB
-        xui_mem_limit="1600MiB"
-        xui_gogc=100
-      fi
-      ;;
-    eu)
-      scenario_name="欧洲/远距离跨洋 (500 Mbps / 200 ms - 欧洲高延迟长途)"
-      bandwidth=500
-      rtt=200
-      if (( memory_mb <= 600 )); then
-        tcp_buf_max=2097152
-        xui_mem_limit="180MiB"
-        xui_gogc=50
-      elif (( memory_mb <= 1500 )); then
-        tcp_buf_max=8388608
-        xui_mem_limit="350MiB"
-        xui_gogc=75
-      else
-        tcp_buf_max=16777216
-        xui_mem_limit="1600MiB"
-        xui_gogc=100
-      fi
-      ;;
-    cn|*)
-      scenario_name="亚太优化直连国内 (200 Mbps / 40 ms - 兼顾 3000 高并发防爆)"
-      bandwidth=200
-      rtt=40
-      if (( memory_mb <= 600 )); then
-        bandwidth=100
-        tcp_buf_max=1048576    # 1MB
-        xui_mem_limit="180MiB"
-        xui_gogc=50
-      elif (( memory_mb <= 1500 )); then
-        bandwidth=200
-        tcp_buf_max=2097152    # 2MB
-        xui_mem_limit="350MiB"
-        xui_gogc=75
-      elif (( memory_mb <= 3000 )); then
-        bandwidth=500
-        tcp_buf_max=8388608    # 8MB
-        xui_mem_limit="800MiB"
-        xui_gogc=100
-      else
-        bandwidth=1000
-        tcp_buf_max=8388608    # 8MB
-        xui_mem_limit="1600MiB"
-        xui_gogc=100
-      fi
-      ;;
-  esac
+  # 检测可用交互终端（/dev/tty 优先，确保 curl 管道下也能接收键盘输入）
+  local tty_in=""
+  if [[ -e /dev/tty && -r /dev/tty && -c /dev/tty ]]; then
+    tty_in="/dev/tty"
+  elif [[ -t 0 ]]; then
+    tty_in="/dev/stdin"
+  fi
+
+  # 若完全未传参数且有交互终端，弹出场景菜单
+  if [[ -z "$requested_mode" && -n "$tty_in" ]]; then
+    printf '\n%s\n' "请选择高并发业务场景与线路预设："
+    printf '%s\n' \
+      "  1. 日本/亚太国际互联 (默认 1000 Mbps / 30 ms) - 纯海外节点中转/落地，跑满千兆" \
+      "  2. 亚太优化直连国内 (默认 200 Mbps / 40 ms)   - 面向国内直连，3000 高并发防爆 [默认]" \
+      "  3. 美西/美国跨洋大带宽 (默认 1000 Mbps / 160 ms) - 美国 1G/200M 跨洋线路" \
+      "  4. 欧洲/远距离跨洋   (默认 500 Mbps / 220 ms)  - 欧洲高延迟长途互联" \
+      "  5. 自定义带宽与延迟 (手动输入数值)"
+    local choice=""
+    read -r -t 15 -p "请选择 [1-5，直接回车默认 2]: " choice < "$tty_in" || true
+    case "${choice:-2}" in
+      1) scenario="intl"; default_bw=1000; default_rtt=30 ;;
+      2) scenario="cn"; default_bw=200; default_rtt=40 ;;
+      3) scenario="us"; default_bw=1000; default_rtt=160 ;;
+      4) scenario="eu"; default_bw=500; default_rtt=220 ;;
+      5) scenario="custom"; default_bw=200; default_rtt=160 ;;
+      *) scenario="cn"; default_bw=200; default_rtt=40 ;;
+    esac
+  fi
+
+  # 若未传具体带宽，且在 custom 模式或传入地区未带带宽参数时，允许终端交互输入
+  if [[ -n "$tty_in" && -z "$custom_bw" ]]; then
+    if [[ "$scenario" == "custom" ]] || [[ -n "$requested_mode" && -z "$2" ]]; then
+      printf '\n%s\n' "--------------------------------------------------"
+      printf ' 预设场景: %s (默认参考: %s Mbps / %s ms)\n' "$scenario" "$default_bw" "$default_rtt"
+      printf '%s\n' "--------------------------------------------------"
+      local input_bw="" input_rtt=""
+      read -r -t 15 -p " 请输入机器实际带宽 Mbps [回车默认 ${default_bw}]: " input_bw < "$tty_in" || true
+      custom_bw="${input_bw:-$default_bw}"
+      read -r -t 15 -p " 请输入往返典型延迟 ms   [回车默认 ${default_rtt}]: " input_rtt < "$tty_in" || true
+      custom_rtt="${input_rtt:-$default_rtt}"
+      printf '%s\n' "--------------------------------------------------"
+    fi
+  fi
+
+  local bandwidth="${custom_bw:-$default_bw}"
+  local rtt="${custom_rtt:-$default_rtt}"
+  [[ "$bandwidth" =~ ^[0-9]+$ ]] && (( bandwidth > 0 )) || bandwidth=$default_bw
+  [[ "$rtt" =~ ^[0-9]+$ ]] && (( rtt > 0 )) || rtt=$default_rtt
+
+  # 3. 计算理论 BDP (Bytes = Mbps * ms * 125) 并匹配标准缓冲区档位
+  local raw_bdp=$(( bandwidth * rtt * 125 ))
+  local tcp_buf_max xui_mem_limit xui_gogc
+
+  if (( raw_bdp <= 2097152 )); then
+    tcp_buf_max=2097152    # 2 MB (日本/亚太低延迟，或低带宽)
+  elif (( raw_bdp <= 4500000 )); then
+    tcp_buf_max=4194304    # 4 MB (精准匹配美国 200 Mbps / 160 ms)
+  elif (( raw_bdp <= 22000000 )); then
+    tcp_buf_max=8388608    # 8 MB (匹配美国/欧洲 500~1000 Mbps)
+  else
+    tcp_buf_max=16777216   # 16 MB (超千兆跨洋大内存)
+  fi
+
+  # 4. 结合物理内存做防爆安全封顶与 Go 限制
+  if (( memory_mb <= 600 )); then
+    tcp_buf_max=1048576    # 1 MB
+    xui_mem_limit="180MiB"
+    xui_gogc=50
+  elif (( memory_mb <= 1500 )); then
+    # 1GB 小内存机器
+    if (( tcp_buf_max > 4194304 && bandwidth <= 300 )); then
+      tcp_buf_max=4194304  # 200M/300M 带宽下 4MB 既能跑满又防 bufferbloat
+    elif (( tcp_buf_max > 8388608 )); then
+      tcp_buf_max=8388608  # 1GB 内存最高保护上限 8MB
+    fi
+    xui_mem_limit="350MiB"
+    xui_gogc=75
+  elif (( memory_mb <= 3000 )); then
+    xui_mem_limit="800MiB"
+    xui_gogc=100
+  else
+    xui_mem_limit="1600MiB"
+    xui_gogc=100
+  fi
+
+  local scenario_name="${scenario} (${bandwidth} Mbps / ${rtt} ms -> 缓冲上限 $((tcp_buf_max / 1048576)) MB)"
 
   TUNING_BANDWIDTH=$bandwidth
   TUNING_RTT=$rtt
@@ -1246,7 +1260,7 @@ EOF
       current_ipv6="on"
     fi
   fi
-  tune_kernel "$current_ipv6" auto "$TUNING_BANDWIDTH" "$TUNING_RTT"
+  tune_kernel "$current_ipv6" auto "$TUNING_BANDWIDTH" "$TUNING_RTT" "$TUNING_BUFFER_MAX"
 
   configure_journald_limits
 
@@ -2414,8 +2428,8 @@ Commands:
   conntrack [auto|on|off]  Select conntrack for NAT/firewall or proxy-only mode
   bandwidth [Mbps|auto] [RTT_MS|auto]
                            Save bandwidth/RTT buffer profile without changing MSS
-  high-conn [intl|cn|us|eu]
-                           Apply high-concurrency profile (intl: 1G JP/APAC, cn: 200M direct, us: 1G US)
+  high-conn [preset|custom] [bandwidth] [rtt]
+                           Apply high-concurrency profile (us/intl/cn/eu or custom Mbps & RTT)
   mss [clamp|dual-fixed|1200..1460] Persist MSS policy (default: clamp)
   swap                     Create managed 2/4 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
@@ -2551,7 +2565,7 @@ main() {
     ipv6) tune_kernel "${2:-}" ;;
     conntrack) tune_kernel "${VPS_IPV6:-}" "${2:-auto}" ;;
     bandwidth) configure_bandwidth_profile "${2:-}" "${3:-}" ;;
-    high-conn|highconn|conn|1g-high-conn) tune_high_concurrency "${2:-}" ;;
+    high-conn|highconn|conn|1g-high-conn) tune_high_concurrency "${2:-}" "${3:-}" "${4:-}" ;;
     mss) setup_mss "${2:-clamp}" ;;
     swap) setup_swap ;;
     timezone) setup_timezone "${2:-auto}" ;;
