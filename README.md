@@ -197,8 +197,8 @@ vps-init uninstall --remove-swap
 - 自动将默认路由初始发包窗口提升为 `initcwnd 64 initrwnd 64` 并将主网卡发送队列深度提升为 `txqueuelen 5000`（开机持久化），首个 RTT 即可直发 90KB 数据并消除高突发大视频拉取时的驱动级丢包，大幅提升网页与社交媒体首屏加载速度。
 - 引入 `net.ipv4.tcp_adv_win_scale=2` 与 `net.ipv4.tcp_base_mss=1024`，消除跨洋长肥管道 `rwnd_limited` 窗口堵塞，并锁定 MTU 探测保底基准包，防止暴跌至 512 碎包引发恶性限速。
 - `net.ipv4.tcp_fastopen=2` 默认采用安全服务端模式：客户端连入享受 0-RTT 握手省 160ms 往返，出站连接外部目标网站走标准握手，彻底杜绝目标 CDN 丢包罚站。
-- 提供 `vps-init dns` 命令一键写入全球纯净 IPv4 DNS（`8.8.8.8` / `1.1.1.1`），彻底消灭海外 CDN 域名解析卡顿与图片空白。
-- `nf_conntrack` 默认使用 `auto`：检测到现有 NAT 或 conntrack/state 防火墙规则才加载并配置；纯 Xray/VLESS/Reality/SOCKS 代理不主动加载。需要 NAT、iptables 状态匹配或复杂转发时用 `vps-init conntrack on`。启用时 established 超时为 432000 秒（5 天）；如果仅代理且 `conntrack_count` 不断增长，应优先关闭它而不是继续扩大表。
+- 提供 `vps-init dns` 命令一键写入全球纯净高并发快速轮询 IPv4 DNS（`1.1.1.1` / `8.8.8.8` / `9.9.9.9`，配置 `timeout:1 attempts:2 rotate single-request-reopen`），彻底消灭海外 CDN 域名解析卡顿、首屏白屏转圈与图片加载失败。
+- `nf_conntrack` 默认使用 `auto`：检测到现有 NAT 或 conntrack/state 防火墙规则才加载并配置；纯 Xray/VLESS/Reality/SOCKS 代理不主动加载。需要 NAT、iptables 状态匹配或复杂转发时用 `vps-init conntrack on`。启用时 established 超时优化为 3600 秒（1 小时防爆表）；如果仅代理且 `conntrack_count` 不断增长，应优先关闭它而不是继续扩大表。
 - MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；默认只挂载到 `FORWARD`，避免影响本机发起或回复的 SSH/Xray 握手。MSS 通过开机后 30 秒触发的 timer 延迟应用，不参与网络就绪链，服务设置 20 秒启动超时。受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。
 - 快捷入口为 `/usr/local/bin/vps-init`，实际脚本保存在 `/usr/local/lib/vps-init-suite/setup.sh`。
 - 时区探测依次查询 `ipwho.is`、`ipinfo.io` 和 `ipapi.co`；这些服务会看到 VPS 的公网出口 IP，但脚本不会向其发送其他机器数据。

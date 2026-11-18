@@ -28,15 +28,16 @@ tune_kernel() { FLOW+=(kernel); }
 setup_timezone() { FLOW+=(timezone); }
 setup_swap() { FLOW+=(swap); }
 setup_mss() { FLOW+=(mss); }
+setup_dns() { FLOW+=(dns); }
 install_shortcut() { FLOW+=(shortcut); }
 show_status() { FLOW+=(status); }
 offer_xui_policy() { FLOW+=(xui-policy); }
 full_init keep off
-[[ "${FLOW[*]}" == "kernel timezone swap mss shortcut status xui-policy" ]] || die "Full initialization did not offer the 3X-UI policy menu at the end: ${FLOW[*]}"
+[[ "${FLOW[*]}" == "kernel timezone swap mss dns shortcut status xui-policy" ]] || die "Full initialization did not offer the 3X-UI policy menu at the end: ${FLOW[*]}"
 
 FLOW=()
 full_init keep off auto 200 160
-[[ "${FLOW[*]}" == "kernel timezone swap mss shortcut status xui-policy" ]] || die "Full initialization with an explicit bandwidth profile failed: ${FLOW[*]}"
+[[ "${FLOW[*]}" == "kernel timezone swap mss dns shortcut status xui-policy" ]] || die "Full initialization with an explicit bandwidth profile failed: ${FLOW[*]}"
 
 if bash "$TEST_ROOT/setup.sh" definitely-not-a-command >/dev/null 2>&1; then
   die "Unknown command should fail instead of silently running an initialization path."

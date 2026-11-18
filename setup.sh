@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.17.0"
+readonly SCRIPT_VERSION="1.18.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -30,12 +30,13 @@ readonly XUI_BACKUP_ROOT="/var/lib/vps-init-suite/backups/3xui"
 readonly XUI_POLICY_HELPER="${INSTALL_DIR}/xui-policy.py"
 readonly XUI_POLICY_HELPER_VERSION="1.9.0"
 ZONEINFO_DIR="/usr/share/zoneinfo"
-readonly ROOT_COMMANDS=(full kernel ipv6 conntrack bandwidth mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade dns high-conn conn)
+readonly ROOT_COMMANDS=(full kernel ipv6 conntrack bandwidth mss swap timezone install select menu uninstall remove uninstall-3xui xui-policy xray-policy update upgrade dns high-conn highconn conn 1g-high-conn)
 readonly CONFLICT_FILES=(
   99-custom-net.conf 99-cyberverse.conf 99-gost.conf 99-joeyblog.conf
   99-network-bbr.conf 99-optimal-proxy.conf 99-tcp-custom.conf
   99-tfo.conf 99-japan-vps.conf 99-us-vps.conf 99-vps-tuning.conf
-  99-1g-high-conn.conf 99-high-conn.conf
+  99-1g-high-conn.conf 99-high-conn.conf 99-lowmem-patch.conf
+  99-us-200m.conf 99-zzz-lowmem-override.conf 99-proxy-experience.conf
 )
 
 if [[ -t 1 ]]; then
@@ -52,24 +53,35 @@ XUI_POLICY_SERVICE_STOPPED=0
 
 log() { printf '%s\n' "${GREEN}$*${RESET}"; }
 warn() { printf '%s\n' "${YELLOW}$*${RESET}" >&2; }
+
+detect_tty() {
+  if ( : < /dev/tty ) 2>/dev/null; then
+    printf '%s\n' "/dev/tty"
+  elif [[ -t 0 ]]; then
+    printf '%s\n' "/dev/stdin"
+  fi
+}
+
 run_with_timeout() {
   local seconds=$1
   shift
   command -v timeout >/dev/null 2>&1 || return 127
   timeout --signal=TERM "${seconds}s" "$@"
 }
+
 run_timedatectl() {
   local seconds=${1:-5}
   shift || true
   run_with_timeout "$seconds" timedatectl "$@"
 }
+
 github_raw_url() {
   local path=$1
   printf 'https://raw.githubusercontent.com/%s/main/%s?cache=%s-%s\n' \
     "$REPO_SLUG" "$path" "$(date +%s)" "$RANDOM"
 }
+
 die() {
-  # Never leave 3X-UI stopped if an explicit error exits this script.
   if (( XUI_POLICY_SERVICE_STOPPED )); then
     systemctl start x-ui.service >/dev/null 2>&1 || true
     XUI_POLICY_SERVICE_STOPPED=0
@@ -145,7 +157,6 @@ apt_install() {
   done
   ((${#missing[@]} == 0)) && return 0
   if [[ $APT_UPDATED -eq 0 ]]; then
-    # Wait for unattended apt jobs instead of failing on the transient dpkg lock.
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 update -y
     APT_UPDATED=1
   fi
@@ -177,13 +188,16 @@ capture_original_sysctl_state() {
     net.ipv4.tcp_congestion_control net.ipv4.tcp_fastopen
     net.ipv4.tcp_adv_win_scale net.ipv4.tcp_base_mss
     net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default
-    net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.ip_forward
+    net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem
+    net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min
+    net.ipv4.ip_forward
     net.ipv6.conf.all.forwarding net.ipv6.conf.default.forwarding
     net.ipv6.conf.all.accept_ra net.ipv6.conf.default.accept_ra
     net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
     net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_window_scaling
     net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_mtu_probing
-    net.ipv4.tcp_notsent_lowat net.ipv4.tcp_retries2 net.ipv4.tcp_reordering net.ipv4.tcp_frto
+    net.ipv4.tcp_notsent_lowat net.ipv4.tcp_retries2 net.ipv4.tcp_syn_retries net.ipv4.tcp_synack_retries
+    net.ipv4.tcp_orphan_retries net.ipv4.tcp_reordering net.ipv4.tcp_frto
     net.ipv4.tcp_no_metrics_save
     net.ipv4.tcp_timestamps net.ipv4.tcp_tw_reuse
     net.core.somaxconn net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog
@@ -212,7 +226,6 @@ capture_original_managed_file() {
   original="${state_dir}/original-${filename}"
   mkdir -p "$state_dir"
   if [[ -e "$marker" ]]; then
-    # Older builds could snapshot the suite's own file as if it were user data.
     if [[ -e "$original" ]] && is_suite_managed_file "$original"; then
       rm -f -- "$marker" "$original"
       : >"${state_dir}/original-${filename}.absent"
@@ -352,8 +365,9 @@ show_status() {
     xui_env_limit=$(run_with_timeout 3 systemctl show x-ui.service --property=Environment --value 2>/dev/null || true)
   fi
   if [[ -n "$xui_env_limit" && "$xui_env_limit" == *"GOMEMLIMIT"* ]]; then
-    local gomem=$(grep -o 'GOMEMLIMIT=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2)
-    local gogc=$(grep -o 'GOGC=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2)
+    local gomem gogc
+    gomem=$(grep -o 'GOMEMLIMIT=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2)
+    gogc=$(grep -o 'GOGC=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2)
     printf 'x-ui Go 内存限制:        %s (GOGC: %s, madvdontneed=1)\n' "${gomem:-未设定}" "${gogc:-默认}"
   fi
   printf '%s\n' "------------------------------------------------------------"
@@ -405,11 +419,8 @@ diagnose_system() {
 
 has_working_ipv6() {
   command -v ip >/dev/null 2>&1 || return 1
-  # 1. 检查是否存在除 lo 和 link-local(fe80) 以外的 global IPv6 地址
   ip -6 addr show scope global 2>/dev/null | grep -qw "inet6" || return 1
-  # 2. 检查是否有默认 IPv6 路由
   ip -6 route show default 2>/dev/null | grep -qw "default" || return 1
-  # 3. 快速网络连通性探测（限时 1 秒），测试公网著名 IPv6 DNS
   if command -v ping6 >/dev/null 2>&1; then
     ping6 -c 1 -W 1 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
   elif command -v ping >/dev/null 2>&1; then
@@ -471,13 +482,18 @@ tune_kernel() {
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
   resolve_tuning_profile "$requested_bandwidth" "$requested_rtt" "$memory_mb" "$requested_buffer_max"
-  local profile rmem_max wmem_max rmem_default wmem_default file_max conntrack_max backlog netdev_backlog syn_backlog tw_buckets keepalive_time keepalive_intvl keepalive_probes conntrack_config ipv6_config tcp_mem_config
+  local profile rmem_max wmem_max tcp_rmem_def tcp_wmem_def udp_rmem_def udp_wmem_def notsent_lowat
+  local file_max conntrack_max backlog netdev_backlog syn_backlog tw_buckets keepalive_time keepalive_intvl keepalive_probes conntrack_config ipv6_config tcp_mem_config
   if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
-    profile="低内存高并发（${TUNING_BUFFER_MAX} 字节缓冲，16KB初始/锁256MB）"
+    profile="低内存高并发（${TUNING_BUFFER_MAX} 字节缓冲，16KB TCP初始/锁256MB）"
     rmem_max=$TUNING_BUFFER_MAX
     wmem_max=$TUNING_BUFFER_MAX
-    rmem_default=16384
-    wmem_default=16384
+    tcp_rmem_def=16384
+    tcp_wmem_def=16384
+    # 256KB 默认套接字缓冲专为 UDP/QUIC (HTTP/3 图片CDN/LINE/TG) 预留，TCP 仍由 tcp_rmem 独立限制为 16KB
+    udp_rmem_def=262144
+    udp_wmem_def=262144
+    notsent_lowat=32768
     file_max=$(proxy_nofile_limit "$memory_mb")
     conntrack_max=65536
     backlog=4096
@@ -492,8 +508,11 @@ tune_kernel() {
     profile="标准档（按带宽/RTT计算的 ${TUNING_BUFFER_MAX} 字节缓冲）"
     rmem_max=$TUNING_BUFFER_MAX
     wmem_max=$TUNING_BUFFER_MAX
-    rmem_default=65536
-    wmem_default=65536
+    tcp_rmem_def=65536
+    tcp_wmem_def=65536
+    udp_rmem_def=262144
+    udp_wmem_def=262144
+    notsent_lowat=65536
     file_max=$(proxy_nofile_limit "$memory_mb")
     conntrack_max=131072
     backlog=16384
@@ -535,14 +554,14 @@ net.ipv6.conf.default.forwarding = 0"
     if [[ -n "$conntrack_config" ]]; then
       conntrack_config+=$'\n'
     fi
-    conntrack_config+="net.netfilter.nf_conntrack_tcp_timeout_established = 432000"
+    conntrack_config+="net.netfilter.nf_conntrack_tcp_timeout_established = 3600"
   fi
   if [[ "$conntrack_mode" == "off" ]]; then
     log "Conntrack 配置已关闭，跳过相关 sysctl。"
   elif [[ -z "$conntrack_config" ]]; then
     warn "系统没有可用的 nf_conntrack 参数节点，跳过连接跟踪限制。"
   else
-    log "已按内核实际暴露的 conntrack 参数应用代理长连接保护。"
+    log "已按内核实际暴露的 conntrack 参数应用代理长连接保护（3600s 超时防表满）。"
   fi
 
   cat >"$SYSCTL_FILE" <<EOF
@@ -553,10 +572,12 @@ net.ipv4.tcp_fastopen = 2
 net.ipv4.tcp_adv_win_scale = 2
 net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${wmem_max}
-net.core.rmem_default = ${rmem_default}
-net.core.wmem_default = ${wmem_default}
-net.ipv4.tcp_rmem = 4096 ${rmem_default} ${rmem_max}
-net.ipv4.tcp_wmem = 4096 ${wmem_default} ${wmem_max}
+net.core.rmem_default = ${udp_rmem_def}
+net.core.wmem_default = ${udp_wmem_def}
+net.ipv4.tcp_rmem = 4096 ${tcp_rmem_def} ${rmem_max}
+net.ipv4.tcp_wmem = 4096 ${tcp_wmem_def} ${wmem_max}
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
 ${tcp_mem_config}
 net.ipv4.ip_forward = 1
 ${ipv6_config}
@@ -564,8 +585,11 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_notsent_lowat = ${notsent_lowat}
 net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_orphan_retries = 1
 net.ipv4.tcp_reordering = 6
 net.ipv4.tcp_frto = 2
 net.ipv4.tcp_no_metrics_save = 1
@@ -614,8 +638,6 @@ EOF
     verify_sysctl_value net.ipv6.conf.all.forwarding 0 || die "IPv6 转发关闭设置未能生效。"
     verify_sysctl_value net.ipv6.conf.all.disable_ipv6 1 || die "IPv6 禁用设置未能生效。"
   fi
-  # /etc/sysctl.d is loaded by the distro-provided systemd-sysctl unit. Do
-  # not add a second boot-time unit or place sysctl behind network-online.
   migrate_legacy_boot_services
   setup_initcwnd
   systemctl daemon-reload
@@ -628,9 +650,6 @@ EOF
 
 restore_system_sysctl_link() {
   local path=/etc/sysctl.d/99-sysctl.conf
-  # Older releases treated this distribution-managed entry point as a
-  # removable conflict. Restore it only when absent; never overwrite a user
-  # file or symlink.
   [[ -e "$path" || -L "$path" ]] && return 0
   [[ -f /etc/sysctl.conf ]] || return 0
   ln -s ../sysctl.conf "$path"
@@ -646,8 +665,10 @@ setup_initcwnd() {
     ip link set dev "$dev" txqueuelen 5000 2>/dev/null || true
     mkdir -p /etc/network/if-up.d
     local initcwnd_file="/etc/network/if-up.d/99-initcwnd"
+    capture_original_managed_file "$initcwnd_file"
     cat >"$initcwnd_file" <<'EOF'
 #!/bin/sh
+# Managed by vps-init-suite.
 dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
 gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
 if [ -n "$dev" ] && [ -n "$gw" ]; then
@@ -673,15 +694,15 @@ setup_dns() {
   fi
   cat >"$target" <<'EOF'
 # Managed by vps-init-suite.
-nameserver 8.8.8.8
+options timeout:1 attempts:2 rotate single-request-reopen
 nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
 EOF
-  log "已成功配置纯净公共 IPv4 DNS (8.8.8.8 / 1.1.1.1)，解决海外 CDN 解析缓慢与图片空白。"
+  log "已配置高并发快速轮询 DNS (1.1.1.1 / 8.8.8.8 / 9.9.9.9, timeout:1)，消除网页多图首屏白屏延迟。"
 }
 
 configure_systemd_shutdown_timeout() {
-  # Keep the scope limited to the suite-owned manager drop-in. Do not alter
-  # individual services or block network-online during boot.
   if [[ -e "$SYSTEMD_TIMEOUT_FILE" ]] && ! is_suite_managed_file "$SYSTEMD_TIMEOUT_FILE"; then
     warn "发现非本项目的 systemd 停机超时配置，保持原文件不变。"
     return 0
@@ -728,7 +749,6 @@ EOF
 
 is_pve_or_qemu_vm() {
   if command -v systemd-detect-virt >/dev/null 2>&1; then
-    # In container environments, GRUB is not applicable.
     if systemd-detect-virt --container >/dev/null 2>&1; then
       return 1
     fi
@@ -755,7 +775,6 @@ configure_pve_reboot_quirk() {
   is_pve_or_qemu_vm || return 0
   command -v update-grub >/dev/null 2>&1 || return 0
 
-  # If reboot= is already set in /proc/cmdline or /etc/default/grub, do not interfere.
   if grep -qE '(^|[[:space:]])reboot=' /proc/cmdline 2>/dev/null; then
     return 0
   fi
@@ -838,8 +857,6 @@ migrate_legacy_boot_services() {
     systemctl enable --now vps-init-suite-mss.timer >/dev/null 2>&1 || true
     log "已迁移 MSS 到延迟启动计时器，不再占用系统开机目标。"
   fi
-  # Remove only legacy suite-owned OUTPUT attachments. This lets an upgrade
-  # take effect immediately even when setup_mss is not run afterwards.
   local binary
   for binary in iptables ip6tables; do
     command -v "$binary" >/dev/null 2>&1 || continue
@@ -885,8 +902,6 @@ buffer_profile() {
 
 memory_buffer_cap_mib() {
   local memory_mb=$1
-  # Keep a 1 GiB proxy node capable of filling a 200 Mbps high-RTT path,
-  # while still bounding the per-socket autotuning ceiling for OOM safety.
   local cap_mib=$(((memory_mb + 127) / 128))
   (( cap_mib < 4 )) && cap_mib=4
   (( cap_mib > 64 )) && cap_mib=64
@@ -903,13 +918,9 @@ calculate_buffer_max() {
   local bandwidth_mbps=$1 rtt_ms=$2 memory_mb=$3
   local bdp_bytes target_bytes target_mib memory_cap_mib rounded_mib
   bdp_bytes=$((bandwidth_mbps * 125 * rtt_ms))
-  # Reserve 1.5x BDP for ACK compression and moderate loss without making
-  # every connection start with a large allocation.
   target_bytes=$((bdp_bytes * 3 / 2))
   target_mib=$(( (target_bytes + 1048575) / 1048576 ))
   (( target_mib < 1 )) && target_mib=1
-  # Power-of-two ceilings avoid awkward values such as 6 MiB and give
-  # autotuning enough headroom for real-world RTT/jitter variation.
   rounded_mib=1
   while (( rounded_mib < target_mib && rounded_mib < 64 )); do
     rounded_mib=$((rounded_mib * 2))
@@ -1154,13 +1165,9 @@ tune_high_concurrency() {
       ;;
   esac
 
-  # 检测可用交互终端（/dev/tty 优先，确保 curl 管道下也能接收键盘输入）
-  local tty_in=""
-  if [[ -e /dev/tty && -r /dev/tty && -c /dev/tty ]]; then
-    tty_in="/dev/tty"
-  elif [[ -t 0 ]]; then
-    tty_in="/dev/stdin"
-  fi
+  # 安全检测可用控制终端（防止后台/无终端 SSH 下读取 /dev/tty 触发 set -e 退出）
+  local tty_in
+  tty_in=$(detect_tty)
 
   # 若完全未传参数且有交互终端，弹出场景菜单
   if [[ -z "$requested_mode" && -n "$tty_in" ]]; then
@@ -1185,7 +1192,7 @@ tune_high_concurrency() {
 
   # 若未传具体带宽，且在 custom 模式或传入地区未带带宽参数时，允许终端交互输入
   if [[ -n "$tty_in" && -z "$custom_bw" ]]; then
-    if [[ "$scenario" == "custom" ]] || [[ -n "$requested_mode" && -z "$2" ]]; then
+    if [[ "$scenario" == "custom" ]] || [[ -n "$requested_mode" ]]; then
       printf '\n%s\n' "--------------------------------------------------"
       printf ' 预设场景: %s (默认参考: %s Mbps / %s ms)\n' "$scenario" "$default_bw" "$default_rtt"
       printf '%s\n' "--------------------------------------------------"
@@ -1223,15 +1230,16 @@ tune_high_concurrency() {
     xui_mem_limit="180MiB"
     xui_gogc=50
   elif (( memory_mb <= 1500 )); then
-    # 1GB 小内存机器
-    if (( tcp_buf_max > 4194304 && bandwidth <= 300 )); then
-      tcp_buf_max=4194304  # 200M/300M 带宽下 4MB 既能跑满又防 bufferbloat
-    elif (( tcp_buf_max > 8388608 )); then
-      tcp_buf_max=8388608  # 1GB 内存最高保护上限 8MB
+    # 1GB 小内存机器高并发安全封顶：跨洋高延迟最大 4MB，近距低延迟最大 2MB
+    if (( rtt >= 100 && tcp_buf_max > 4194304 )); then
+      tcp_buf_max=4194304
+    elif (( rtt < 100 && tcp_buf_max > 2097152 )); then
+      tcp_buf_max=2097152
     fi
     xui_mem_limit="350MiB"
     xui_gogc=75
   elif (( memory_mb <= 3000 )); then
+    (( tcp_buf_max > 8388608 )) && tcp_buf_max=8388608
     xui_mem_limit="800MiB"
     xui_gogc=100
   else
@@ -1262,22 +1270,24 @@ EOF
   fi
   tune_kernel "$current_ipv6" auto "$TUNING_BANDWIDTH" "$TUNING_RTT" "$TUNING_BUFFER_MAX"
 
+  # 同步开启 MSS 自动钳制与快速轮询 DNS，防止网页多图与 Telegram/LINE 媒体加载卡 99%
+  setup_mss clamp
+  setup_dns
+
   configure_journald_limits
-
   configure_xui_service_limits 65535 "$xui_mem_limit" "$xui_gogc" "now"
-
   install_shortcut
 
   log "============================================================"
   log "自适应高并发调优已成功生效！(业务场景: ${scenario_name})"
   log "• 物理内存: ${memory_mb} MB | 带宽/RTT 档位: ${TUNING_BANDWIDTH} Mbps / ${TUNING_RTT} ms"
   log "• TCP 缓冲上限: $((TUNING_BUFFER_MAX / 1048576)) MB (${TUNING_BUFFER_MAX} 字节)"
-  log "• 初始单连接读写缓冲: $(sysctl -n net.core.rmem_default 2>/dev/null || echo 16384) 字节"
+  log "• UDP/QUIC 默认缓冲: $(sysctl -n net.core.rmem_default 2>/dev/null || echo 262144) 字节（HTTP/3 图片/IM 加速）"
   log "• 内核 TCP 协议栈全局硬上限: $(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo '16384 32768 65536') 页"
-  log "• 临时端口范围: 1024 65535 | 监听与SYN队列: 4096 / 4096"
+  log "• 临时端口范围: 1024 65535 | 监听与SYN队列: $(sysctl -n net.core.somaxconn 2>/dev/null || echo 4096) / $(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo 4096)"
   log "• x-ui Go 内存限制: ${xui_mem_limit} (GOGC: ${xui_gogc}, madvdontneed=1)"
   log "• x-ui 文件句柄与进程限制: 65535"
-  log "• 日志守护: journald 最大占用锁定 30MB"
+  log "• 日志与解析: journald 上限 30MB + 1秒快速轮询 DNS + MSS 自动钳制"
   log "============================================================"
   show_status
 }
@@ -1490,14 +1500,14 @@ choose_timezone_interactively() {
   local choice custom_timezone
   cat >&2 <<'EOF'
 自动时区探测失败，请选择：
-  1. 保留当前时区（推荐）
-  2. UTC（协调世界时）
-  3. Asia/Tokyo（东京）
-  4. America/Los_Angeles（洛杉矶）
-  5. America/New_York（纽约）
-  6. Europe/London（伦敦）
-  7. Asia/Singapore（新加坡）
-  8. 输入其他 IANA 时区
+1. 保留当前时区（推荐）
+2. UTC（协调世界时）
+3. Asia/Tokyo（东京）
+4. America/Los_Angeles（洛杉矶）
+5. America/New_York（纽约）
+6. Europe/London（伦敦）
+7. Asia/Singapore（新加坡）
+8. 输入其他 IANA 时区
 EOF
   read -r -p "请选择 [1-8]（直接回车保留当前时区）: " choice
   case "$choice" in
@@ -1518,8 +1528,6 @@ EOF
 }
 
 enable_network_time() {
-  # Prefer the distribution's native timesyncd. It adds no package or boot
-  # dependency. Fall back to chrony only when timesyncd is unavailable.
   if run_timedatectl 5 set-ntp true 2>/dev/null ||
     run_with_timeout 10 systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1; then
     return 0
@@ -1628,8 +1636,8 @@ setup_swap() {
   local swap_gib=2
   local available_bytes
   available_bytes=$(df -PB1 / | awk 'NR == 2 {print $4}')
-  local required_2g=$(( 3 * 1024 * 1024 * 1024 ))  # 2 GiB swap + 1 GiB headroom
-  local required_1g=$(( 2 * 1024 * 1024 * 1024 ))  # 1 GiB swap + 1 GiB headroom
+  local required_2g=$(( 3 * 1024 * 1024 * 1024 ))
+  local required_1g=$(( 2 * 1024 * 1024 * 1024 ))
 
   if (( available_bytes >= required_2g )); then
     swap_gib=2
@@ -1688,8 +1696,6 @@ ensure_managed_swap_fstab_entry() {
     return 0
   fi
 
-  # Replace only stale entries for this exact suite-owned swap path, including
-  # the legacy entry without nofail; leave every other fstab row untouched.
   sed -i '\|^/swapfile-vps-init-suite[[:space:]].*|d' "$fstab"
   ensure_fstab_trailing_newline "$fstab"
   printf '%s\n' "$entry" >>"$fstab"
@@ -1699,8 +1705,6 @@ ensure_managed_swap_fstab_entry() {
 remove_managed_swap_fstab_entry() {
   local fstab=${1:-/etc/fstab}
   [[ -f "$fstab" && ! -L "$fstab" ]] || return 0
-  # Match the suite-owned path and swap filesystem type, regardless of whether
-  # an older entry used `sw` or the current `sw,nofail` options.
   sed -i '\|^/swapfile-vps-init-suite[[:space:]].*[[:space:]]swap[[:space:]]|d' "$fstab"
 }
 
@@ -1755,16 +1759,12 @@ apply_family() {
     fi
   fi
 
-  # Remove OUTPUT attachments created by older releases.  Only rules carrying
-  # the suite comment are touched; unrelated firewall rules remain unchanged.
   while "$binary" -w 5 -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN \
     -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; do
     "$binary" -w 5 -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN \
       -m comment --comment vps-init-suite -j VPS_INIT_MSS || break
   done
 
-  # Limit MSS rewriting to forwarded traffic.  Locally generated SYN/SYN-ACK
-  # packets (including SSH and Xray) must not be rewritten by this policy.
   for chain in FORWARD; do
     if ! "$binary" -w 5 -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; then
       if ! "$binary" -w 5 -t mangle -I "$chain" 1 -p tcp --tcp-flags SYN,RST SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS; then
@@ -1781,8 +1781,6 @@ fi
 if ! apply_family ip6tables; then
   printf '%s\n' 'vps-init-suite: IPv6 MSS policy could not be applied; continuing.' >&2
 fi
-# A restricted VPS may not grant CAP_NET_ADMIN. Keep the systemd unit healthy
-# and report the skipped family instead of making the whole initialization fail.
 exit 0
 EOF
   chmod 0755 "$helper_path"
@@ -1790,7 +1788,6 @@ EOF
 
 mss_family_status() {
   local binary=$1 mode=$2 value=$3 value6=$4 rule_value
-  local chain
   command -v "$binary" >/dev/null 2>&1 || { printf '%s\n' "未安装"; return 0; }
   "$binary" -w 2 -t mangle -L >/dev/null 2>&1 || { printf '%s\n' "不支持"; return 0; }
   "$binary" -w 2 -t mangle -S VPS_INIT_MSS >/dev/null 2>&1 || { printf '%s\n' "未生效"; return 0; }
@@ -1944,7 +1941,6 @@ ensure_xui_policy_helper() {
     grep -qF "HELPER_VERSION = \"${XUI_POLICY_HELPER_VERSION}\"" "$XUI_POLICY_HELPER"; then
     return 0
   fi
-  # Upgrade helpers left by older suite versions on first policy access.
   install_xui_policy_helper >&2
 }
 
@@ -2120,14 +2116,14 @@ restore_conflict_backups() {
   if (( restored > 0 )); then
     log "Restored ${restored} backed-up third-party sysctl fragment(s). Review them for conflicts before reapplying tuning."
   fi
-
 }
 
 restore_original_managed_files() {
   local path filename marker original backup
   for path in "$SYSCTL_FILE" "$SWAP_SYSCTL_FILE" "$SYSCTL_UNIT" "$MSS_UNIT" "$MSS_TIMER" "$SYSTEMD_TIMEOUT_FILE" \
-    "$GRUB_QUIRK_FILE" \
-    /etc/modules-load.d/vps-init-suite.conf "$MSS_CONFIG" "$MSS_HELPER" \
+    "$GRUB_QUIRK_FILE" "$JOURNALD_LIMITS_FILE" \
+    /etc/modules-load.d/vps-init-suite.conf /etc/network/if-up.d/99-initcwnd /etc/resolv.conf \
+    "$MSS_CONFIG" "$MSS_HELPER" \
     "$TUNING_CONFIG" "$XUI_POLICY_HELPER" "$XUI_LIMITS_FILE" "$INSTALLED_SCRIPT" "$LAUNCHER_PATH"; do
     filename=$(basename "$path")
     marker="${STATE_DIR}/original-${filename}.present"
@@ -2187,7 +2183,6 @@ remove_managed_mss_rules() {
   for binary in iptables ip6tables; do
     command -v "$binary" >/dev/null || continue
     "$binary" -w 5 -t mangle -S >/dev/null 2>&1 || continue
-    # Remove both current and legacy suite attachments during uninstall.
     for chain in OUTPUT FORWARD; do
       while "$binary" -w 5 -t mangle -C "$chain" -p tcp --tcp-flags "SYN,RST" SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS 2>/dev/null; do
         "$binary" -w 5 -t mangle -D "$chain" -p tcp --tcp-flags "SYN,RST" SYN -m comment --comment vps-init-suite -j VPS_INIT_MSS || break
@@ -2364,6 +2359,7 @@ full_init() {
   setup_timezone "$timezone"
   setup_swap
   setup_mss clamp
+  setup_dns
   install_shortcut
   log "VPS 初始化完成。"
   show_status
@@ -2429,15 +2425,15 @@ Commands:
   bandwidth [Mbps|auto] [RTT_MS|auto]
                            Save bandwidth/RTT buffer profile without changing MSS
   high-conn [preset|custom] [bandwidth] [rtt]
-                           Apply high-concurrency profile (us/intl/cn/eu or custom Mbps & RTT)
+                           Apply high-concurrency profile (us/intl/cn/hk/eu or custom Mbps & RTT)
   mss [clamp|dual-fixed|1200..1460] Persist MSS policy (default: clamp)
-  swap                     Create managed 2/4 GiB swap if none exists
+  swap                     Create managed 1/2 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
   install                  Install the 'vps-init' shortcut command
   select                   Choose an action interactively
   status                   Show current settings
   diagnose                 Show CPU, retransmission, softirq, and conntrack counters
-  dns                      Configure clean public IPv4 DNS (8.8.8.8 / 1.1.1.1)
+  dns                      Configure fast rotating public IPv4 DNS (1.1.1.1 / 8.8.8.8 / 9.9.9.9)
   uninstall [--remove-swap] Remove suite (preserves swap by default)
   remove                   Alias for uninstall
   uninstall-3xui [--yes]   Permanently remove 3X-UI and known data paths
@@ -2450,37 +2446,42 @@ EOF
 }
 
 pause_menu() {
-  if [[ -t 0 ]]; then
-    read -r -p "Press Enter to return to the menu..." _ || true
+  local tty_in
+  tty_in=$(detect_tty)
+  if [[ -n "$tty_in" ]]; then
+    read -r -p "Press Enter to return to the menu..." _ < "$tty_in" || true
   fi
 }
 
 menu() {
+  local tty_in choice
+  tty_in=$(detect_tty)
+  [[ -n "$tty_in" ]] || die "交互式菜单需要可用的终端设备。"
   while true; do
     [[ -t 1 ]] && clear
     printf '%s\n' "VPS 初始化与内核调优工具 v${SCRIPT_VERSION}"
     show_status
     cat <<'EOF'
-  1. 完整初始化（推荐）
-  2. 内核与网络调优
-  3. MSS 自动钳制（clamp-to-PMTU）
-  4. 固定 MSS 1380
-  5. 创建 SWAP
-  6. 自动探测时区并启用网络校时
-  7. 卸载 3X-UI
-  8. 升级/下载最新版脚本
-  9. 安装/修复快捷命令（vps-init）
- 10. 开启 IPv6 转发
- 11. 关闭 IPv6 转发
- 12. 卸载 vps-init-suite（保留 SWAP）
-  13. 3X-UI / Xray 连接策略
- 14. 手动设置/修改带宽与 RTT
- 15. 网络/CPU 诊断
- 16. 优化纯净 DNS（8.8.8.8 / 1.1.1.1）
- 17. 自适应高并发专属调优 (Swap + TCP + Go/x-ui 防爆 + 日志)
- 18. 退出（也可输入 0）
+1. 完整初始化（推荐）
+2. 内核与网络调优
+3. MSS 自动钳制（clamp-to-PMTU）
+4. 固定 MSS 1380
+5. 创建 SWAP
+6. 自动探测时区并启用网络校时
+7. 卸载 3X-UI
+8. 升级/下载最新版脚本
+9. 安装/修复快捷命令（vps-init）
+10. 开启 IPv6 转发
+11. 关闭 IPv6 转发
+12. 卸载 vps-init-suite（保留 SWAP）
+13. 3X-UI / Xray 连接策略
+14. 手动设置/修改带宽与 RTT
+15. 网络/CPU 诊断
+16. 优化快速轮询 DNS（1.1.1.1 / 8.8.8.8 / 9.9.9.9）
+17. 自适应高并发专属调优 (Swap + TCP/UDP + Go/x-ui 防爆 + DNS + MSS)
+18. 退出（也可输入 0）
 EOF
-    read -r -p "请选择 [0-18]: " choice
+    read -r -p "请选择 [0-18]: " choice < "$tty_in" || return 0
     case "$choice" in
       1) full_init; pause_menu ;;
       2) tune_kernel; pause_menu ;;
@@ -2506,7 +2507,9 @@ EOF
 }
 
 select_menu() {
-  local choice
+  local tty_in choice
+  tty_in=$(detect_tty)
+  [[ -n "$tty_in" ]] || die "交互式菜单需要可用的终端设备。"
   while true; do
     printf '\nVPS Init - 请选择操作\n'
     printf '%s\n' \
@@ -2526,10 +2529,10 @@ select_menu() {
       " 14. 3X-UI / Xray 连接策略" \
       " 15. 手动设置/修改带宽与 RTT" \
       " 16. 网络/CPU 诊断" \
-      " 17. 优化纯净 DNS（8.8.8.8 / 1.1.1.1）" \
-      " 18. 自适应高并发专属调优 (Swap + TCP + Go/x-ui 防爆 + 日志)" \
+      " 17. 优化快速轮询 DNS（1.1.1.1 / 8.8.8.8 / 9.9.9.9）" \
+      " 18. 自适应高并发专属调优 (Swap + TCP/UDP + Go/x-ui 防爆 + DNS + MSS)" \
       "  0. 退出"
-    read -r -p "请选择 [0-18]: " choice
+    read -r -p "请选择 [0-18]: " choice < "$tty_in" || return 0
     case "$choice" in
       1) full_init ;;
       2) tune_kernel ;;
