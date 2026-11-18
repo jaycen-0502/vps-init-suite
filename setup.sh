@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.18.0"
+readonly SCRIPT_VERSION="1.18.1"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -452,13 +452,7 @@ tune_kernel() {
   apt_install kmod procps
 
   if [[ -z "$requested_ipv6" ]]; then
-    if has_working_ipv6; then
-      requested_ipv6=on
-      log "检测到本机具备正常可达的公网 IPv6，保留 IPv6 支持。"
-    else
-      requested_ipv6=off
-      log "检测到本机 IPv6 无可用公网出口或网络不可达，自动启用「防假死黑洞防护」（禁用 IPv6）。"
-    fi
+    requested_ipv6=${VPS_IPV6:-off}
   fi
   ipv6_mode=$(resolve_ipv6_mode "$requested_ipv6")
 
@@ -541,6 +535,7 @@ net.ipv6.conf.default.accept_ra = 2"
   else
     ipv6_config="net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
 net.ipv6.conf.all.forwarding = 0
 net.ipv6.conf.default.forwarding = 0"
     warn "IPv6 已彻底禁用（默认），杜绝假死黑洞并锁定 IPv4 专线。"
@@ -1262,12 +1257,7 @@ RTT_MS=${TUNING_RTT}
 BUFFER_MAX=${TUNING_BUFFER_MAX}
 EOF
 
-  local current_ipv6="off"
-  if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
-    if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 1)" == "0" ]]; then
-      current_ipv6="on"
-    fi
-  fi
+  local current_ipv6=${VPS_IPV6:-off}
   tune_kernel "$current_ipv6" auto "$TUNING_BANDWIDTH" "$TUNING_RTT" "$TUNING_BUFFER_MAX"
 
   # 同步开启 MSS 自动钳制与快速轮询 DNS，防止网页多图与 Telegram/LINE 媒体加载卡 99%
@@ -2349,7 +2339,7 @@ install_shortcut() {
 
 full_init() {
   local timezone=${1:-${VPS_TIMEZONE:-auto}}
-  local ipv6_mode=${2:-${VPS_IPV6:-}}
+  local ipv6_mode=${2:-${VPS_IPV6:-off}}
   local conntrack_mode=${3:-${VPS_CONNTRACK:-auto}}
   local bandwidth=${4:-${VPS_BANDWIDTH_MBPS:-}}
   local rtt=${5:-${VPS_RTT_MS:-}}
@@ -2563,10 +2553,10 @@ main() {
     reexec_as_root "$@"
   fi
   case "${1:-menu}" in
-    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" "${3:-${VPS_IPV6:-}}" "${4:-${VPS_CONNTRACK:-auto}}" "${5:-${VPS_BANDWIDTH_MBPS:-}}" "${6:-${VPS_RTT_MS:-}}" ;;
-    kernel) tune_kernel "${2:-${VPS_IPV6:-}}" "${3:-${VPS_CONNTRACK:-auto}}" "${4:-${VPS_BANDWIDTH_MBPS:-}}" "${5:-${VPS_RTT_MS:-}}" ;;
-    ipv6) tune_kernel "${2:-}" ;;
-    conntrack) tune_kernel "${VPS_IPV6:-}" "${2:-auto}" ;;
+    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" "${3:-${VPS_IPV6:-off}}" "${4:-${VPS_CONNTRACK:-auto}}" "${5:-${VPS_BANDWIDTH_MBPS:-}}" "${6:-${VPS_RTT_MS:-}}" ;;
+    kernel) tune_kernel "${2:-${VPS_IPV6:-off}}" "${3:-${VPS_CONNTRACK:-auto}}" "${4:-${VPS_BANDWIDTH_MBPS:-}}" "${5:-${VPS_RTT_MS:-}}" ;;
+    ipv6) tune_kernel "${2:-off}" ;;
+    conntrack) tune_kernel "${VPS_IPV6:-off}" "${2:-auto}" ;;
     bandwidth) configure_bandwidth_profile "${2:-}" "${3:-}" ;;
     high-conn|highconn|conn|1g-high-conn) tune_high_concurrency "${2:-}" "${3:-}" "${4:-}" ;;
     mss) setup_mss "${2:-clamp}" ;;
