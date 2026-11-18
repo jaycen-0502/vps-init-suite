@@ -1252,6 +1252,8 @@ EOF
 
   configure_xui_service_limits 65535 "$xui_mem_limit" "$xui_gogc" "now"
 
+  install_shortcut
+
   log "============================================================"
   log "自适应高并发调优已成功生效！(业务场景: ${scenario_name})"
   log "• 物理内存: ${memory_mb} MB | 带宽/RTT 档位: ${TUNING_BANDWIDTH} Mbps / ${TUNING_RTT} ms"
