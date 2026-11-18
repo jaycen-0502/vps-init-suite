@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.15.0"
+readonly SCRIPT_VERSION="1.16.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -1052,16 +1052,37 @@ configure_bandwidth_profile() {
   local memory_mb bandwidth=${1:-} rtt=${2:-} current_bandwidth current_rtt
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
   if [[ -z "$bandwidth" && -t 0 ]]; then
-    current_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
-    prompt_tuning_value bandwidth "VPS 标称带宽" \
-      "请输入 VPS 标称带宽 Mbps（输入 auto 使用保守 100 Mbps）[${current_bandwidth:-auto}]: " \
-      "${current_bandwidth:-auto}" 1 100000 1 100 Mbps
-  fi
-  if [[ -z "$rtt" && -t 0 ]]; then
-    current_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
-    prompt_tuning_value rtt "代理 RTT" \
-      "请输入代理用户到 VPS 的典型 RTT 毫秒（跨洋可填 160）[${current_rtt:-160}]: " \
-      "${current_rtt:-160}" 1 2000 1 160 ms
+    printf '\n%s\n' "请选择 VPS 业务场景与线路预设："
+    printf '%s\n' \
+      "  1. 日本/亚太国际互联 (1000 Mbps / 30 ms) - 纯海外节点中转/国际落地，跑满千兆极速" \
+      "  2. 亚太优化直连国内 (200 Mbps / 40 ms)  - 面向国内直连，兼顾 3000 高并发防爆" \
+      "  3. 美西跨洋大带宽   (1000 Mbps / 160 ms) - 美西 1G 跨太平洋长距离线路" \
+      "  4. 欧洲/远距离跨洋   (500 Mbps / 200 ms)  - 欧洲高延迟长途互联" \
+      "  5. 自定义带宽与 RTT (手动输入数值)"
+    local choice
+    read -r -p "请选择 [1-5，直接回车使用当前/默认]: " choice
+    case "$choice" in
+      1) bandwidth=1000; rtt=30 ;;
+      2) bandwidth=200; rtt=40 ;;
+      3) bandwidth=1000; rtt=160 ;;
+      4) bandwidth=500; rtt=200 ;;
+      5)
+        current_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
+        prompt_tuning_value bandwidth "VPS 标称带宽" \
+          "请输入 VPS 标称带宽 Mbps（输入 auto 使用保守 100 Mbps）[${current_bandwidth:-auto}]: " \
+          "${current_bandwidth:-auto}" 1 100000 1 100 Mbps
+        current_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
+        prompt_tuning_value rtt "代理 RTT" \
+          "请输入代理用户到 VPS 的典型 RTT 毫秒（跨洋可填 160）[${current_rtt:-160}]: " \
+          "${current_rtt:-160}" 1 2000 1 160 ms
+        ;;
+      *)
+        current_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
+        current_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
+        bandwidth=${current_bandwidth:-200}
+        rtt=${current_rtt:-40}
+        ;;
+    esac
   fi
   tune_kernel "${VPS_IPV6:-}" "${VPS_CONNTRACK:-auto}" "$bandwidth" "$rtt"
   log "已保存带宽档位：${TUNING_BANDWIDTH} Mbps，RTT：${TUNING_RTT} ms，TCP 缓冲上限：${TUNING_BUFFER_MAX} 字节。"
@@ -1070,37 +1091,141 @@ configure_bandwidth_profile() {
 tune_high_concurrency() {
   require_root
   require_supported_os
-  log "正在启动高并发自适应调优引擎 (Swap + TCP + Go/x-ui + 日志)..."
+  local requested_mode=${1:-}
+  local memory_mb
+  memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
 
   # 1. 自动挂载 Swap 守护防 OOM
   setup_swap
 
-  # 2. 读取物理内存并自适应分档 (四档自适应)
-  local memory_mb
-  memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+  # 2. 读取或交互选择业务场景预设
+  local scenario="cn"
+  local mode_lower
+  mode_lower=$(printf '%s' "$requested_mode" | tr '[:upper:]' '[:lower:]')
+  case "$mode_lower" in
+    intl|global|jp-intl|japan-intl|international|1|jp)
+      scenario="intl"
+      ;;
+    cn|direct|china|asia|2)
+      scenario="cn"
+      ;;
+    us|us-west|america|3)
+      scenario="us"
+      ;;
+    eu|europe|4)
+      scenario="eu"
+      ;;
+    "")
+      if [[ -t 0 ]]; then
+        printf '\n%s\n' "请选择高并发业务场景与线路预设："
+        printf '%s\n' \
+          "  1. 日本/亚太国际互联 (1000 Mbps / 30 ms) - 纯海外节点中转/国际落地，跑满千兆极速" \
+          "  2. 亚太优化直连国内 (200 Mbps / 40 ms)  - 面向国内直连，兼顾 3000 高并发防爆 [默认]" \
+          "  3. 美西跨洋大带宽   (1000 Mbps / 160 ms) - 美西 1G 跨太平洋长距离线路" \
+          "  4. 欧洲/远距离跨洋   (500 Mbps / 200 ms)  - 欧洲高延迟长途互联" \
+          "  5. 完全自适应物理内存 (默认安全档)"
+        local choice
+        read -r -p "请选择 [1-5，直接回车默认 2]: " choice
+        case "${choice:-2}" in
+          1) scenario="intl" ;;
+          2) scenario="cn" ;;
+          3) scenario="us" ;;
+          4) scenario="eu" ;;
+          *) scenario="cn" ;;
+        esac
+      else
+        scenario="cn"
+      fi
+      ;;
+    *)
+      warn "未知预设 '${requested_mode}'，回退至亚太直连自适应档。"
+      scenario="cn"
+      ;;
+  esac
 
-  local bandwidth=200 rtt=40 tcp_buf_max xui_mem_limit xui_gogc
-  if (( memory_mb <= 600 )); then
-    bandwidth=100
-    tcp_buf_max=1048576    # 1MB
-    xui_mem_limit="180MiB"
-    xui_gogc=50
-  elif (( memory_mb <= 1500 )); then
-    bandwidth=200
-    tcp_buf_max=2097152    # 2MB
-    xui_mem_limit="350MiB"
-    xui_gogc=75
-  elif (( memory_mb <= 3000 )); then
-    bandwidth=500
-    tcp_buf_max=8388608    # 8MB
-    xui_mem_limit="800MiB"
-    xui_gogc=100
-  else
-    bandwidth=1000
-    tcp_buf_max=8388608    # 8MB
-    xui_mem_limit="1600MiB"
-    xui_gogc=100
-  fi
+  local bandwidth=200 rtt=40 tcp_buf_max xui_mem_limit xui_gogc scenario_name
+  case "$scenario" in
+    intl)
+      scenario_name="日本/亚太国际互联 (1000 Mbps / 30 ms - 纯海外中转/落地跑满千兆)"
+      bandwidth=1000
+      rtt=30
+      if (( memory_mb <= 600 )); then
+        tcp_buf_max=2097152    # 2MB
+        xui_mem_limit="180MiB"
+        xui_gogc=50
+      elif (( memory_mb <= 1500 )); then
+        tcp_buf_max=8388608    # 8MB (1GB 物理内存上限，30ms 下可跑满 2.1 Gbps 单流)
+        xui_mem_limit="350MiB"
+        xui_gogc=75
+      else
+        tcp_buf_max=16777216   # 16MB (大内存直接放开 16MB)
+        xui_mem_limit="800MiB"
+        xui_gogc=100
+      fi
+      ;;
+    us)
+      scenario_name="美西跨洋大带宽 (1000 Mbps / 160 ms - 跨太平洋大口子)"
+      bandwidth=1000
+      rtt=160
+      if (( memory_mb <= 600 )); then
+        tcp_buf_max=2097152    # 2MB
+        xui_mem_limit="180MiB"
+        xui_gogc=50
+      elif (( memory_mb <= 1500 )); then
+        tcp_buf_max=8388608    # 8MB (1GB 受保护上限，160ms 下可跑 400M+ 单流，多流跑满 1G)
+        xui_mem_limit="350MiB"
+        xui_gogc=75
+      else
+        tcp_buf_max=16777216   # 16MB
+        xui_mem_limit="1600MiB"
+        xui_gogc=100
+      fi
+      ;;
+    eu)
+      scenario_name="欧洲/远距离跨洋 (500 Mbps / 200 ms - 欧洲高延迟长途)"
+      bandwidth=500
+      rtt=200
+      if (( memory_mb <= 600 )); then
+        tcp_buf_max=2097152
+        xui_mem_limit="180MiB"
+        xui_gogc=50
+      elif (( memory_mb <= 1500 )); then
+        tcp_buf_max=8388608
+        xui_mem_limit="350MiB"
+        xui_gogc=75
+      else
+        tcp_buf_max=16777216
+        xui_mem_limit="1600MiB"
+        xui_gogc=100
+      fi
+      ;;
+    cn|*)
+      scenario_name="亚太优化直连国内 (200 Mbps / 40 ms - 兼顾 3000 高并发防爆)"
+      bandwidth=200
+      rtt=40
+      if (( memory_mb <= 600 )); then
+        bandwidth=100
+        tcp_buf_max=1048576    # 1MB
+        xui_mem_limit="180MiB"
+        xui_gogc=50
+      elif (( memory_mb <= 1500 )); then
+        bandwidth=200
+        tcp_buf_max=2097152    # 2MB
+        xui_mem_limit="350MiB"
+        xui_gogc=75
+      elif (( memory_mb <= 3000 )); then
+        bandwidth=500
+        tcp_buf_max=8388608    # 8MB
+        xui_mem_limit="800MiB"
+        xui_gogc=100
+      else
+        bandwidth=1000
+        tcp_buf_max=8388608    # 8MB
+        xui_mem_limit="1600MiB"
+        xui_gogc=100
+      fi
+      ;;
+  esac
 
   TUNING_BANDWIDTH=$bandwidth
   TUNING_RTT=$rtt
@@ -1128,7 +1253,8 @@ EOF
   configure_xui_service_limits 65535 "$xui_mem_limit" "$xui_gogc" "now"
 
   log "============================================================"
-  log "自适应高并发防爆调优已成功生效！(物理内存: ${memory_mb} MB)"
+  log "自适应高并发调优已成功生效！(业务场景: ${scenario_name})"
+  log "• 物理内存: ${memory_mb} MB | 带宽/RTT 档位: ${TUNING_BANDWIDTH} Mbps / ${TUNING_RTT} ms"
   log "• TCP 缓冲上限: $((TUNING_BUFFER_MAX / 1048576)) MB (${TUNING_BUFFER_MAX} 字节)"
   log "• 初始单连接读写缓冲: $(sysctl -n net.core.rmem_default 2>/dev/null || echo 16384) 字节"
   log "• 内核 TCP 协议栈全局硬上限: $(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo '16384 32768 65536') 页"
@@ -2286,7 +2412,8 @@ Commands:
   conntrack [auto|on|off]  Select conntrack for NAT/firewall or proxy-only mode
   bandwidth [Mbps|auto] [RTT_MS|auto]
                            Save bandwidth/RTT buffer profile without changing MSS
-  high-conn                Apply adaptive high-concurrency profile (Swap + TCP + Go/x-ui bounds + journald)
+  high-conn [intl|cn|us|eu]
+                           Apply high-concurrency profile (intl: 1G JP/APAC, cn: 200M direct, us: 1G US)
   mss [clamp|dual-fixed|1200..1460] Persist MSS policy (default: clamp)
   swap                     Create managed 2/4 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
@@ -2422,7 +2549,7 @@ main() {
     ipv6) tune_kernel "${2:-}" ;;
     conntrack) tune_kernel "${VPS_IPV6:-}" "${2:-auto}" ;;
     bandwidth) configure_bandwidth_profile "${2:-}" "${3:-}" ;;
-    high-conn|highconn|conn|1g-high-conn) tune_high_concurrency ;;
+    high-conn|highconn|conn|1g-high-conn) tune_high_concurrency "${2:-}" ;;
     mss) setup_mss "${2:-clamp}" ;;
     swap) setup_swap ;;
     timezone) setup_timezone "${2:-auto}" ;;
