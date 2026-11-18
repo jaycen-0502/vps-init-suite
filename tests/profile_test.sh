@@ -27,6 +27,7 @@ assert_equal "16" "$(memory_buffer_cap_mib 2048)"
 assert_equal "32" "$(memory_buffer_cap_mib 4096)"
 assert_equal "64" "$(memory_buffer_cap_mib 8192)"
 assert_equal "64" "$(memory_buffer_cap_mib 16384)"
+assert_equal "1048576" "$(calculate_buffer_max 50 40 1024)"
 assert_equal "4194304" "$(calculate_buffer_max 100 160 1024)"
 assert_equal "8388608" "$(calculate_buffer_max 200 160 1024)"
 assert_equal "16777216" "$(calculate_buffer_max 500 160 4096)"
@@ -62,6 +63,8 @@ if verify_sysctl_value net.ipv4.tcp_congestion_control bbr; then
 fi
 is_root_command uninstall
 is_root_command select
+is_root_command high-conn
+is_root_command conn
 if is_root_command status; then
   printf '%s\n' "read-only status unexpectedly requires root" >&2
   exit 1
