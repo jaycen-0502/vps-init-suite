@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.18.1"
+readonly SCRIPT_VERSION="1.19.0"
 readonly REPO_SLUG="jaycen-0502/vps-init-suite"
 readonly LAUNCHER_NAME="vps-init"
 readonly INSTALL_DIR="/usr/local/lib/vps-init-suite"
@@ -37,6 +37,7 @@ readonly CONFLICT_FILES=(
   99-tfo.conf 99-japan-vps.conf 99-us-vps.conf 99-vps-tuning.conf
   99-1g-high-conn.conf 99-high-conn.conf 99-lowmem-patch.conf
   99-us-200m.conf 99-zzz-lowmem-override.conf 99-proxy-experience.conf
+  99-us-speed-test.conf 99-vps-init-opt.conf
 )
 
 if [[ -t 1 ]]; then
@@ -50,12 +51,19 @@ fi
 
 APT_UPDATED=0
 XUI_POLICY_SERVICE_STOPPED=0
+TUNING_BANDWIDTH=""
+TUNING_RTT=""
+TUNING_BUFFER_MAX=""
+TUNING_CONN_MODE="speed"
 
 log() { printf '%s\n' "${GREEN}$*${RESET}"; }
 warn() { printf '%s\n' "${YELLOW}$*${RESET}" >&2; }
 
 detect_tty() {
-  if ( : < /dev/tty ) 2>/dev/null; then
+  if [[ -n "${VPS_NONINTERACTIVE:-}" ]]; then
+    return 0
+  fi
+  if [[ -t 1 ]] && ( : < /dev/tty ) 2>/dev/null; then
     printf '%s\n' "/dev/tty"
   elif [[ -t 0 ]]; then
     printf '%s\n' "/dev/stdin"
@@ -275,13 +283,23 @@ find_latest_unmanaged_backup() {
   done <<<"$candidates"
 }
 
+normalize_conn_mode() {
+  local raw
+  raw=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "$raw" in
+    1|speed|fast|low|normal|single|"") printf '%s\n' "speed" ;;
+    2|high|high-conn|highconn|stable|safe|3000) printf '%s\n' "high" ;;
+    *) return 1 ;;
+  esac
+}
+
 show_status() {
   local timezone="unavailable"
   local swap="none"
   local mss="not configured"
   local xui_nofile="未检测到 x-ui.service"
   local xui_pid
-  local tuning_bandwidth tuning_rtt mss_mode mss_value mss_value6 ipv4_mss ipv6_mss
+  local tuning_bandwidth tuning_rtt tuning_conn_mode conn_mode_label mss_mode mss_value mss_value6 ipv4_mss ipv6_mss
 
   if command -v timedatectl >/dev/null; then
     timezone=$(run_timedatectl 2 show --property=Timezone --value 2>/dev/null || true)
@@ -315,8 +333,14 @@ show_status() {
   fi
   tuning_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
   tuning_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
+  tuning_conn_mode=$(tuning_value CONN_MODE 2>/dev/null || true)
   [[ -n "$tuning_bandwidth" ]] || tuning_bandwidth="未设置"
   [[ -n "$tuning_rtt" ]] || tuning_rtt="未设置"
+  case "${tuning_conn_mode:-}" in
+    high) conn_mode_label="高并发防爆 (high)" ;;
+    speed) conn_mode_label="低中并发极速 (speed)" ;;
+    *) conn_mode_label="未设置" ;;
+  esac
 
   printf '%s\n' "------------------------------------------------------------"
   printf '版本:                    %s\n' "$SCRIPT_VERSION"
@@ -343,6 +367,7 @@ show_status() {
   printf 'IPv6 状态:               %s\n' "$(if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == "1" ]]; then printf '%s' 已开启; else printf '%s' 已关闭; fi)"
   printf 'IPv6 假死黑洞防护:       %s\n' "$(if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)" == "1" ]]; then printf '%s' '已禁用（防假死黑洞）'; else printf '%s' '未禁用'; fi)"
   printf 'TCP 缓冲上限:            %s 字节\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unavailable)"
+  printf 'UDP/QUIC 默认缓冲:       %s 字节\n' "$(sysctl -n net.core.rmem_default 2>/dev/null || echo unavailable)"
   local rmem_vals tcp_mem_vals tcp_mem_high_mb
   rmem_vals=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo "")
   if [[ -n "$rmem_vals" ]]; then
@@ -354,21 +379,23 @@ show_status() {
     printf 'TCP 内存硬上限 (tcp_mem):%s 页（硬顶: %s MB）\n' "$tcp_mem_vals" "$tcp_mem_high_mb"
   fi
   printf '带宽/RTT 缓冲档位:       %s Mbps / %s ms\n' "$tuning_bandwidth" "$tuning_rtt"
+  printf '并发调优模式:            %s\n' "$conn_mode_label"
   printf 'Swap 倾向:               %s\n' "$(sysctl -n vm.swappiness 2>/dev/null || echo unavailable)"
   printf '时区:                    %s\n' "${timezone:-未知}"
   printf 'Swap:                    %s\n' "$swap"
   printf 'MSS 策略:                %s\n' "${mss:-未配置}"
   printf 'Conntrack:               %s\n' "$(if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then printf '已加载 (%s/%s)' "$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo '?')" "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '?')"; else printf '%s' 未加载; fi)"
   printf 'x-ui 文件句柄上限:       %s\n' "$xui_nofile"
-  local xui_env_limit=""
+  local xui_env_limit="" xui_oom=""
   if xui_service_detected && command -v systemctl >/dev/null; then
     xui_env_limit=$(run_with_timeout 3 systemctl show x-ui.service --property=Environment --value 2>/dev/null || true)
+    xui_oom=$(run_with_timeout 3 systemctl show x-ui.service --property=OOMScoreAdjust --value 2>/dev/null || true)
   fi
   if [[ -n "$xui_env_limit" && "$xui_env_limit" == *"GOMEMLIMIT"* ]]; then
     local gomem gogc
-    gomem=$(grep -o 'GOMEMLIMIT=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2)
-    gogc=$(grep -o 'GOGC=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2)
-    printf 'x-ui Go 内存限制:        %s (GOGC: %s, madvdontneed=1)\n' "${gomem:-未设定}" "${gogc:-默认}"
+    gomem=$(grep -o 'GOMEMLIMIT=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2 || true)
+    gogc=$(grep -o 'GOGC=[^ ]*' <<<"$xui_env_limit" | head -n1 | cut -d= -f2 || true)
+    printf 'x-ui Go 内存限制:        %s (GOGC: %s, OOM: %s)\n' "${gomem:-未设定}" "${gogc:-默认}" "${xui_oom:-0}"
   fi
   printf '%s\n' "------------------------------------------------------------"
 }
@@ -421,13 +448,16 @@ has_working_ipv6() {
   command -v ip >/dev/null 2>&1 || return 1
   ip -6 addr show scope global 2>/dev/null | grep -qw "inet6" || return 1
   ip -6 route show default 2>/dev/null | grep -qw "default" || return 1
+  if command -v curl >/dev/null 2>&1; then
+    if curl -6 -fsS -m 2 -o /dev/null "https://www.gstatic.com/generate_204" 2>/dev/null ||
+      curl -6 -fsS -m 2 -o /dev/null "https://cp.cloudflare.com/generate_204" 2>/dev/null; then
+      return 0
+    fi
+  fi
   if command -v ping6 >/dev/null 2>&1; then
     ping6 -c 1 -W 1 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
   elif command -v ping >/dev/null 2>&1; then
     ping -6 -c 1 -W 1 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
-  fi
-  if command -v curl >/dev/null 2>&1; then
-    curl -6 -s -m 2 "https://ip.sb" >/dev/null 2>&1 && return 0
   fi
   return 1
 }
@@ -436,12 +466,13 @@ tune_kernel() {
   require_root
   require_supported_os
   local ipv6_mode requested_ipv6 conntrack_mode requested_conntrack
-  local requested_bandwidth requested_rtt requested_buffer_max
+  local requested_bandwidth requested_rtt requested_buffer_max requested_conn_mode
   requested_ipv6=${1:-}
   requested_conntrack=${2:-${VPS_CONNTRACK:-auto}}
   requested_bandwidth=${3:-}
   requested_rtt=${4:-}
   requested_buffer_max=${5:-}
+  requested_conn_mode=${6:-}
   if [[ -t 0 ]]; then
     prompt_missing_tuning_profile requested_bandwidth requested_rtt
   fi
@@ -453,6 +484,9 @@ tune_kernel() {
 
   if [[ -z "$requested_ipv6" ]]; then
     requested_ipv6=${VPS_IPV6:-off}
+    if [[ "$requested_ipv6" == "off" ]]; then
+      log "默认关闭 IPv6（防假死黑洞与双栈握手卡顿）；如需启用可指定 on 或在菜单中开启。"
+    fi
   fi
   ipv6_mode=$(resolve_ipv6_mode "$requested_ipv6")
 
@@ -475,50 +509,69 @@ tune_kernel() {
 
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
-  resolve_tuning_profile "$requested_bandwidth" "$requested_rtt" "$memory_mb" "$requested_buffer_max"
+  resolve_tuning_profile "$requested_bandwidth" "$requested_rtt" "$memory_mb" "$requested_buffer_max" "$requested_conn_mode"
+
   local profile rmem_max wmem_max tcp_rmem_def tcp_wmem_def udp_rmem_def udp_wmem_def notsent_lowat
   local file_max conntrack_max backlog netdev_backlog syn_backlog tw_buckets keepalive_time keepalive_intvl keepalive_probes conntrack_config ipv6_config tcp_mem_config
-  if [[ "$(buffer_profile "$memory_mb")" == "4" ]]; then
-    profile="低内存高并发（${TUNING_BUFFER_MAX} 字节缓冲，16KB TCP初始/锁256MB）"
-    rmem_max=$TUNING_BUFFER_MAX
-    wmem_max=$TUNING_BUFFER_MAX
+
+  rmem_max=$TUNING_BUFFER_MAX
+  wmem_max=$TUNING_BUFFER_MAX
+  # 256KB 默认套接字缓冲专为 UDP/QUIC (HTTP/3 图片CDN/LINE/TG) 预留，TCP 仍由 tcp_rmem 独立控制
+  udp_rmem_def=262144
+  udp_wmem_def=262144
+  file_max=$(proxy_nofile_limit "$memory_mb")
+  keepalive_time=300
+  keepalive_intvl=15
+  keepalive_probes=3
+
+  if (( memory_mb <= 600 )); then
+    profile="512M微型防爆档（上限 $((rmem_max / 1048576))MB / 初始 16KB / 硬顶 128MB）"
     tcp_rmem_def=16384
     tcp_wmem_def=16384
-    # 256KB 默认套接字缓冲专为 UDP/QUIC (HTTP/3 图片CDN/LINE/TG) 预留，TCP 仍由 tcp_rmem 独立限制为 16KB
-    udp_rmem_def=262144
-    udp_wmem_def=262144
     notsent_lowat=32768
-    file_max=$(proxy_nofile_limit "$memory_mb")
+    conntrack_max=32768
+    backlog=2048
+    netdev_backlog=2048
+    syn_backlog=2048
+    tw_buckets=16384
+    tcp_mem_config="net.ipv4.tcp_mem = 8192 16384 32768"
+  elif (( memory_mb <= 1500 )); then
+    tcp_rmem_def=16384
+    tcp_wmem_def=16384
     conntrack_max=65536
     backlog=4096
     netdev_backlog=4096
     syn_backlog=4096
     tw_buckets=32768
-    keepalive_time=300
-    keepalive_intvl=15
-    keepalive_probes=3
-    tcp_mem_config="net.ipv4.tcp_mem = 16384 32768 65536"
+    if [[ "$TUNING_CONN_MODE" == "high" ]]; then
+      profile="1G高并发防爆档（上限 $((rmem_max / 1048576))MB / 初始 16KB / 硬顶 256MB）"
+      notsent_lowat=32768
+      tcp_mem_config="net.ipv4.tcp_mem = 16384 32768 65536"
+    else
+      profile="1G低中并发极速档（上限 $((rmem_max / 1048576))MB / 初始 16KB / 硬顶 320MB 兜底）"
+      notsent_lowat=16384
+      tcp_mem_config="net.ipv4.tcp_mem = 24576 49152 81920"
+    fi
   else
-    profile="标准档（按带宽/RTT计算的 ${TUNING_BUFFER_MAX} 字节缓冲）"
-    rmem_max=$TUNING_BUFFER_MAX
-    wmem_max=$TUNING_BUFFER_MAX
-    tcp_rmem_def=65536
-    tcp_wmem_def=65536
-    udp_rmem_def=262144
-    udp_wmem_def=262144
-    notsent_lowat=65536
-    file_max=$(proxy_nofile_limit "$memory_mb")
     conntrack_max=131072
     backlog=16384
     netdev_backlog=16384
     syn_backlog=8192
     tw_buckets=50000
-    keepalive_time=300
-    keepalive_intvl=15
-    keepalive_probes=3
-    local tcp_mem_low=$((memory_mb * 1024 / 4 / 16))
-    local tcp_mem_press=$((memory_mb * 1024 / 4 / 8))
+    if [[ "$TUNING_CONN_MODE" == "high" ]]; then
+      profile="大内存高并发档（上限 $((rmem_max / 1048576))MB / 初始 32KB）"
+      tcp_rmem_def=32768
+      tcp_wmem_def=32768
+      notsent_lowat=32768
+    else
+      profile="大内存跨洋极速档（上限 $((rmem_max / 1048576))MB / 初始 64KB）"
+      tcp_rmem_def=65536
+      tcp_wmem_def=65536
+      notsent_lowat=16384
+    fi
     local tcp_mem_high=$((memory_mb * 1024 / 4 / 4))
+    local tcp_mem_press=$((tcp_mem_high / 2))
+    local tcp_mem_low=$((tcp_mem_high / 4))
     tcp_mem_config="net.ipv4.tcp_mem = ${tcp_mem_low} ${tcp_mem_press} ${tcp_mem_high}"
   fi
   log "检测到 ${memory_mb} MiB 内存，正在应用 ${profile} 配置。"
@@ -535,7 +588,6 @@ net.ipv6.conf.default.accept_ra = 2"
   else
     ipv6_config="net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
 net.ipv6.conf.all.forwarding = 0
 net.ipv6.conf.default.forwarding = 0"
     warn "IPv6 已彻底禁用（默认），杜绝假死黑洞并锁定 IPv4 专线。"
@@ -897,9 +949,41 @@ buffer_profile() {
 
 memory_buffer_cap_mib() {
   local memory_mb=$1
-  local cap_mib=$(((memory_mb + 127) / 128))
-  (( cap_mib < 4 )) && cap_mib=4
-  (( cap_mib > 64 )) && cap_mib=64
+  local conn_mode=${2:-speed}
+  local rtt_ms=${3:-160}
+  local cap_mib=32
+
+  if (( memory_mb <= 600 )); then
+    if [[ "$conn_mode" == "high" ]]; then
+      cap_mib=1
+    else
+      cap_mib=4
+    fi
+  elif (( memory_mb <= 1500 )); then
+    if [[ "$conn_mode" == "high" ]]; then
+      if (( rtt_ms >= 100 )); then
+        cap_mib=4
+      else
+        cap_mib=2
+      fi
+    else
+      # 1GB 低中并发模式：不再死锁 4MB，允许按手填带宽放开至最高 32MB，
+      # 依靠 16KB 初始缓冲与 tcp_mem 320MB 硬顶自动兜底防 OOM。
+      cap_mib=32
+    fi
+  elif (( memory_mb <= 3000 )); then
+    if [[ "$conn_mode" == "high" ]]; then
+      cap_mib=16
+    else
+      cap_mib=32
+    fi
+  else
+    if [[ "$conn_mode" == "high" ]]; then
+      cap_mib=32
+    else
+      cap_mib=64
+    fi
+  fi
   printf '%s\n' "$cap_mib"
 }
 
@@ -910,29 +994,36 @@ tuning_value() {
 }
 
 calculate_buffer_max() {
-  local bandwidth_mbps=$1 rtt_ms=$2 memory_mb=$3
+  local bandwidth_mbps=$1 rtt_ms=$2 memory_mb=$3 conn_mode=${4:-speed}
   local bdp_bytes target_bytes target_mib memory_cap_mib rounded_mib
   bdp_bytes=$((bandwidth_mbps * 125 * rtt_ms))
+  # 1.5x BDP 余量保证跨洋轻微丢包/抖动下依然能单线程拉满带宽
   target_bytes=$((bdp_bytes * 3 / 2))
   target_mib=$(( (target_bytes + 1048575) / 1048576 ))
-  (( target_mib < 1 )) && target_mib=1
-  rounded_mib=1
+  if (( target_mib < 2 )); then
+    target_mib=2
+  fi
+  rounded_mib=2
   while (( rounded_mib < target_mib && rounded_mib < 64 )); do
     rounded_mib=$((rounded_mib * 2))
   done
   target_mib=$rounded_mib
-  memory_cap_mib=$(memory_buffer_cap_mib "$memory_mb")
-  (( target_mib > memory_cap_mib )) && target_mib=$memory_cap_mib
+  memory_cap_mib=$(memory_buffer_cap_mib "$memory_mb" "$conn_mode" "$rtt_ms")
+  if (( target_mib > memory_cap_mib )); then
+    target_mib=$memory_cap_mib
+  fi
   printf '%s\n' "$((target_mib * 1048576))"
 }
 
 resolve_tuning_profile() {
-  local requested_bandwidth=${1:-} requested_rtt=${2:-} memory_mb=$3 requested_buffer_max=${4:-}
-  local stored_bandwidth stored_rtt bdp_bytes requested_mib memory_cap_mib
+  local requested_bandwidth=${1:-} requested_rtt=${2:-} memory_mb=$3 requested_buffer_max=${4:-} requested_conn_mode=${5:-}
+  local stored_bandwidth stored_rtt stored_conn_mode bdp_bytes requested_mib memory_cap_mib
   stored_bandwidth=$(tuning_value BANDWIDTH_MBPS)
   stored_rtt=$(tuning_value RTT_MS)
+  stored_conn_mode=$(tuning_value CONN_MODE)
   [[ -n "$requested_bandwidth" ]] || requested_bandwidth="$stored_bandwidth"
   [[ -n "$requested_rtt" ]] || requested_rtt="$stored_rtt"
+  [[ -n "$requested_conn_mode" ]] || requested_conn_mode="${stored_conn_mode:-speed}"
 
   if [[ -z "$requested_bandwidth" && -t 0 ]]; then
     prompt_tuning_value requested_bandwidth "VPS 标称带宽" \
@@ -955,16 +1046,18 @@ resolve_tuning_profile() {
 
   TUNING_BANDWIDTH=$((10#$requested_bandwidth))
   TUNING_RTT=$((10#$requested_rtt))
+  TUNING_CONN_MODE=$(normalize_conn_mode "$requested_conn_mode") || die "并发模式必须是 speed（极速）或 high（高并发防爆）。"
+
   if [[ -n "$requested_buffer_max" && "$requested_buffer_max" =~ ^[0-9]+$ ]]; then
     TUNING_BUFFER_MAX=$requested_buffer_max
   else
-    TUNING_BUFFER_MAX=$(calculate_buffer_max "$TUNING_BANDWIDTH" "$TUNING_RTT" "$memory_mb")
+    TUNING_BUFFER_MAX=$(calculate_buffer_max "$TUNING_BANDWIDTH" "$TUNING_RTT" "$memory_mb" "$TUNING_CONN_MODE")
   fi
   bdp_bytes=$((TUNING_BANDWIDTH * 125 * TUNING_RTT))
   requested_mib=$(( (bdp_bytes * 3 / 2 + 1048575) / 1048576 ))
-  memory_cap_mib=$(memory_buffer_cap_mib "$memory_mb")
+  memory_cap_mib=$(memory_buffer_cap_mib "$memory_mb" "$TUNING_CONN_MODE" "$TUNING_RTT")
   if (( requested_mib > memory_cap_mib )); then
-    warn "按 ${TUNING_BANDWIDTH} Mbps/${TUNING_RTT} ms 计算需要约 ${requested_mib} MiB；受 ${memory_mb} MiB 物理内存保护，上限收敛为 ${memory_cap_mib} MiB。"
+    warn "按 ${TUNING_BANDWIDTH} Mbps/${TUNING_RTT} ms 计算需要约 ${requested_mib} MiB；受 ${memory_mb} MiB 内存与 ${TUNING_CONN_MODE} 模式保护，上限收敛为 ${memory_cap_mib} MiB。"
   fi
   assert_not_symlink "$TUNING_CONFIG"
   capture_original_managed_file "$TUNING_CONFIG"
@@ -976,6 +1069,7 @@ resolve_tuning_profile() {
 BANDWIDTH_MBPS=${TUNING_BANDWIDTH}
 RTT_MS=${TUNING_RTT}
 BUFFER_MAX=${TUNING_BUFFER_MAX}
+CONN_MODE=${TUNING_CONN_MODE}
 EOF
   chmod 0644 "$temporary"
   mv -f -- "$temporary" "$TUNING_CONFIG"
@@ -1060,43 +1154,53 @@ prompt_missing_tuning_profile() {
 configure_bandwidth_profile() {
   require_root
   require_supported_os
-  local memory_mb bandwidth=${1:-} rtt=${2:-} current_bandwidth current_rtt
-  memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+  local bandwidth=${1:-} rtt=${2:-} conn_mode=${3:-} current_bandwidth current_rtt current_conn_mode
   if [[ -z "$bandwidth" && -t 0 ]]; then
     printf '\n%s\n' "请选择 VPS 业务场景与线路预设："
     printf '%s\n' \
-      "  1. 日本/亚太国际互联 (1000 Mbps / 30 ms) - 纯海外节点中转/国际落地，跑满千兆极速" \
-      "  2. 亚太优化直连国内 (200 Mbps / 40 ms)  - 面向国内直连，兼顾 3000 高并发防爆" \
-      "  3. 美西跨洋大带宽   (1000 Mbps / 160 ms) - 美西 1G 跨太平洋长距离线路" \
-      "  4. 欧洲/远距离跨洋   (500 Mbps / 200 ms)  - 欧洲高延迟长途互联" \
-      "  5. 自定义带宽与 RTT (手动输入数值)"
+      "  1. 日本/亚太国际互联 (1000 Mbps / 30 ms / speed)  - 海外落地/中转，单线跑满千兆" \
+      "  2. 亚太优化直连国内 (200 Mbps / 40 ms / high)    - 面向国内直连，3000 高并发防爆" \
+      "  3. 美西跨洋大带宽   (1000 Mbps / 160 ms / speed) - 美西 1G 跨洋极速（1G 机自动放开至 32MB）" \
+      "  4. 美西 500M 跨洋   (500 Mbps / 160 ms / speed)  - 美西 500M 跨洋极速（自动给 16MB）" \
+      "  5. 欧洲/远距离跨洋   (500 Mbps / 200 ms / speed)  - 欧洲高延迟长途互联" \
+      "  6. 自定义带宽、RTT 与并发模式 (手动输入数值)"
     local choice
-    read -r -p "请选择 [1-5，直接回车使用当前/默认]: " choice
+    read -r -p "请选择 [1-6，直接回车使用当前/默认]: " choice
     case "$choice" in
-      1) bandwidth=1000; rtt=30 ;;
-      2) bandwidth=200; rtt=40 ;;
-      3) bandwidth=1000; rtt=160 ;;
-      4) bandwidth=500; rtt=200 ;;
-      5)
+      1) bandwidth=1000; rtt=30; conn_mode="speed" ;;
+      2) bandwidth=200; rtt=40; conn_mode="high" ;;
+      3) bandwidth=1000; rtt=160; conn_mode="speed" ;;
+      4) bandwidth=500; rtt=160; conn_mode="speed" ;;
+      5) bandwidth=500; rtt=200; conn_mode="speed" ;;
+      6)
         current_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
         prompt_tuning_value bandwidth "VPS 标称带宽" \
-          "请输入 VPS 标称带宽 Mbps（输入 auto 使用保守 100 Mbps）[${current_bandwidth:-auto}]: " \
-          "${current_bandwidth:-auto}" 1 100000 1 100 Mbps
+          "请输入 VPS 标称带宽 Mbps（输入 auto 使用保守 100 Mbps）[${current_bandwidth:-500}]: " \
+          "${current_bandwidth:-500}" 1 100000 1 100 Mbps
         current_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
         prompt_tuning_value rtt "代理 RTT" \
-          "请输入代理用户到 VPS 的典型 RTT 毫秒（跨洋可填 160）[${current_rtt:-160}]: " \
+          "请输入代理用户到 VPS 的典型 RTT 毫秒（美西 160 / 日本 40 / 国际落地 30）[${current_rtt:-160}]: " \
           "${current_rtt:-160}" 1 2000 1 160 ms
+        local tier_in=""
+        printf '%s\n' \
+          "请选择并发模式：" \
+          "  [1] speed - 低中并发极速（<500连接，按手填带宽放开窗口，拉满单线程）" \
+          "  [2] high  - 多人高并发防爆（1000-3000+连接，严格封顶内存与 CPU）"
+        read -r -p "请选择 [1/2，默认 1]: " tier_in
+        conn_mode=$(normalize_conn_mode "${tier_in:-1}" 2>/dev/null || echo "speed")
         ;;
       *)
         current_bandwidth=$(tuning_value BANDWIDTH_MBPS 2>/dev/null || true)
         current_rtt=$(tuning_value RTT_MS 2>/dev/null || true)
+        current_conn_mode=$(tuning_value CONN_MODE 2>/dev/null || true)
         bandwidth=${current_bandwidth:-200}
         rtt=${current_rtt:-40}
+        conn_mode=${current_conn_mode:-speed}
         ;;
     esac
   fi
-  tune_kernel "${VPS_IPV6:-}" "${VPS_CONNTRACK:-auto}" "$bandwidth" "$rtt"
-  log "已保存带宽档位：${TUNING_BANDWIDTH} Mbps，RTT：${TUNING_RTT} ms，TCP 缓冲上限：${TUNING_BUFFER_MAX} 字节。"
+  tune_kernel "${VPS_IPV6:-}" "${VPS_CONNTRACK:-auto}" "$bandwidth" "$rtt" "" "${conn_mode:-speed}"
+  log "已保存档位：${TUNING_BANDWIDTH} Mbps / ${TUNING_RTT} ms / 模式: ${TUNING_CONN_MODE}，TCP 缓冲上限：${TUNING_BUFFER_MAX} 字节。"
 }
 
 tune_high_concurrency() {
@@ -1105,136 +1209,136 @@ tune_high_concurrency() {
   local requested_mode=${1:-}
   local custom_bw=${2:-}
   local custom_rtt=${3:-}
+  local custom_conn_mode=${4:-}
   local memory_mb
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
 
   # 1. 自动挂载 Swap 守护防 OOM
   setup_swap
 
-  # 2. 如果第 1 个参数是纯数字（例如 high-conn 200 160），自动识别为自定义带宽
+  # 2. 如果第 1 个参数是纯数字（例如 high-conn 500 160 speed），自动识别为自定义带宽
   if [[ "$requested_mode" =~ ^[0-9]+$ ]]; then
-    custom_rtt=${custom_bw:-160}
+    custom_conn_mode=$custom_rtt
+    custom_rtt=$custom_bw
     custom_bw=$requested_mode
     requested_mode="custom"
   fi
 
-  local default_bw=200 default_rtt=40 scenario="cn"
+  local default_bw=200 default_rtt=40 default_conn="high" scenario="cn"
   local mode_lower
   mode_lower=$(printf '%s' "$requested_mode" | tr '[:upper:]' '[:lower:]')
   case "$mode_lower" in
     us|us-west|america|3)
       scenario="us"
-      default_bw=1000
+      default_bw=500
       default_rtt=160
+      default_conn="speed"
       ;;
     intl|global|jp-intl|japan-intl|international|1|jp)
       scenario="intl"
       default_bw=1000
       default_rtt=30
+      default_conn="speed"
       ;;
     hk|hk-intl|hongkong|sg|singapore)
       scenario="hk"
       default_bw=1000
       default_rtt=20
+      default_conn="speed"
       ;;
     eu|europe|4)
       scenario="eu"
       default_bw=500
       default_rtt=220
+      default_conn="speed"
       ;;
     custom|5)
       scenario="custom"
-      default_bw=200
+      default_bw=500
       default_rtt=160
+      default_conn="speed"
       ;;
     cn|direct|china|asia|2|"")
       scenario="cn"
       default_bw=200
       default_rtt=40
+      default_conn="high"
       ;;
     *)
       warn "未知预设 '${requested_mode}'，回退至自适应直连档。"
       scenario="cn"
       default_bw=200
       default_rtt=40
+      default_conn="high"
       ;;
   esac
 
-  # 安全检测可用控制终端（防止后台/无终端 SSH 下读取 /dev/tty 触发 set -e 退出）
   local tty_in
   tty_in=$(detect_tty)
 
   # 若完全未传参数且有交互终端，弹出场景菜单
   if [[ -z "$requested_mode" && -n "$tty_in" ]]; then
-    printf '\n%s\n' "请选择高并发业务场景与线路预设："
+    printf '\n%s\n' "请选择业务场景与线路预设（本机内存: ${memory_mb} MB）："
     printf '%s\n' \
-      "  1. 日本/亚太国际互联 (默认 1000 Mbps / 30 ms) - 纯海外节点中转/落地，跑满千兆" \
-      "  2. 亚太优化直连国内 (默认 200 Mbps / 40 ms)   - 面向国内直连，3000 高并发防爆 [默认]" \
-      "  3. 美西/美国跨洋大带宽 (默认 1000 Mbps / 160 ms) - 美国 1G/200M 跨洋线路" \
-      "  4. 欧洲/远距离跨洋   (默认 500 Mbps / 220 ms)  - 欧洲高延迟长途互联" \
-      "  5. 自定义带宽与延迟 (手动输入数值)"
+      "  1. 日本/美国国际互联 (默认 1000 Mbps / 30 ms / speed)  - 海外落地/中转，拉满千兆" \
+      "  2. 亚太优化直连国内 (默认 200 Mbps / 40 ms / high)     - 多人 3000 高并发防爆 [默认]" \
+      "  3. 美西/美国跨洋线路 (默认 500 Mbps / 160 ms / speed)  - 支持 200M/500M/1G 手填放开上限" \
+      "  4. 欧洲/远距离跨洋   (默认 500 Mbps / 220 ms / speed)  - 欧洲高延迟长途互联" \
+      "  5. 完全自定义带宽、延迟与并发模式"
     local choice=""
-    read -r -t 15 -p "请选择 [1-5，直接回车默认 2]: " choice < "$tty_in" || true
+    read -r -t 20 -p "请选择 [1-5，直接回车默认 2]: " choice < "$tty_in" || true
     case "${choice:-2}" in
-      1) scenario="intl"; default_bw=1000; default_rtt=30 ;;
-      2) scenario="cn"; default_bw=200; default_rtt=40 ;;
-      3) scenario="us"; default_bw=1000; default_rtt=160 ;;
-      4) scenario="eu"; default_bw=500; default_rtt=220 ;;
-      5) scenario="custom"; default_bw=200; default_rtt=160 ;;
-      *) scenario="cn"; default_bw=200; default_rtt=40 ;;
+      1) scenario="intl"; default_bw=1000; default_rtt=30; default_conn="speed" ;;
+      2) scenario="cn"; default_bw=200; default_rtt=40; default_conn="high" ;;
+      3) scenario="us"; default_bw=500; default_rtt=160; default_conn="speed" ;;
+      4) scenario="eu"; default_bw=500; default_rtt=220; default_conn="speed" ;;
+      5) scenario="custom"; default_bw=500; default_rtt=160; default_conn="speed" ;;
+      *) scenario="cn"; default_bw=200; default_rtt=40; default_conn="high" ;;
     esac
   fi
 
-  # 若未传具体带宽，且在 custom 模式或传入地区未带带宽参数时，允许终端交互输入
+  # 若命令行未直接传入带宽且存在交互终端，引导手动填写带宽、延迟与并发模式
   if [[ -n "$tty_in" && -z "$custom_bw" ]]; then
-    if [[ "$scenario" == "custom" ]] || [[ -n "$requested_mode" ]]; then
-      printf '\n%s\n' "--------------------------------------------------"
-      printf ' 预设场景: %s (默认参考: %s Mbps / %s ms)\n' "$scenario" "$default_bw" "$default_rtt"
-      printf '%s\n' "--------------------------------------------------"
-      local input_bw="" input_rtt=""
-      read -r -t 15 -p " 请输入机器实际带宽 Mbps [回车默认 ${default_bw}]: " input_bw < "$tty_in" || true
+    if [[ "$scenario" == "custom" || "$scenario" == "us" || -n "$requested_mode" ]]; then
+      local default_tier_num=1
+      [[ "$default_conn" == "high" ]] && default_tier_num=2
+      printf '\n%s\n' "------------------------------------------------------------"
+      printf ' 预设场景: %s | 物理内存: %s MB (默认: %s Mbps / %s ms / %s)\n' \
+        "$scenario" "$memory_mb" "$default_bw" "$default_rtt" "$default_conn"
+      printf '%s\n' "------------------------------------------------------------"
+      local input_bw="" input_rtt="" input_tier=""
+      read -r -t 20 -p " 1. 请输入机器实际带宽 Mbps [回车默认 ${default_bw}]: " input_bw < "$tty_in" || true
       custom_bw="${input_bw:-$default_bw}"
-      read -r -t 15 -p " 请输入往返典型延迟 ms   [回车默认 ${default_rtt}]: " input_rtt < "$tty_in" || true
+      read -r -t 20 -p " 2. 请输入往返典型延迟 ms   [回车默认 ${default_rtt}]: " input_rtt < "$tty_in" || true
       custom_rtt="${input_rtt:-$default_rtt}"
-      printf '%s\n' "--------------------------------------------------"
+      printf '%s\n' \
+        " 3. 请选择并发使用规模:" \
+        "    [1] speed - 低中并发极速 (<500连接，按带宽放开上限至16M/32M，拉满单线程)" \
+        "    [2] high  - 多人高并发防爆 (1000-3000+连接，1G机严格封顶防CPU/RAM过载)"
+      read -r -t 20 -p " 请选择 [1/2，回车默认 ${default_tier_num}]: " input_tier < "$tty_in" || true
+      custom_conn_mode="${input_tier:-$default_tier_num}"
+      printf '%s\n' "------------------------------------------------------------"
     fi
   fi
 
   local bandwidth="${custom_bw:-$default_bw}"
   local rtt="${custom_rtt:-$default_rtt}"
+  local conn_mode
+  conn_mode=$(normalize_conn_mode "${custom_conn_mode:-$default_conn}" 2>/dev/null || printf '%s' "$default_conn")
   [[ "$bandwidth" =~ ^[0-9]+$ ]] && (( bandwidth > 0 )) || bandwidth=$default_bw
   [[ "$rtt" =~ ^[0-9]+$ ]] && (( rtt > 0 )) || rtt=$default_rtt
 
-  # 3. 计算理论 BDP (Bytes = Mbps * ms * 125) 并匹配标准缓冲区档位
-  local raw_bdp=$(( bandwidth * rtt * 125 ))
+  # 3. 结合物理内存 + 并发模式 + 手填带宽计算最终缓冲上限与 Go 限制
   local tcp_buf_max xui_mem_limit xui_gogc
+  tcp_buf_max=$(calculate_buffer_max "$bandwidth" "$rtt" "$memory_mb" "$conn_mode")
 
-  if (( raw_bdp <= 2097152 )); then
-    tcp_buf_max=2097152    # 2 MB (日本/亚太低延迟，或低带宽)
-  elif (( raw_bdp <= 4500000 )); then
-    tcp_buf_max=4194304    # 4 MB (精准匹配美国 200 Mbps / 160 ms)
-  elif (( raw_bdp <= 22000000 )); then
-    tcp_buf_max=8388608    # 8 MB (匹配美国/欧洲 500~1000 Mbps)
-  else
-    tcp_buf_max=16777216   # 16 MB (超千兆跨洋大内存)
-  fi
-
-  # 4. 结合物理内存做防爆安全封顶与 Go 限制
   if (( memory_mb <= 600 )); then
-    tcp_buf_max=1048576    # 1 MB
     xui_mem_limit="180MiB"
     xui_gogc=50
   elif (( memory_mb <= 1500 )); then
-    # 1GB 小内存机器高并发安全封顶：跨洋高延迟最大 4MB，近距低延迟最大 2MB
-    if (( rtt >= 100 && tcp_buf_max > 4194304 )); then
-      tcp_buf_max=4194304
-    elif (( rtt < 100 && tcp_buf_max > 2097152 )); then
-      tcp_buf_max=2097152
-    fi
     xui_mem_limit="350MiB"
     xui_gogc=75
   elif (( memory_mb <= 3000 )); then
-    (( tcp_buf_max > 8388608 )) && tcp_buf_max=8388608
     xui_mem_limit="800MiB"
     xui_gogc=100
   else
@@ -1242,42 +1346,37 @@ tune_high_concurrency() {
     xui_gogc=100
   fi
 
-  local scenario_name="${scenario} (${bandwidth} Mbps / ${rtt} ms -> 缓冲上限 $((tcp_buf_max / 1048576)) MB)"
+  local scenario_name="${scenario} (${bandwidth} Mbps / ${rtt} ms / ${conn_mode} -> 缓冲上限 $((tcp_buf_max / 1048576)) MB)"
 
-  TUNING_BANDWIDTH=$bandwidth
-  TUNING_RTT=$rtt
-  TUNING_BUFFER_MAX=$tcp_buf_max
-  assert_not_symlink "$TUNING_CONFIG"
-  capture_original_managed_file "$TUNING_CONFIG"
-  mkdir -p "$(dirname "$TUNING_CONFIG")"
-  cat >"$TUNING_CONFIG" <<EOF
-# Managed by vps-init-suite.
-BANDWIDTH_MBPS=${TUNING_BANDWIDTH}
-RTT_MS=${TUNING_RTT}
-BUFFER_MAX=${TUNING_BUFFER_MAX}
-EOF
+  local current_ipv6="off"
+  if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
+    if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 1)" == "0" ]]; then
+      current_ipv6="on"
+    fi
+  fi
+  tune_kernel "$current_ipv6" auto "$bandwidth" "$rtt" "$tcp_buf_max" "$conn_mode"
 
-  local current_ipv6=${VPS_IPV6:-off}
-  tune_kernel "$current_ipv6" auto "$TUNING_BANDWIDTH" "$TUNING_RTT" "$TUNING_BUFFER_MAX"
-
-  # 同步开启 MSS 自动钳制与快速轮询 DNS，防止网页多图与 Telegram/LINE 媒体加载卡 99%
+  # 同步开启 MSS 自动钳制与快速轮询 DNS，防止网页多图与 Telegram/LINE 媒体加载卡顿
   setup_mss clamp
   setup_dns
 
   configure_journald_limits
-  configure_xui_service_limits 65535 "$xui_mem_limit" "$xui_gogc" "now"
+  local nofile_target=65535
+  if (( memory_mb > 1500 )); then
+    nofile_target=524288
+  fi
+  configure_xui_service_limits "$nofile_target" "$xui_mem_limit" "$xui_gogc" "now"
   install_shortcut
 
   log "============================================================"
-  log "自适应高并发调优已成功生效！(业务场景: ${scenario_name})"
-  log "• 物理内存: ${memory_mb} MB | 带宽/RTT 档位: ${TUNING_BANDWIDTH} Mbps / ${TUNING_RTT} ms"
+  log "自适应调优已成功生效！(场景: ${scenario_name})"
+  log "• 物理内存: ${memory_mb} MB | 并发模式: ${conn_mode}"
+  log "• 带宽/RTT 档位: ${TUNING_BANDWIDTH} Mbps / ${TUNING_RTT} ms"
   log "• TCP 缓冲上限: $((TUNING_BUFFER_MAX / 1048576)) MB (${TUNING_BUFFER_MAX} 字节)"
-  log "• UDP/QUIC 默认缓冲: $(sysctl -n net.core.rmem_default 2>/dev/null || echo 262144) 字节（HTTP/3 图片/IM 加速）"
-  log "• 内核 TCP 协议栈全局硬上限: $(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo '16384 32768 65536') 页"
-  log "• 临时端口范围: 1024 65535 | 监听与SYN队列: $(sysctl -n net.core.somaxconn 2>/dev/null || echo 4096) / $(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo 4096)"
-  log "• x-ui Go 内存限制: ${xui_mem_limit} (GOGC: ${xui_gogc}, madvdontneed=1)"
-  log "• x-ui 文件句柄与进程限制: 65535"
-  log "• 日志与解析: journald 上限 30MB + 1秒快速轮询 DNS + MSS 自动钳制"
+  log "• TCP 初始读写缓冲: $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $2}') 字节 | UDP/QUIC 默认: $(sysctl -n net.core.rmem_default 2>/dev/null || echo 262144) 字节"
+  log "• 内核 TCP 协议栈全局硬上限: $(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo 'unavailable') 页"
+  log "• x-ui Go 内存限制: ${xui_mem_limit} (GOGC: ${xui_gogc}) | 句柄上限: ${nofile_target}"
+  log "• 体验增强: 1秒快速轮询 DNS + MSS 自动钳制 + journald 30MB 封顶"
   log "============================================================"
   show_status
 }
@@ -1309,8 +1408,14 @@ configure_xui_service_limits() {
     return 0
   fi
 
-  local memory_mb
+  local memory_mb oom_score
   memory_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || echo 1024)
+  if (( memory_mb <= 1500 )); then
+    # 1GB 及以下小内存给 -300：优先保活 x-ui，但极端内存耗尽时不反杀 SSH 导致失联
+    oom_score="-300"
+  else
+    oom_score="-900"
+  fi
   if [[ -z "$gomemlimit" ]]; then
     if (( memory_mb <= 600 )); then
       gomemlimit="180MiB"
@@ -1338,7 +1443,7 @@ configure_xui_service_limits() {
 [Service]
 LimitNOFILE=${file_limit}
 LimitNPROC=${file_limit}
-OOMScoreAdjust=-900
+OOMScoreAdjust=${oom_score}
 Environment="GOMEMLIMIT=${gomemlimit}"
 Environment="GOGC=${gogc}"
 Environment="GODEBUG=madvdontneed=1"
@@ -1351,7 +1456,7 @@ EOF
   if systemctl is-active --quiet x-ui.service; then
     if [[ "$restart_mode" == "now" ]]; then
       if systemctl restart x-ui.service; then
-        log "已平滑重启 x-ui.service，LimitNOFILE=${file_limit} 与 Go 限制 (${gomemlimit}, GOGC=${gogc}) 已生效。"
+        log "已平滑重启 x-ui.service，LimitNOFILE=${file_limit}、OOM=${oom_score} 与 Go 限制 (${gomemlimit}, GOGC=${gogc}) 已生效。"
       else
         warn "x-ui.service 重启失败，正在尝试启动服务；设置将在下次成功启动时生效。"
         systemctl start x-ui.service >/dev/null 2>&1 || true
@@ -1362,7 +1467,7 @@ EOF
       case "${answer:-n}" in
         y|Y|yes|YES)
           if systemctl restart x-ui.service; then
-            log "已为 x-ui.service 应用 LimitNOFILE=${file_limit} 与 Go 限制 (${gomemlimit}, GOGC=${gogc})。"
+            log "已为 x-ui.service 应用 LimitNOFILE=${file_limit}、OOM=${oom_score} 与 Go 限制 (${gomemlimit}, GOGC=${gogc})。"
           else
             warn "x-ui.service 重启失败，正在尝试启动服务；设置将在下次成功启动时生效。"
             systemctl start x-ui.service >/dev/null 2>&1 || true
@@ -1374,7 +1479,7 @@ EOF
       log "已为 x-ui.service 保存设置；下次重启面板服务后生效。"
     fi
   else
-    log "已为 x-ui.service 设置 LimitNOFILE=${file_limit} 与 Go 限制 (${gomemlimit})；服务下次启动时生效。"
+    log "已为 x-ui.service 设置 LimitNOFILE=${file_limit}、OOM=${oom_score} 与 Go 限制 (${gomemlimit})；服务下次启动时生效。"
   fi
 }
 
@@ -2340,7 +2445,7 @@ install_shortcut() {
 
 full_init() {
   local timezone=${1:-${VPS_TIMEZONE:-auto}}
-  local ipv6_mode=${2:-${VPS_IPV6:-off}}
+  local ipv6_mode=${2:-${VPS_IPV6:-}}
   local conntrack_mode=${3:-${VPS_CONNTRACK:-auto}}
   local bandwidth=${4:-${VPS_BANDWIDTH_MBPS:-}}
   local rtt=${5:-${VPS_RTT_MS:-}}
@@ -2413,10 +2518,10 @@ Commands:
                            Apply BBR, FQ, TCP, and BDP-sized buffers
   ipv6 [on|off]            Enable or disable IPv6 forwarding (default: off)
   conntrack [auto|on|off]  Select conntrack for NAT/firewall or proxy-only mode
-  bandwidth [Mbps|auto] [RTT_MS|auto]
-                           Save bandwidth/RTT buffer profile without changing MSS
-  high-conn [preset|custom] [bandwidth] [rtt]
-                           Apply high-concurrency profile (us/intl/cn/hk/eu or custom Mbps & RTT)
+  bandwidth [Mbps|auto] [RTT_MS|auto] [speed|high]
+                           Save bandwidth/RTT/concurrency profile without changing MSS
+  high-conn [preset|Mbps] [Mbps] [RTT_MS] [speed|high]
+                           Adaptive tuning (us/intl/cn/hk/eu/custom; speed=拉满单线, high=3000高并发防爆)
   mss [clamp|dual-fixed|1200..1460] Persist MSS policy (default: clamp)
   swap                     Create managed 1/2 GiB swap if none exists
   timezone [auto|keep|ZONE] Detect, retain, or set an IANA timezone
@@ -2466,10 +2571,10 @@ menu() {
 11. 关闭 IPv6 转发
 12. 卸载 vps-init-suite（保留 SWAP）
 13. 3X-UI / Xray 连接策略
-14. 手动设置/修改带宽与 RTT
+14. 手动设置/修改带宽、RTT 与并发模式
 15. 网络/CPU 诊断
 16. 优化快速轮询 DNS（1.1.1.1 / 8.8.8.8 / 9.9.9.9）
-17. 自适应高并发专属调优 (Swap + TCP/UDP + Go/x-ui 防爆 + DNS + MSS)
+17. 自适应调优 (按带宽/延迟/并发分档 + Swap + x-ui防爆 + DNS + MSS)
 18. 退出（也可输入 0）
 EOF
     read -r -p "请选择 [0-18]: " choice < "$tty_in" || return 0
@@ -2518,10 +2623,10 @@ select_menu() {
       " 12. 卸载套件（保留 SWAP）" \
       " 13. 卸载套件并删除受管 SWAP" \
       " 14. 3X-UI / Xray 连接策略" \
-      " 15. 手动设置/修改带宽与 RTT" \
+      " 15. 手动设置/修改带宽、RTT 与并发模式" \
       " 16. 网络/CPU 诊断" \
       " 17. 优化快速轮询 DNS（1.1.1.1 / 8.8.8.8 / 9.9.9.9）" \
-      " 18. 自适应高并发专属调优 (Swap + TCP/UDP + Go/x-ui 防爆 + DNS + MSS)" \
+      " 18. 自适应调优 (按带宽/延迟/并发分档 + Swap + x-ui防爆 + DNS + MSS)" \
       "  0. 退出"
     read -r -p "请选择 [0-18]: " choice < "$tty_in" || return 0
     case "$choice" in
@@ -2554,12 +2659,12 @@ main() {
     reexec_as_root "$@"
   fi
   case "${1:-menu}" in
-    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" "${3:-${VPS_IPV6:-off}}" "${4:-${VPS_CONNTRACK:-auto}}" "${5:-${VPS_BANDWIDTH_MBPS:-}}" "${6:-${VPS_RTT_MS:-}}" ;;
-    kernel) tune_kernel "${2:-${VPS_IPV6:-off}}" "${3:-${VPS_CONNTRACK:-auto}}" "${4:-${VPS_BANDWIDTH_MBPS:-}}" "${5:-${VPS_RTT_MS:-}}" ;;
-    ipv6) tune_kernel "${2:-off}" ;;
-    conntrack) tune_kernel "${VPS_IPV6:-off}" "${2:-auto}" ;;
-    bandwidth) configure_bandwidth_profile "${2:-}" "${3:-}" ;;
-    high-conn|highconn|conn|1g-high-conn) tune_high_concurrency "${2:-}" "${3:-}" "${4:-}" ;;
+    full) full_init "${2:-${VPS_TIMEZONE:-auto}}" "${3:-${VPS_IPV6:-}}" "${4:-${VPS_CONNTRACK:-auto}}" "${5:-${VPS_BANDWIDTH_MBPS:-}}" "${6:-${VPS_RTT_MS:-}}" ;;
+    kernel) tune_kernel "${2:-${VPS_IPV6:-}}" "${3:-${VPS_CONNTRACK:-auto}}" "${4:-${VPS_BANDWIDTH_MBPS:-}}" "${5:-${VPS_RTT_MS:-}}" ;;
+    ipv6) tune_kernel "${2:-}" ;;
+    conntrack) tune_kernel "${VPS_IPV6:-}" "${2:-auto}" ;;
+    bandwidth) configure_bandwidth_profile "${2:-}" "${3:-}" "${4:-}" ;;
+    high-conn|highconn|conn|1g-high-conn) tune_high_concurrency "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
     mss) setup_mss "${2:-clamp}" ;;
     swap) setup_swap ;;
     timezone) setup_timezone "${2:-auto}" ;;
@@ -2582,3 +2687,4 @@ main() {
 if [[ "${BASH_SOURCE[0]:-}" == "$0" || -z "${BASH_SOURCE[0]:-}" ]]; then
   main "$@"
 fi
+

@@ -6,14 +6,28 @@
 
 ## 🚀 一键执行命令（复制粘贴即可）
 
-### 方式一：交互式菜单（小白推荐）
-登录 VPS 终端（`root` 权限）后直接粘贴执行，弹出菜单输入 **`1`** 并回车：
+### 方式一：交互式自适应调优（推荐）
+登录 VPS 终端（`root` 权限）后直接粘贴执行，自动探测硬件规格，并引导输入带宽、延迟与并发档位：
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh)
 ```
 
-### 方式二：全自动静默执行（批量装机推荐）
-无需按键确认，自动完成全部 6 项深度调优并打印自检报告：
+### 方式二：直接传参极速执行（适合特定节点）
+* **美西 500M/1G 低中并发（解除 4MB 限制，单线程拉满 500M，视频秒开）：**
+  ```bash
+  bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) 500 160 1
+  ```
+* **美国/日本国际落地千兆机（海外互联 RTT 30ms，拉满千兆）：**
+  ```bash
+  bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) 1000 30 1
+  ```
+* **亚太/日本直连多人高并发（1000-3000+ 连接，严控 2M/4M 防爆 CPU 与内存）：**
+  ```bash
+  bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) 200 40 2
+  ```
+
+### 方式三：全自动静默执行（批量装机）
+无需按键确认，按默认美西 500M 极速档完成全部调优并打印自检报告：
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) --auto
 ```
@@ -69,13 +83,20 @@ VPS 跑完调优后，按以下 4 项收尾即可把整条链路的稳定性与�
 
 ---
 
-## ⚙️ 进阶命令（Suite 专业版 `setup.sh`）
+## ⚙️ 进阶命令（Suite 专业管理版 `setup.sh` v1.19.0）
 
-仓库同时保留了完整的模块化管理套件 `setup.sh`（提供交互状态面板、精确 BDP 计算、时区与连接策略调优）：
+仓库同时提供完整的模块化管理套件 `setup.sh`（支持 `vps-init` 全局快捷命令、精确 BDP 计算、时区与连接策略调优）：
 
 ```bash
-# 运行完整专业版套件
-curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh | bash -s high-conn
-# 查看系统状态面板
+# 1. 美西 1G 内存 + 500M 带宽（自动放开至 16MB 缓冲上限 + 320MB 硬顶，单线程拉满）
+curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh" | bash -s high-conn us 500 160 speed
+
+# 2. 国际千兆落地机（1000M 带宽 / 30ms 延迟 / speed 极速模式）
+curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh" | bash -s high-conn intl 1000 30 speed
+
+# 3. 亚太优化多人高并发（200M / 40ms / high 模式，严格 2M/4M 封顶防爆 CPU）
+curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh" | bash -s high-conn cn 200 40 high
+
+# 4. 交互式选择与查看系统状态
 vps-init status
 ```
