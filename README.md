@@ -1,246 +1,81 @@
-# VPS Initialization & Kernel Tuning Suite
+# vps-init-suite
 
-面向 Debian/Ubuntu VPS 的纯净初始化工具，专注系统底座、跨洋 TCP、MSS、时区和 SWAP，不安装任何代理面板。
+专为 **3x-ui / Xray 代理与多级中转服务器** 打造的一键稳定性与速度深度调优套件。**全程不开启系统防火墙**，不拦截任何业务或转发端口，开箱即用。
 
-## 功能
+---
 
-- 持久启用 BBR、FQ，并默认关闭 TCP Fast Open（值为 `0`，降低特殊线路上的握手兼容性风险）。
-- 根据用户输入的标称带宽和典型 RTT，按约 1.5 倍 BDP 计算 TCP 缓冲上限，再按物理内存设置安全天花板；不把 1C1G 当成唯一硬编码机型。
-- 交互输入带宽/RTT 时逐项询问：每项先校验并显示确认值，再出现下一项；范围错误会留在当前项重新输入，避免两个提示挤在一行造成误解。
-- 默认使用保守的 `100 Mbps / 160 ms` 档；缓冲上限受动态物理内存天花板约束（约每 128 MiB RAM 放宽 1 MiB，上限 64 MiB），并将 BDP 结果向上取 4/8/16/32/64 MiB 档。例如约 1 GiB 机器输入 200 Mbps、160-200 ms RTT 时可使用 8 MiB。TCP 缓冲按需增长，不会启动时预分配全部上限；但大量同时高速传输的活跃连接仍可能提高内核内存占用，应结合 `vps-init diagnose` 及 `free -h` 观察。
-- 面向代理节点深度防断流与防积压：设置 `tcp_slow_start_after_idle=0`（连接空闲后不折叠拥塞窗口，消除网页浏览或短暂静默后的 1~2 秒卡顿感）；启用 `tcp_notsent_lowat=16384`（将未发送队列上限限制为 16KB，从内核层面遏制 bufferbloat 与高延迟峰值，显著改善软银、Lumen 及跨洋晚高峰丢包与抖动）；配置 `tcp_retries2=8`（死链超时缩短至约 30 秒，遭遇线路丢包或阻断时客户端能秒级感知并快速故障切换）；设置 `tcp_reordering=6` 与 `tcp_frto=2`（容忍跨洋多路径偶发乱序，启用 F-RTO 规避虚假重传）；配置 `tcp_no_metrics_save=1`（关闭历史路由指标缓存，避免偶发丢包污染后续连接）。
-- 自动检测 QEMU / KVM / Proxmox VE 虚拟机环境：在 `/etc/default/grub.d/` 写入独立引导配置注入 `reboot=pci` 并更新 GRUB，彻底根治 PVE 宿主机下软重启黑屏卡死挂起、必须手动强制重置的问题。
-- 连接跟踪（conntrack）默认自动判断：有 NAT/状态防火墙才启用，纯 Xray 代理默认不主动加载，减少每包开销。
-- 通过发行版原生 `systemd-sysctl` 加载项目自己的 sysctl 文件，避免额外服务参与开机网络依赖。
-- 写入后立即回读并验证 BBR、FQ、Fast Open、收发缓冲上限和转发状态；若运行时值与目标不符会明确报错，不再只凭配置文件写入成功判断完成。
-- 开启 IPv4 转发；IPv6 转发由用户选择，默认关闭，同时保留普通 IPv6 主机连接能力。
-- 支持 `clamp-to-PMTU` 或固定值 MSS，默认只作用于 `FORWARD` 转发流量，不改写本机 SSH/Xray 等 `OUTPUT` 握手。
-- 无现有 SWAP 时，根据内存自动创建 2 GiB 或 4 GiB SWAP，设置 `swappiness=10`。
-- 通过三个 HTTPS 地理服务依次探测公网出口时区，并启用网络时间同步。
-- 优先使用发行版自带 `systemd-timesyncd`；只有该服务不可用时才安装 chrony，重启后执行一次 `chronyc makestep` 立即校准。校时失败只提示，不阻断开机。
-- MSS 安装后会分别核对 IPv4/IPv6 的 MSS 规则及 `FORWARD` 挂载点，不把“私有链存在”误报为规则已生效；不支持的 IPv6 规则只告警，不阻断 IPv4 调优。
-- 可选彻底清理 3X-UI 服务及已知数据目录。
-- 可选安全调整 3X-UI 的 Xray `policy.levels[0]`：先停面板、备份 SQLite、修改后校验并重启，失败时保留备份并尝试恢复。
-- 完整初始化后安装 `vps-init` 快捷命令，随时打开中文菜单或执行子命令；如果检测到 3X-UI，会在初始化结束时询问是否立即打开 policy 菜单。
-- 提供首次安装、已安装机器交互选择、保留 SWAP 卸载和显式删除受管 SWAP。
+## 🚀 一键执行命令（复制粘贴即可）
 
-## 支持系统
-
-- Debian 11/12 及更新版本
-- Ubuntu 20.04/22.04/24.04 及更新版本
-- systemd、Linux 内核 BBR 支持
-
-## 傻瓜式一键安装（推荐）
-
-在 VPS 的 SSH 终端中，整行复制执行。脚本会先下载到临时文件、检查 Bash 语法，再开始初始化；root 会直接运行，普通用户会自动通过 `sudo` 提权。新机器首次初始化时，如果没有已保存的带宽/RTT 档位，会在安装依赖和修改系统配置前逐项询问；确认一项后才询问下一项。
-
+### 方式一：交互式菜单（小白推荐）
+登录 VPS 终端（`root` 权限）后直接粘贴执行，弹出菜单输入 **`1`** 并回车：
 ```bash
-( f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)" -o "$f" && bash -n "$f" && if [ "$(id -u)" -eq 0 ]; then bash "$f" full; else sudo bash "$f" full; fi )
+bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh)
 ```
 
-如果当前提示符是 `root@主机`，不需要也不要加 `sudo`；上面的一键命令会自动识别。普通用户需要系统已安装 `sudo`，否则请先切换到 root 再运行。`less` 不是安装依赖。
-
-不建议使用 `curl ... | bash`：初始化需要交互读取带宽、RTT 等输入，管道可能占用标准输入，让提示无法正常接收答案。
-
-想先查看脚本再执行时，可用下面的分步方式（每行单独执行）：
-
+### 方式二：全自动静默执行（批量装机推荐）
+无需按键确认，自动完成全部 6 项深度调优并打印自检报告：
 ```bash
-curl -fsSL -o setup.sh "https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh?cache=$(date +%s)"
-sed -n '1,260p' setup.sh
-bash -n setup.sh
-chmod +x setup.sh
-./setup.sh full       # 当前是 root
-# 普通用户则运行：sudo ./setup.sh full
+bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) --auto
 ```
 
-如果下载文件开头是 `<html>` 或 Bash 语法检查失败，不要运行该文件。
+> **提示：** 若精简版系统提示 `curl: command not found`，可用 `wget` 替代：
+> ```bash
+> bash <(wget -qO- https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) --auto
+> ```
 
-初始化成功后可直接使用快捷命令（菜单已汉化）：
+---
+
+## 📋 新手使用三步走
+
+1. **切换 root 权限：** SSH 登录 VPS 后执行 `sudo -i`，确认命令行前缀变为 `root@...`（已是 `root@` 开头可跳过）。
+2. **运行一键命令：** 复制上方任意一条命令粘贴到终端按回车，等待约 20–40 秒自动完成。
+3. **核对自检结果：** 屏幕末尾输出 5 项绿色 **`[PASS]`** 状态即代表全部优化生效。
+
+---
+
+## ✨ 自动完成的 6 项深度优化（无防火墙干扰）
+
+* **自动屏蔽残废 IPv6：** 实测 IPv6 公网出口，若不通则自动禁用内核 IPv6，消除刷图与测速时白等 3.6 秒超时的卡顿与重置。
+* **BBR + 32MB 大缓冲 + 零空闲重置：** 启用 `fq + bbr`，关闭 `tcp_slow_start_after_idle` 防止停顿后网速掉回慢启动，拉满跨洋高延迟首屏速度。
+* **TCP MSS 1380 持久化钳制：** 仅在 `mangle` 表优化封包尺寸防止多层代理隧道大包丢弃，不开启防火墙、不拦截任何端口。
+* **百万级文件句柄与连接追踪扩容：** 将 `nofile` 拉高至 `1048576`、加速 `TIME_WAIT` 端口复用，防止高并发与 XHTTP 分片断流。
+* **2GB Swap + `x-ui` 防崩溃守护：** 自动创建 2GB 虚拟内存（`swappiness=10`），并为 `x-ui` 注入 `OOMScoreAdjust=-900` 与秒级自启保护。
+* **Chrony 毫秒级校时 + 日志封顶：** 自动同步 NTP 时间（防止 REALITY / TLS 1.3 时间偏差握手失败），系统日志封顶 100MB 并每日凌晨自动清理。
+
+---
+
+## 💻 支持系统
+
+* Debian 12 / Debian 13（推荐）
+* Ubuntu 22.04 / Ubuntu 24.04
+* RHEL / Rocky / AlmaLinux 8 / 9
+
+---
+
+## 🛠️ 3x-ui 面板与客户端（v2rayN）配套落地清单
+
+VPS 跑完调优后，按以下 4 项收尾即可把整条链路的稳定性与速度拉满：
+
+1. **3x-ui 出站强制走 IPv4：** 进入 **Xray 配置 → 出站规则（Outbounds）**，确保 `direct`（`freedom`）出站的 `domainStrategy` 为 **`UseIPv4`**，避免任何潜在的 IPv6 绕路。
+2. **双协议组合 + 加密中转：**
+   * **主力节点：** `VLESS + xtls-rprx-vision + REALITY`（高位冷门端口、选用本地 TLS 握手 `< 15ms` 的 `dest`/`SNI`）。
+   * **保底节点：** `VLESS + XHTTP + TLS`（走 Cloudflare 固定冷门优选 IP，如 `172.64.229.107` 与 `172.64.229.11`，在 CF WAF 为 `/xhttp_stream` 添加 `Skip` 放行规则）。
+   * **多级中转铁律：** 跨墙转发链路段严禁使用明文 `socks` 协议，统一改为 `VLESS + REALITY` 或 `Shadowsocks-2022` 加密对接。
+3. **v2rayN 客户端 3 项必配：**
+   * **参数设置 → Core 基础设置：** 取消勾选 **启用 Mux 多路复用**。
+   * **路由设置 → 阻止（Block）：** 拦截端口 `443`、网络 `udp`（禁用 QUIC 避免刷图卡顿回退）。
+   * **XHTTP 节点保活：** 在节点 `extra` 参数中保留 `"xmux":{"hKeepAlivePeriod":30}`，防止空闲 100 秒被 Cloudflare 断开底层连接。
+4. **已误开防火墙的机器清理：** 若此前在机器上跑过带防火墙的旧版脚本，执行一次 `ufw disable 2>/dev/null; systemctl disable --now firewalld 2>/dev/null` 即可彻底恢复无防火墙状态。
+
+---
+
+## ⚙️ 进阶命令（Suite 专业版 `setup.sh`）
+
+仓库同时保留了完整的模块化管理套件 `setup.sh`（提供交互状态面板、精确 BDP 计算、时区与连接策略调优）：
 
 ```bash
-vps-init
+# 运行完整专业版套件
+curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/setup.sh | bash -s high-conn
+# 查看系统状态面板
 vps-init status
-vps-init ipv6 on
 ```
-
-带宽和 RTT 不会自动识别或测速。首次交互式初始化且没有已保存档位时，会询问 VPS 套餐标称带宽（Mbps）和代理用户到节点的典型 RTT（毫秒），用于估算单流 BDP 缓冲；输入的是线路/套餐信息，不是一次测速结果。无法交互时使用 `100 Mbps / 160 ms` 保守档。已有档位会直接复用；需要更改时运行 `vps-init`，选择“手动设置/修改带宽与 RTT”，或执行 `vps-init bandwidth`。
-
-不带参数直接输入 `vps-init` 会打开操作菜单，菜单中包含完整初始化、升级脚本、安装/修复快捷命令、开启/禁用 IPv6 转发、3X-UI policy 和卸载套件等选项。这里的“禁用 IPv6”仅关闭内核转发，不会关闭本机 IPv6 出站；也可以直接运行 `vps-init upgrade`、`vps-init install` 或 `vps-init uninstall`。
-
-如果安装了 3X-UI，完整初始化结束时会提示是否打开 `3X-UI / Xray 连接策略` 菜单；也可以随时执行 `vps-init xui-policy`。首次进入会按需安装 Python 辅助程序。
-
-代理节点建议在内核调优后单独执行：
-
-```bash
-vps-init kernel off       # IPv6 转发按需选择 on/off
-vps-init mss clamp       # 推荐按路径 MTU 自动钳制，不固定 1380
-vps-init xui-policy stable
-vps-init diagnose        # CPU、软中断、TCP 重传、conntrack 诊断
-vps-init bandwidth 200 160 # 按 200 Mbps、160 ms 重新计算并立即应用缓冲
-```
-
-`kernel` 只更新项目自己的 `/etc/sysctl.d/99-vps-init-suite.conf`，不会覆盖 `/etc/sysctl.conf` 或删除其他防火墙规则。检测到 3X-UI 时会写入独立的 `x-ui.service.d/90-vps-init-suite.conf`；文件句柄上限在下次重启 `x-ui.service` 后生效。MSS 规则使用项目专用链，支持 VLESS Reality、SOCKS5 和 UDP，不会清空用户现有规则。
-
-### 高并发与小内存自适应调优（high-conn）
-
-针对高并发（如 3,000+ 连接）代理节点，提供三合一自适应防爆引擎，支持多种业务线路场景预设：
-
-```bash
-# 1. 交互式选择场景（在终端中弹出菜单选择 1~5）
-vps-init high-conn
-
-# 2. 或直接指定线路预设与自定义带宽（支持直接传参）：
-vps-init high-conn us 200 160 # 美国 200M 带宽 / 160ms 延迟（自动精准分配 4MB 缓冲）
-vps-init high-conn intl       # 日本/亚太国际互联（纯海外中转/国际落地，1000M/30ms 跑满千兆极速）
-vps-init high-conn cn         # 亚太优化直连国内（面向国内直连，200M/40ms 兼顾 3000 并发防爆）
-vps-init high-conn us         # 美西跨洋千兆大带宽（1000M/160ms 跨太平洋大口子）
-vps-init high-conn eu         # 欧洲长途跨洋（500M/200ms）
-```
-
-- **业务场景精准适配**：
-  - `intl` (国际互联)：针对纯海外中转、国际落地、节点间对接，无 GFW 丢包，单流缓冲放宽至 8MB~16MB，单连接直接跑满 1Gbps+ 千兆；
-  - `cn` (直连国内)：针对日本/香港直连中国大陆，收紧单流缓冲至 2MB，3,000 并发底噪极小，彻底杜绝爆内存；
-  - `us` (美西大口子)：针对跨太平洋高延迟千兆线路，兼顾单流极速与突发流量防封。
-- **自适应 Swap 守护**：若无 Swap 且物理内存 ≤ 3.5GB，按磁盘余量自适应分配 1~2 GiB Swap 并配置 `swappiness=10` 与 `nofail` 引导保护；容器或已有 Swap 机器自动跳过。
-- **内核 TCP 协议栈收敛**：低内存机型初始读写缓冲收紧至 16 KB（原 64 KB，底噪内存节约 75%），全局 TCP 内存硬上限锁定 256 MB，避免高并发流量突发挤爆物理内存。
-- **Go 运行时智能限额**：为 `x-ui` 注入 `GOMEMLIMIT=350MiB`、`GOGC=75` 与 `GODEBUG=madvdontneed=1`，彻底消除 Go 频繁 GC 引起的 90% CPU 尖峰，并强制将闲置内存立即归还系统，面板内存占用即时下降。
-- **日志防膨胀**：锁定 `systemd-journald` 最大内存/磁盘占用至 30MB，避免系统日志长期驻留挤占 RAM。
-
-快捷命令可直接由普通用户调用；需要改动系统的子命令会自动请求一次 `sudo`，无需手动重复输入 `sudo`。常规只读的 `status`、`version`、`help` 不需要 root；`xui-policy` 还要读取通常仅 root 可读的 3X-UI 数据库，因此会自动请求 root。若当前用户不是 root 且系统没有安装 `sudo`，请先切换到 root，或安装 sudo。
-
-## 已安装机器：选择操作或卸载
-
-旧版本先刷新脚本，再打开新菜单：
-
-```bash
-vps-init update
-vps-init select
-```
-
-交互式选择操作：
-
-```bash
-vps-init select
-```
-
-直接卸载本套件（会要求输入确认短语）：
-
-```bash
-vps-init uninstall
-```
-
-卸载默认保留 SWAP。只有确定要删除本套件创建的 SWAP 时才使用：
-
-```bash
-vps-init uninstall --remove-swap
-```
-
-如果受管 SWAP 正在使用，脚本会拒绝删除，避免关闭活跃 swap 造成低内存 VPS OOM；对旧版本留下、无法证明归属的同名 swap 文件也会拒绝删除。卸载会移除本项目的 sysctl/systemd/MSS 规则和快捷命令，并尝试恢复此前备份的 sysctl 碎片及首次安装时记录的运行时 sysctl 值；备份目录 `/var/lib/vps-init-suite/backups/` 会保留。对于升级前已安装的旧版本，原始运行时值从未记录，脚本不会猜测，卸载时会提示重启以加载还原后的配置。系统时间和已安装依赖包不会自动回滚。卸载后建议重启并检查网络转发状态。
-
-需要交互式菜单：
-
-```bash
-./setup.sh menu                 # 当前是 root
-# 普通用户使用：sudo ./setup.sh menu
-```
-
-## 命令
-
-| 命令 | 说明 |
-| --- | --- |
-| `sudo ./setup.sh full` | 完整初始化；首次交互运行且没有已保存档位时，先询问带宽/RTT；IPv6 默认关闭，conntrack 自动判断 |
-| `sudo ./setup.sh full auto on off 200 160` | 完整初始化并开启 IPv6、关闭 conntrack，按 200 Mbps/160 ms 计算缓冲 |
-| `sudo ./setup.sh full Asia/Tokyo off on 500 160` | 完整初始化并关闭 IPv6、开启 conntrack，按 500 Mbps/160 ms 计算缓冲 |
-| `sudo ./setup.sh kernel on auto 200 160` | 仅应用内核参数并开启 IPv6，按带宽/RTT 计算缓冲 |
-| `sudo ./setup.sh ipv6 off` | 关闭 IPv6 转发（默认策略） |
-| `sudo ./setup.sh conntrack off` | 纯代理节点不主动加载 conntrack |
-| `sudo ./setup.sh conntrack on` | VPS 做 NAT/转发或使用状态防火墙时启用 conntrack |
-| `sudo ./setup.sh conntrack auto` | 根据现有 iptables/nat 规则自动选择（默认） |
-| `sudo ./setup.sh bandwidth` | 逐项手动输入并保存带宽/RTT，立即应用新的缓冲档 |
-| `sudo ./setup.sh bandwidth 200 160` | 保存并立即应用 200 Mbps、160 ms 的 BDP 缓冲档 |
-| `sudo ./setup.sh bandwidth auto auto` | 使用保守默认 100 Mbps、160 ms 档 |
-| `vps-init diagnose` | 查看 Xray、ksoftirqd、CPU steal、TCP 重传、队列和 conntrack 计数 |
-| `vps-init` 菜单中的“手动设置/修改带宽与 RTT” | 随时录入或更新带宽/延迟档位；不是自动测速 |
-| `vps-init` 菜单中的“禁用 IPv6 转发” | 关闭 IPv6 forwarding，保留普通 IPv6 出站 |
-| `sudo ./setup.sh mss clamp` | 使用路径 MTU 自动钳制 MSS（默认） |
-| `sudo ./setup.sh mss 1380` | 将 MSS 固定为 1380，可使用 1200-1460 |
-| `sudo ./setup.sh mss dual-fixed` | IPv4 固定 1380、IPv6 固定 1340 |
-| `sudo ./setup.sh swap` | 无现有 SWAP 时创建受管 SWAP |
-| `sudo ./setup.sh timezone auto` | 自动探测时区并启用网络时间同步 |
-| `sudo ./setup.sh timezone America/Los_Angeles` | 手动指定 IANA 时区 |
-| `sudo ./setup.sh timezone keep` | 保留当前时区，仅启用网络时间同步 |
-| `sudo ./setup.sh install` | 单独安装或刷新 `vps-init` 快捷命令 |
-| `vps-init upgrade` | 下载并安装最新脚本版本 |
-| `vps-init select` | 已安装机器打开操作选择器 |
-| `vps-init uninstall` | 卸载本套件，默认保留 SWAP |
-| `vps-init uninstall --remove-swap` | 卸载并删除空闲的本套件 SWAP |
-| `./setup.sh status` | 查看当前状态 |
-| `vps-init xui-policy status` | 查看 3X-UI Xray policy（只读） |
-| `vps-init xui-policy stable` | 设置稳定长连接档：`connIdle=300`、`uplinkOnly=2`、`downlinkOnly=5`、`handshake=4` |
-| `vps-init xui-policy high-concurrency` | 设置 1G 高并发档：`connIdle=120`、`uplinkOnly=2`、`downlinkOnly=5`、`handshake=4` |
-| `vps-init xui-policy set 120 2 5 4` | 交互确认后设置自定义 policy 值（支持握手超时） |
-| `vps-init xui-policy restore` | 交互确认后恢复最近一次已验证的 policy 备份 |
-| `sudo ./setup.sh uninstall-3xui` | 交互确认后清理 3X-UI |
-| `sudo ./setup.sh update` | 更新仓库或下载最新脚本 |
-
-## 设计与安全说明
-
-- 项目只写入带 `vps-init-suite` 名称的 sysctl、systemd、SWAP 和 iptables 资源，不删除第三方调优文件。
-- 对附件中列出的已知历史 sysctl 碎片会先备份到 `/var/lib/vps-init-suite/backups/`，再删除，避免被旧脚本覆盖；不会覆盖 `/etc/sysctl.conf`。
-- 缓冲上限按 `BDP = 带宽(Mbps) × 125 × RTT(ms)` 估算，并使用约 1.5 倍 BDP 后向上取 4/8/16/32/64 MiB 档；物理内存天花板按 `ceil(物理内存 MiB / 128)` 动态计算，最低 4 MiB、最高 64 MiB。若线路需求超过天花板，脚本会明确警告而不是盲目放大。
-- `rmem_default/wmem_default` 仍按内存档保持较小的 64 KiB 或 256 KiB；它们是初始值，不是每条连接预分配的最大缓冲。多连接代理不会因为较高的 `rmem_max/wmem_max` 上限而在启动时按连接数预分配内存；但很多连接同时跑满带宽时，实际内存仍会随活跃 socket 缓冲增长。
-- 低内存档的监听队列为 `somaxconn=8192`、`tcp_max_syn_backlog=4096`、`netdev_max_backlog=8192`；标准档提升到 `somaxconn=16384`、`tcp_max_syn_backlog=8192`、`netdev_max_backlog=16384`，不是无限增大；若 `ListenOverflows` 持续增长，应优先检查应用监听 backlog、CPU steal 和上游连接突发。
-- 两档 TCP keepalive 均采用 `300/15/3`，减少代理节点上大量空闲长连接的定时器开销；应用层心跳和 NAT 超时可能需要独立调整，内核 keepalive 不替代 Xray/3X-UI 的连接策略。
-- `tcp_slow_start_after_idle=0` 保持空闲连接的拥塞窗口不回退，消除间歇性网页浏览与长连接唤醒时的断流感；配合 `tcp_notsent_lowat=16384` 限制未发送数据积压，有效平抑跨洋线路上因大缓冲突发造成的延迟激增（Bufferbloat）。`tcp_mtu_probing=1` 只在检测到 PMTU 黑洞时探测，不改变 UDP，也不替代 MSS `clamp-to-PMTU`。
-- 自动识别 QEMU/KVM 虚拟化环境并注入 `reboot=pci` 引导参数，解决 Proxmox VE (PVE) 等宿主机软重启卡死黑屏问题；卸载套件时会自动清理该配置文件并重新生成 GRUB。
-- IPv6 默认关闭（`off`）并彻底禁用 IPv6 协议栈（`disable_ipv6=1`），杜绝跨国公网因缺乏 IPv6 优质路由而引发的假死黑洞（防止 YouTube 4K 播放转圈及连接超时）；选择 `on` 时完整开启协议栈与转发。
-- 自动将默认路由初始发包窗口提升为 `initcwnd 64 initrwnd 64` 并将主网卡发送队列深度提升为 `txqueuelen 5000`（开机持久化），首个 RTT 即可直发 90KB 数据并消除高突发大视频拉取时的驱动级丢包，大幅提升网页与社交媒体首屏加载速度。
-- 引入 `net.ipv4.tcp_adv_win_scale=2` 与 `net.ipv4.tcp_base_mss=1024`，消除跨洋长肥管道 `rwnd_limited` 窗口堵塞，并锁定 MTU 探测保底基准包，防止暴跌至 512 碎包引发恶性限速。
-- `net.ipv4.tcp_fastopen=2` 默认采用安全服务端模式：客户端连入享受 0-RTT 握手省 160ms 往返，出站连接外部目标网站走标准握手，彻底杜绝目标 CDN 丢包罚站。
-- 提供 `vps-init dns` 命令一键写入全球纯净高并发快速轮询 IPv4 DNS（`1.1.1.1` / `8.8.8.8` / `9.9.9.9`，配置 `timeout:1 attempts:2 rotate single-request-reopen`），彻底消灭海外 CDN 域名解析卡顿、首屏白屏转圈与图片加载失败。
-- `nf_conntrack` 默认使用 `auto`：检测到现有 NAT 或 conntrack/state 防火墙规则才加载并配置；纯 Xray/VLESS/Reality/SOCKS 代理不主动加载。需要 NAT、iptables 状态匹配或复杂转发时用 `vps-init conntrack on`。启用时 established 超时优化为 3600 秒（1 小时防爆表）；如果仅代理且 `conntrack_count` 不断增长，应优先关闭它而不是继续扩大表。
-- MSS 规则会分别探测 IPv4/IPv6 的 `mangle` 表；默认只挂载到 `FORWARD`，避免影响本机发起或回复的 SSH/Xray 握手。MSS 通过开机后 30 秒触发的 timer 延迟应用，不参与网络就绪链，服务设置 20 秒启动超时。受限容器或不支持该表的 VPS 会跳过 MSS 并继续完成其余初始化。
-- 快捷入口为 `/usr/local/bin/vps-init`，实际脚本保存在 `/usr/local/lib/vps-init-suite/setup.sh`。
-- 时区探测依次查询 `ipwho.is`、`ipinfo.io` 和 `ipapi.co`；这些服务会看到 VPS 的公网出口 IP，但脚本不会向其发送其他机器数据。
-- 所有探测请求强制使用 HTTPS，返回值必须存在于本机 IANA 时区数据库中才会应用。
-- 无人值守模式探测失败时会保留当前时区；交互模式提供常用地区、任意 IANA 时区及保留现状选项。
-- 每次重写项目自己的 sysctl 文件前，旧版本都会备份到 `/var/lib/vps-init-suite/backups/`。
-- MSS 使用专用 `VPS_INIT_MSS` 链和注释标记，只处理 `FORWARD` 中的 TCP SYN，不保存或覆盖整套防火墙规则。
-- 升级/安装快捷命令时会迁移旧版启动配置：停用重复的 sysctl 自定义服务、将 MSS 改为开机后延迟 timer，不阻塞网络就绪，并清理本项目旧版的 `OUTPUT` MSS 挂载。
-- 可选写入受管的 systemd manager drop-in，将全局服务停止等待上限设为 10 秒，减少 VPS 关机/重启时因代理连接迟迟不释放而长时间挂起；卸载时会恢复安装前的同名配置。
-- 不会执行 `iptables -F`、不会覆盖 `/etc/sysctl.conf`，也不会删除系统用于加载 `/etc/sysctl.conf` 的 `99-sysctl.conf` 软链接，也不会覆盖已有的非本项目 `x-ui.service` drop-in；同名受管文件升级前会进入备份目录。
-- 如果旧版本曾误删该系统软链接，重新执行 `vps-init kernel` 时会在目标不存在且 `/etc/sysctl.conf` 存在的情况下安全恢复；已有文件或用户软链接不会被覆盖。
-- 完整初始化默认使用 `clamp-to-PMTU`（仅 `FORWARD`）；只有明确执行 `mss dual-fixed` 才会使用 IPv4 1380 / IPv6 1340 固定值。
-- `net.ipv4.tcp_fastopen=2` 采用服务端 TFO 加速，手机与客户端连入可免除 160ms 握手，同时避免了改为 `3` 时出站向外部目标服务器握手遭骨干网丢弃的风险。
-- `net.ipv4.ip_local_port_range` 不会让临时端口抢占已监听的 SSH 端口；Linux 绑定监听端口时会进行冲突检查，因此保留宽端口池用于高并发代理连接。
-- 已存在任何活动 SWAP 时不会修改；磁盘余量不足时不会创建新文件。
-- 新建或再次配置已有受管 SWAP 时会先确保 `/etc/fstab` 末尾换行，并使用 `sw,nofail` 持久化；卸载可兼容清理旧版 `sw` 条目，避免 fstab 行粘连或异常挂载阻断开机。
-- 不修改全局 `fs.nr_open`，保留发行版默认的单进程文件句柄硬上限；3X-UI 仅通过自己的 systemd `LimitNOFILE` drop-in 单独设置。
-- 3X-UI policy 工具只支持 SQLite，默认读取 `/etc/x-ui/x-ui.db`，也会识别 `XUI_DB_FOLDER`；检测到 PostgreSQL 等其他后端时会拒绝修改。若面板还没有保存 Xray 模板，会提示先在面板设置中保存一次，而不是报不明确的数据库错误。
-- 3X-UI policy 工具只修改 `xrayTemplateConfig` 中的 `policy.levels[0]`，不会覆盖入站、出站、路由或用户数据；修改前会停止 `x-ui.service` 并创建完整性校验过的备份。
-- `connIdle` 是空闲连接超时，不是连接总生命周期；活跃流量、LINE/Telegram/WebSocket/HTTP2 心跳可能让连接继续保持。过短的 `uplinkOnly` 或 `downlinkOnly` 可能造成正常长连接重连，建议先使用稳定档。
-- policy 修改会重启 `x-ui.service`，现有代理连接可能短暂重连；若重启失败，脚本会尝试恢复之前的 policy 并重新启动服务。备份保留在 `/var/lib/vps-init-suite/backups/3xui/`。
-- 3X-UI 清理是不可逆操作，交互模式要求输入 `REMOVE`；自动化必须显式传入 `--yes`。
-- 内核不提供 BBR 时，脚本会停止并提示升级，不会伪装成成功。
-- 时区探测现在每个服务最多等待 3 秒且不重复重试；全部失败会自动保留现有时区继续，不会卡在选择提示。需要手动改时区时执行 `vps-init timezone Asia/Tokyo`。
-- `vps-init diagnose` 是只读诊断，不显示 Xray 启动参数；若 `xray` 占用高查 sniffing/QUIC/重连，若 `ksoftirqd` 占用高查 UDP 包速率、网卡丢包和 conntrack，若 `st` 高则是宿主机 steal，调内核参数无法根治。
-- `apt` 依赖会先检查已安装的软件包，已安装的包不会重复执行 `apt-get update/install`，可减少初始化等待时间。
-
-## 修改后检查
-
-项目使用 GitHub Actions 运行 ShellCheck。也可以在本地执行：
-
-```bash
-bash -n setup.sh
-shellcheck setup.sh tests/timezone_test.sh tests/profile_test.sh tests/behavior_test.sh tests/timezone_speed_test.sh
-bash tests/timezone_test.sh
-bash tests/profile_test.sh
-bash tests/behavior_test.sh
-bash tests/timezone_speed_test.sh
-python3 -m py_compile xui-policy.py tests/xui_policy_test.py
-python3 tests/xui_policy_test.py
-```
-
-## 许可证
-
-[MIT](LICENSE)

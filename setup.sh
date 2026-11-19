@@ -1338,11 +1338,12 @@ configure_xui_service_limits() {
 [Service]
 LimitNOFILE=${file_limit}
 LimitNPROC=${file_limit}
+OOMScoreAdjust=-900
 Environment="GOMEMLIMIT=${gomemlimit}"
 Environment="GOGC=${gogc}"
 Environment="GODEBUG=madvdontneed=1"
 Restart=always
-RestartSec=3s
+RestartSec=2s
 EOF
   chmod 0644 "$temporary"
   mv -f -- "$temporary" "$XUI_LIMITS_FILE"
