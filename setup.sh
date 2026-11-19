@@ -483,9 +483,12 @@ tune_kernel() {
   apt_install kmod procps
 
   if [[ -z "$requested_ipv6" ]]; then
-    requested_ipv6=${VPS_IPV6:-off}
-    if [[ "$requested_ipv6" == "off" ]]; then
-      log "默认关闭 IPv6（防假死黑洞与双栈握手卡顿）；如需启用可指定 on 或在菜单中开启。"
+    if has_working_ipv6; then
+      requested_ipv6=on
+      log "检测到本机具备正常可达的公网 IPv6，保留 IPv6 支持。"
+    else
+      requested_ipv6=off
+      log "检测到本机 IPv6 无可用公网出口或网络不可达，自动启用「防假死黑洞防护」（禁用 IPv6）。"
     fi
   fi
   ipv6_mode=$(resolve_ipv6_mode "$requested_ipv6")
