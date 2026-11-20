@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 项目名称: vps-init-suite (init.sh) - 纯净无防火墙稳定满速版 (v1.19.1)
+# 项目名称: vps-init-suite (init.sh) - 纯净无防火墙稳定满速版 (v1.19.2)
 # 适用系统: Debian 12/13, Ubuntu 22.04/24.04, RHEL/AlmaLinux/Rocky 8/9
 # 项目地址: https://github.com/jaycen-0502/vps-init-suite
 # ==============================================================================
 
 set -u
 
-readonly SCRIPT_VERSION="1.19.1"
+readonly SCRIPT_VERSION="1.19.2"
 readonly SYSCTL_TARGET="/etc/sysctl.d/99-zzz-vps-init.conf"
 readonly STATE_FILE="/etc/default/vps-init-opt"
+readonly RUNTIME_SCRIPT="/usr/local/sbin/vps-init-runtime.sh"
+readonly RUNTIME_SERVICE="/etc/systemd/system/proxy-mss.service"
 readonly XUI_DROPIN_DIR="/etc/systemd/system/x-ui.service.d"
 readonly XUI_DROPIN_FILE="${XUI_DROPIN_DIR}/99-vps-init-opt.conf"
+readonly RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
+readonly RESOLVED_DROPIN_FILE="${RESOLVED_DROPIN_DIR}/99-vps-init-dns.conf"
 readonly BACKUP_ROOT="/var/lib/vps-init-suite/backups"
 
 RED='\033[0;31m'
@@ -48,7 +52,6 @@ prompt_read() {
             raw=""
         fi
     fi
-    # 清理前后空白和回车符，防止异常终端字符污染
     raw=$(printf '%s' "$raw" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     printf -v "$var_name" '%s' "$raw"
 }
@@ -59,17 +62,19 @@ RTT_MS=160
 CONN_TIER=1
 TCP_MAX_BUF=16777216
 TCP_DEF_BUF=16384
-TCP_MEM_PAGES="24576 49152 81920"
+TCP_MEM_PAGES="20480 40960 71680"
 TCP_NOTSENT_LOWAT=16384
 BACKLOG_LIMIT=4096
 CONNTRACK_MAX=65536
 NOFILE_LIMIT=65535
-XUI_GOMEMLIMIT="350MiB"
+XUI_GOMEMLIMIT="320MiB"
 XUI_GOGC="75"
 XUI_OOM_SCORE="-300"
 JOURNAL_DISK_MAX="30M"
 JOURNAL_MEM_MAX="15M"
 PROFILE_DESC="1G-单线程极速档"
+IPV6_ENABLED=0
+DNS_MODE="resolv.conf"
 
 save_state() {
     mkdir -p "$(dirname "$STATE_FILE")"
@@ -91,6 +96,8 @@ XUI_OOM_SCORE="${XUI_OOM_SCORE}"
 JOURNAL_DISK_MAX="${JOURNAL_DISK_MAX}"
 JOURNAL_MEM_MAX="${JOURNAL_MEM_MAX}"
 PROFILE_DESC="${PROFILE_DESC}"
+IPV6_ENABLED=${IPV6_ENABLED}
+DNS_MODE="${DNS_MODE}"
 EOF
 }
 
@@ -135,6 +142,127 @@ clean_conflicting_sysctl() {
     if [[ -n "$backup_dir" ]]; then
         log_warn "已备份并清理旧版冲突 sysctl 碎片（防止参数覆盖打架），备份目录: ${backup_dir}"
     fi
+}
+
+# ==============================================================================
+# 智能 DNS 配置模块（兼容 systemd-resolved 0ms 本地缓存 & 防 DHCP 覆盖锁定）
+# ==============================================================================
+configure_smart_dns() {
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        mkdir -p "$RESOLVED_DROPIN_DIR"
+        cat << EOF > "$RESOLVED_DROPIN_FILE"
+# Managed by vps-init-suite init.sh v${SCRIPT_VERSION}
+[Resolve]
+DNS=8.8.8.8 1.1.1.1
+FallbackDNS=9.9.9.11
+DNSSEC=no
+Cache=yes
+EOF
+        systemctl restart systemd-resolved 2>/dev/null || true
+        DNS_MODE="systemd-resolved"
+        log_ok "已通过 systemd-resolved 配置就近 ECS DNS (8.8.8.8 / 1.1.1.1 / 9.9.9.11) 并开启本地缓存。"
+    else
+        if command -v chattr >/dev/null 2>&1; then
+            chattr -i /etc/resolv.conf 2>/dev/null || true
+        fi
+        if [[ -L /etc/resolv.conf ]]; then
+            local bdir="${BACKUP_ROOT}/dns-$(date +%Y%m%d-%H%M%S)"
+            mkdir -p "$bdir"
+            cp -a /etc/resolv.conf "${bdir}/resolv.conf" 2>/dev/null || true
+            rm -f -- /etc/resolv.conf
+        fi
+        cat << EOF > /etc/resolv.conf
+# Managed by vps-init-suite init.sh v${SCRIPT_VERSION}
+options timeout:1 attempts:2 single-request-reopen
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+nameserver 9.9.9.11
+EOF
+        if command -v chattr >/dev/null 2>&1 && chattr +i /etc/resolv.conf 2>/dev/null; then
+            DNS_MODE="resolv.conf-locked"
+            log_ok "已写入纯净 ECS DNS (8.8.8.8 / 1.1.1.1 / 9.9.9.11) 并锁定防 DHCP/重启覆盖。"
+        else
+            DNS_MODE="resolv.conf"
+            log_ok "已写入纯净 ECS DNS (8.8.8.8 / 1.1.1.1 / 9.9.9.11)。"
+        fi
+    fi
+}
+
+# ==============================================================================
+# 运行时网络规则持久化（IPv4 MSS 1380 + 双栈 IPv6 MSS 1340 + initcwnd 32）
+# ==============================================================================
+configure_runtime_net_rules() {
+    mkdir -p "$(dirname "$RUNTIME_SCRIPT")"
+    cat << 'EOF' > "$RUNTIME_SCRIPT"
+#!/usr/bin/env bash
+# Managed by vps-init-suite init.sh
+set -u
+
+IPV6_ENABLED=0
+if [[ -r /etc/default/vps-init-opt ]]; then
+    # shellcheck disable=SC1091
+    source /etc/default/vps-init-opt
+fi
+
+# 1. IPv4 TCP MSS 1380 幂等钳制（仅优化包长，不拦截任何端口）
+IPT4=$(command -v iptables 2>/dev/null || echo "/sbin/iptables")
+if [[ -x "$IPT4" ]]; then
+    "$IPT4" -w 5 -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380 2>/dev/null || \
+    "$IPT4" -w 5 -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380 2>/dev/null || true
+fi
+
+# 2. 双栈启用时补齐 IPv6 TCP MSS 1340 幂等钳制（IPv6 包头比 IPv4 多 20 字节）
+IPT6=$(command -v ip6tables 2>/dev/null || echo "/sbin/ip6tables")
+if [[ "${IPV6_ENABLED:-0}" == "1" && -x "$IPT6" ]]; then
+    "$IPT6" -w 5 -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340 2>/dev/null || \
+    "$IPT6" -w 5 -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340 2>/dev/null || true
+elif [[ -x "$IPT6" ]]; then
+    while "$IPT6" -w 5 -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340 2>/dev/null; do
+        "$IPT6" -w 5 -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340 2>/dev/null || break
+    done
+fi
+
+# 3. 设置默认 IPv4 路由 initcwnd 32 / initrwnd 32（首屏多图秒开且跨洋丢包稳健）
+IP_BIN=$(command -v ip 2>/dev/null || echo "/sbin/ip")
+if [[ -x "$IP_BIN" ]]; then
+    DEF_ROUTE=$("$IP_BIN" -4 route show default 2>/dev/null | head -n1 | sed -E 's/[[:space:]]+initcwnd[[:space:]]+[0-9]+//g; s/[[:space:]]+initrwnd[[:space:]]+[0-9]+//g; s/[[:space:]]+$//')
+    if [[ -n "$DEF_ROUTE" ]]; then
+        # shellcheck disable=SC2086
+        "$IP_BIN" -4 route change $DEF_ROUTE initcwnd 32 initrwnd 32 2>/dev/null || true
+    fi
+fi
+
+exit 0
+EOF
+    chmod 0755 "$RUNTIME_SCRIPT"
+
+    # 同步替换或写入 if-up.d 钩子，防止旧版 99-initcwnd (64) 或网卡重启覆盖
+    if [[ -d /etc/network/if-up.d ]]; then
+        cat << EOF > /etc/network/if-up.d/99-initcwnd
+#!/bin/sh
+# Managed by vps-init-suite init.sh v${SCRIPT_VERSION}
+[ -x "${RUNTIME_SCRIPT}" ] && "${RUNTIME_SCRIPT}" >/dev/null 2>&1 || true
+EOF
+        chmod 0755 /etc/network/if-up.d/99-initcwnd
+    fi
+
+    cat << EOF > "$RUNTIME_SERVICE"
+[Unit]
+Description=Persist vps-init-suite TCP MSS Clamping and initcwnd Tuning
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${RUNTIME_SCRIPT}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable proxy-mss.service >/dev/null 2>&1 || true
+    "$RUNTIME_SCRIPT"
 }
 
 # ==============================================================================
@@ -238,7 +366,6 @@ configure_adaptive_network() {
         BACKLOG_LIMIT=4096
         CONNTRACK_MAX=65536
         NOFILE_LIMIT=65535
-        XUI_GOMEMLIMIT="350MiB"
         XUI_GOGC="75"
         XUI_OOM_SCORE="-300"
         JOURNAL_DISK_MAX="30M"
@@ -250,13 +377,15 @@ configure_adaptive_network() {
             elif (( RTT_MS < 100 && TCP_MAX_BUF > 2097152 )); then
                 TCP_MAX_BUF=2097152
             fi
+            XUI_GOMEMLIMIT="350MiB"
             TCP_MEM_PAGES="16384 32768 65536"   # 硬顶 256MB
             TCP_NOTSENT_LOWAT=32768
             PROFILE_DESC="1G-高并发稳态档"
         else
-            # 1G 低中并发极速：按手填带宽放开至最高 32MB，靠 16KB 起步与 320MB 硬顶兜底防爆
+            # 1G 低中并发极速：放开单连接至 16MB/32MB，同时微调 GOMEM=320MiB / 硬顶 280MB 留足物理余量
             (( TCP_MAX_BUF > 33554432 )) && TCP_MAX_BUF=33554432
-            TCP_MEM_PAGES="24576 49152 81920"   # 硬顶 320MB
+            XUI_GOMEMLIMIT="320MiB"
+            TCP_MEM_PAGES="20480 40960 71680"   # 硬顶 280MB
             TCP_NOTSENT_LOWAT=16384
             PROFILE_DESC="1G-单线程极速档"
         fi
@@ -288,7 +417,6 @@ configure_adaptive_network() {
         fi
     fi
 
-    save_state
     log_ok "匹配方案: ${PROFILE_DESC} | 带宽: ${BW_MBPS}Mbps | 延迟: ${RTT_MS}ms (并发档位: ${CONN_TIER})"
     log_ok "缓冲参数: TCP初始=$((TCP_DEF_BUF/1024))KB, TCP上限=$((TCP_MAX_BUF/1048576))MB, UDP默认=256KB, x-ui内存限制=${XUI_GOMEMLIMIT}"
 }
@@ -302,9 +430,9 @@ optimize_proxy_stability_and_speed() {
     # 0. 安装基础依赖
     if command -v apt-get >/dev/null 2>&1; then
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl iptables chrony cron kmod procps >/dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl iptables iproute2 chrony cron kmod procps e2fsprogs >/dev/null 2>&1
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y -q curl iptables chrony cronie kmod procps-ng >/dev/null 2>&1
+        dnf install -y -q curl iptables iproute chrony cronie kmod procps-ng e2fsprogs >/dev/null 2>&1
     fi
 
     # 1. 四维自适应网络计算 (带宽 + 延迟 + 并发档位 + 物理内存)
@@ -314,22 +442,29 @@ optimize_proxy_stability_and_speed() {
     local disable_ipv6_block=""
     if ! curl -6 -s -I -m 3 https://www.gstatic.com/generate_204 >/dev/null 2>&1 && \
        ! curl -6 -s -I -m 3 https://cp.cloudflare.com/generate_204 >/dev/null 2>&1; then
+        IPV6_ENABLED=0
         log_info "检测到当前 VPS 无有效 IPv6 公网出口，写入内核禁用规则（防假死黑洞）..."
         disable_ipv6_block="net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1"
     else
-        log_info "IPv6 公网出口连通性正常，保留双栈支持。"
+        IPV6_ENABLED=1
+        log_info "IPv6 公网出口连通性正常，保留双栈支持并同步开启 IPv6 MSS 1340 钳制。"
         disable_ipv6_block="net.ipv6.conf.all.disable_ipv6 = 0
 net.ipv6.conf.default.disable_ipv6 = 0
 net.ipv6.conf.lo.disable_ipv6 = 0"
     fi
 
-    # 3. 清理旧冲突 sysctl 并统一写入高优先级单文件
+    # 3. 清理旧冲突 sysctl 并校验内核 BBR 支持
     clean_conflicting_sysctl
     modprobe tcp_bbr 2>/dev/null || true
 
-    # 清理旧版 init.sh 强行开机加载的 nf_conntrack，避免纯代理无 NAT 场景白耗 CPU/RAM
+    local cc_algo="bbr"
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        cc_algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "cubic")
+        log_warn "当前内核未暴露 tcp_bbr 模块，暂保留 ${cc_algo}；建议升级至 4.9+ 内核以启用 BBR。"
+    fi
+
     if [[ -f /etc/modules-load.d/nf_conntrack.conf ]]; then
         rm -f /etc/modules-load.d/nf_conntrack.conf
     fi
@@ -348,9 +483,13 @@ net.netfilter.nf_conntrack_tcp_timeout_established = 3600"
 vm.swappiness = 10
 fs.file-max = ${NOFILE_LIMIT}
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_congestion_control = ${cc_algo}
 net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_frto = 2
+net.ipv4.tcp_reordering = 6
 net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
 net.ipv4.tcp_fastopen = 2
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_window_scaling = 1
@@ -388,7 +527,7 @@ ${disable_ipv6_block}
 ${conntrack_block}
 EOF
 
-    # 4. 文件描述符 (FD) 上限（修正 * 通配符）
+    # 4. 文件描述符 (FD) 上限
     mkdir -p /etc/security/limits.d /etc/systemd/system.conf.d
     cat << EOF > /etc/security/limits.d/99-nofile.conf
 * soft nofile ${NOFILE_LIMIT}
@@ -457,42 +596,20 @@ Restart=always
 RestartSec=2s
 EOF
 
-    # 7. 纯净 IPv4 DNS（8.8.8.8 置顶支持 ECS 就近 CDN 解析，去 rotate 避免漂移）
-    if [[ ! -L /etc/resolv.conf ]] && [[ -w /etc/resolv.conf ]]; then
-        cat << 'EOF' > /etc/resolv.conf
-options timeout:1 attempts:2 single-request-reopen
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-EOF
-    fi
+    # 7. 智能防覆写 DNS 配置
+    configure_smart_dns
 
-    # 8. 统一加载 sysctl 并显式再灌入本文件确保无覆盖
+    # 8. 持久化最终完整状态（含 IPV6_ENABLED 与 DNS_MODE）
+    save_state
+
+    # 9. 统一加载 sysctl 并显式再灌入本文件确保无覆盖
     sysctl --system >/dev/null 2>&1 || true
     sysctl -p "$SYSCTL_TARGET" >/dev/null 2>&1 || true
 
-    # 9. TCP MSS 1380 幂等钳制并持久化 (仅优化包长，不拦截任何端口)
-    local ipt_bin
-    ipt_bin=$(command -v iptables 2>/dev/null || echo "/sbin/iptables")
-    "$ipt_bin" -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380 2>/dev/null || \
-    "$ipt_bin" -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+    # 10. 应用并持久化 TCP MSS 1380/1340 与 initcwnd 32
+    configure_runtime_net_rules
 
-    cat << EOF > /etc/systemd/system/proxy-mss.service
-[Unit]
-Description=Persist TCP MSS 1380 Clamping for Multi-layer Proxy Tunnels
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c '${ipt_bin} -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380 2>/dev/null || ${ipt_bin} -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380'
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable proxy-mss.service >/dev/null 2>&1
-
-    # 10. Chrony 毫秒级网络授时 (保障 REALITY 与 TLS 严格握手时间窗口)
+    # 11. Chrony 毫秒级网络授时 (保障 REALITY 与 TLS 严格握手时间窗口)
     log_info "配置 Chrony 毫秒级时间同步..."
     systemctl enable chrony >/dev/null 2>&1 || systemctl enable chronyd >/dev/null 2>&1 || true
     systemctl restart chrony 2>/dev/null || systemctl restart chronyd 2>/dev/null || true
@@ -514,14 +631,17 @@ verify_optimization() {
     echo ""
     echo -e "${BOLD}${CYAN}==================== VPS 调优状态自检报告 (v${SCRIPT_VERSION}) ====================${NC}"
 
-    local cc idle rmem def_buf tcp_mem_raw tcp_mem_norm udp_def
+    local cc idle no_metrics frto rmem def_buf tcp_mem_raw tcp_mem_norm udp_def cur_cwnd
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     idle=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "unknown")
+    no_metrics=$(sysctl -n net.ipv4.tcp_no_metrics_save 2>/dev/null || echo "unknown")
+    frto=$(sysctl -n net.ipv4.tcp_frto 2>/dev/null || echo "unknown")
     rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "0")
     def_buf=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $2}' || echo "0")
     tcp_mem_raw=$(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo "unknown")
     tcp_mem_norm=$(printf '%s' "$tcp_mem_raw" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')
     udp_def=$(sysctl -n net.core.rmem_default 2>/dev/null || echo "0")
+    cur_cwnd=$(ip -4 route show default 2>/dev/null | grep -oE 'initcwnd[[:space:]]+[0-9]+' | awk '{print $2}' | head -n1 || true)
 
     local rmem_mb="?" def_kb="?" udp_kb="?"
     [[ "$rmem" =~ ^[0-9]+$ ]] && rmem_mb=$((rmem / 1048576))
@@ -531,10 +651,10 @@ verify_optimization() {
     echo -e "1. 调优策略与并发模式     : ${GREEN}[INFO] ${PROFILE_DESC}${NC}"
     echo -e "   • 带宽与 RTT 设置        : ${BW_MBPS} Mbps / ${RTT_MS} ms (并发档位: ${CONN_TIER})"
 
-    if [[ "$cc" == "bbr" && "$idle" == "0" ]]; then
-        echo -e "2. BBR + 零空闲慢启动重置 : ${GREEN}[PASS] cc=${cc}, idle=${idle}${NC}"
+    if [[ "$cc" == "bbr" && "$idle" == "0" && "$no_metrics" == "1" ]]; then
+        echo -e "2. BBR + 防晚高峰丢包降速 : ${GREEN}[PASS] cc=${cc}, idle=${idle}, no_metrics=${no_metrics}, frto=${frto}${NC}"
     else
-        echo -e "2. BBR + 零空闲慢启动重置 : ${RED}[FAIL] 当前 cc=${cc}, idle=${idle}${NC}"
+        echo -e "2. BBR + 防晚高峰丢包降速 : ${RED}[FAIL] cc=${cc}, idle=${idle}, no_metrics=${no_metrics}${NC}"
     fi
 
     if [[ "$rmem" == "$TCP_MAX_BUF" && "$def_buf" == "$TCP_DEF_BUF" && "$tcp_mem_norm" == "$TCP_MEM_PAGES" ]]; then
@@ -546,18 +666,47 @@ verify_optimization() {
         echo -e "   • 预期值: rmem=$((TCP_MAX_BUF/1048576))MB, 初始=$((TCP_DEF_BUF/1024))KB, tcp_mem=[${TCP_MEM_PAGES}]"
     fi
 
-    # 4. 出站连通性 (防残废 IPv6 阻塞)
-    if curl -s -I -m 3 https://www.gstatic.com/generate_204 2>/dev/null | grep -q "204"; then
-        echo -e "4. 出站连通性 (防残废IPv6阻塞): ${GREEN}[PASS] 秒返 HTTP 204${NC}"
+    # 4. 首屏 initcwnd 32 + DNS 持久化 + 出站连通性
+    local dns_ok=0 dns_desc="${DNS_MODE}"
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        if [[ -f "$RESOLVED_DROPIN_FILE" ]] && grep -q "8.8.8.8" "$RESOLVED_DROPIN_FILE" 2>/dev/null; then
+            dns_ok=1
+            dns_desc="systemd-resolved (0ms缓存)"
+        fi
     else
-        echo -e "4. 出站连通性 (防残废IPv6阻塞): ${YELLOW}[WARN] 访问 Google 204 超时或受限${NC}"
+        if grep -q "nameserver 8.8.8.8" /etc/resolv.conf 2>/dev/null; then
+            dns_ok=1
+            if command -v lsattr >/dev/null 2>&1 && lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+                dns_desc="resolv.conf (已锁防覆写)"
+            else
+                dns_desc="resolv.conf (ECS就近)"
+            fi
+        fi
     fi
 
-    # 5. TCP MSS 1380 钳制
-    if iptables -t mangle -L POSTROUTING -n 2>/dev/null | grep -q "TCPMSS set 1380"; then
-        echo -e "5. TCP MSS 1380 隧道防分片    : ${GREEN}[PASS] 规则已生效并持久化${NC}"
+    local net_ok=0
+    curl -s -I -m 3 https://www.gstatic.com/generate_204 2>/dev/null | grep -q "204" && net_ok=1
+    if [[ "$cur_cwnd" == "32" && "$dns_ok" -eq 1 && "$net_ok" -eq 1 ]]; then
+        echo -e "4. 首屏加速 + 智能DNS连通 : ${GREEN}[PASS] initcwnd=${cur_cwnd}, DNS=${dns_desc}, 204秒返${NC}"
     else
-        echo -e "5. TCP MSS 1380 隧道防分片    : ${RED}[FAIL] 未检测到 TCPMSS 规则${NC}"
+        echo -e "4. 首屏加速 + 智能DNS连通 : ${YELLOW}[WARN] initcwnd=${cur_cwnd:-默认}, DNS=${dns_desc}(ok=${dns_ok}), 204连通=${net_ok}${NC}"
+    fi
+
+    # 5. TCP MSS 1380 (IPv4) / 1340 (双栈 IPv6) 钳制
+    local mss4_ok=0 mss6_ok=1
+    iptables -t mangle -L POSTROUTING -n 2>/dev/null | grep -q "TCPMSS set 1380" && mss4_ok=1
+    if [[ "${IPV6_ENABLED:-0}" == "1" ]]; then
+        mss6_ok=0
+        ip6tables -t mangle -L POSTROUTING -n 2>/dev/null | grep -q "TCPMSS set 1340" && mss6_ok=1
+    fi
+    if [[ "$mss4_ok" -eq 1 && "$mss6_ok" -eq 1 ]]; then
+        if [[ "${IPV6_ENABLED:-0}" == "1" ]]; then
+            echo -e "5. TCP MSS 隧道防分片     : ${GREEN}[PASS] IPv4=1380, IPv6=1340 已生效并持久化${NC}"
+        else
+            echo -e "5. TCP MSS 隧道防分片     : ${GREEN}[PASS] IPv4=1380 已生效（残废 IPv6 已禁用）${NC}"
+        fi
+    else
+        echo -e "5. TCP MSS 隧道防分片     : ${RED}[FAIL] IPv4=${mss4_ok}, IPv6双栈=${mss6_ok}${NC}"
     fi
 
     # 6. Swap 与 x-ui 真实守护状态核验
@@ -570,19 +719,19 @@ verify_optimization() {
         [[ "$xui_env" == *"GOMEMLIMIT="* ]] && xui_gomem=$(grep -o 'GOMEMLIMIT=[^ ]*' <<<"$xui_env" | head -n1 | cut -d= -f2)
 
         if [[ "$xui_oom" == "$XUI_OOM_SCORE" && "$xui_gomem" == "$XUI_GOMEMLIMIT" ]]; then
-            echo -e "6. Swap & x-ui 防爆保护       : ${GREEN}[PASS] Swap=${swap_total:-0B}, OOM=${xui_oom}, GOMEM=${xui_gomem}, 句柄=${xui_nofile}${NC}"
+            echo -e "6. Swap & x-ui 防爆保护   : ${GREEN}[PASS] Swap=${swap_total:-0B}, OOM=${xui_oom}, GOMEM=${xui_gomem}, 句柄=${xui_nofile}${NC}"
         else
-            echo -e "6. Swap & x-ui 防爆保护       : ${RED}[FAIL] Swap=${swap_total:-0B}, 实际 OOM=${xui_oom}/GOMEM=${xui_gomem} (预期 ${XUI_OOM_SCORE}/${XUI_GOMEMLIMIT})${NC}"
+            echo -e "6. Swap & x-ui 防爆保护   : ${RED}[FAIL] Swap=${swap_total:-0B}, 实际 OOM=${xui_oom}/GOMEM=${xui_gomem} (预期 ${XUI_OOM_SCORE}/${XUI_GOMEMLIMIT})${NC}"
         fi
     else
-        echo -e "6. Swap & x-ui 防爆保护       : ${GREEN}[PASS] Swap=${swap_total:-0B} (未安装 x-ui，防爆配置已预置)${NC}"
+        echo -e "6. Swap & x-ui 防爆保护   : ${GREEN}[PASS] Swap=${swap_total:-0B} (未安装 x-ui，防爆配置已预置)${NC}"
     fi
 
     # 7. Chrony NTP 时间同步
     if systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet chronyd 2>/dev/null; then
-        echo -e "7. Chrony 毫秒级时间同步      : ${GREEN}[PASS] 运行中 (保障 REALITY/TLS 握手)${NC}"
+        echo -e "7. Chrony 毫秒级时间同步  : ${GREEN}[PASS] 运行中 (保障 REALITY/TLS 握手)${NC}"
     else
-        echo -e "7. Chrony 毫秒级时间同步      : ${YELLOW}[WARN] Chrony 未运行${NC}"
+        echo -e "7. Chrony 毫秒级时间同步  : ${YELLOW}[WARN] Chrony 未运行${NC}"
     fi
 
     echo -e "${BOLD}=======================================================================${NC}"
