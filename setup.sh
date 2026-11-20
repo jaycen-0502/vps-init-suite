@@ -37,7 +37,7 @@ readonly CONFLICT_FILES=(
   99-tfo.conf 99-japan-vps.conf 99-us-vps.conf 99-vps-tuning.conf
   99-1g-high-conn.conf 99-high-conn.conf 99-lowmem-patch.conf
   99-us-200m.conf 99-zzz-lowmem-override.conf 99-proxy-experience.conf
-  99-us-speed-test.conf 99-vps-init-opt.conf
+  99-us-speed-test.conf 99-vps-init-opt.conf 99-zzz-vps-init.conf
 )
 
 if [[ -t 1 ]]; then
