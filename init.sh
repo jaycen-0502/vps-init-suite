@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 项目名称: vps-init-suite (init.sh) - 纯净无防火墙稳定满速版 (v1.19.2)
+# 项目名称: vps-init-suite (init.sh) - 纯净无防火墙稳定满速版 (v1.19.3)
 # 适用系统: Debian 12/13, Ubuntu 22.04/24.04, RHEL/AlmaLinux/Rocky 8/9
 # 项目地址: https://github.com/jaycen-0502/vps-init-suite
 # ==============================================================================
 
 set -u
 
-readonly SCRIPT_VERSION="1.19.2"
+readonly SCRIPT_VERSION="1.19.3"
 readonly SYSCTL_TARGET="/etc/sysctl.d/99-zzz-vps-init.conf"
 readonly STATE_FILE="/etc/default/vps-init-opt"
 readonly RUNTIME_SCRIPT="/usr/local/sbin/vps-init-runtime.sh"
@@ -148,19 +148,77 @@ clean_conflicting_sysctl() {
 # 智能 DNS 配置模块（兼容 systemd-resolved 0ms 本地缓存 & 防 DHCP 覆盖锁定）
 # ==============================================================================
 configure_smart_dns() {
+    local def_dev=""
+    def_dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    local dhcp_intercepted=0
+
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         mkdir -p "$RESOLVED_DROPIN_DIR"
         cat << EOF > "$RESOLVED_DROPIN_FILE"
 # Managed by vps-init-suite init.sh v${SCRIPT_VERSION}
 [Resolve]
 DNS=8.8.8.8 1.1.1.1
-FallbackDNS=9.9.9.11
+FallbackDNS=8.8.4.4 1.0.0.1
 DNSSEC=no
 Cache=yes
 EOF
+
+        # 从网络管理层拦截接口级 DHCP DNS 覆盖（严禁直接修改原始 Netplan YAML）
+        if [[ -n "$def_dev" ]]; then
+            if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+                local net_file="" net_base=""
+                net_file=$(SYSTEMD_COLORS=0 networkctl status "$def_dev" --no-pager 2>/dev/null | awk -F': ' '/Network File/ {print $2; exit}' | tr -d '[:space:]')
+                if [[ -n "$net_file" && "$net_file" != "n/a" && "$net_file" != "none" ]]; then
+                    net_base=$(basename "$net_file")
+                    if [[ -n "$net_base" ]]; then
+                        mkdir -p "/etc/systemd/network/${net_base}.d"
+                        cat << EOF > "/etc/systemd/network/${net_base}.d/99-vps-init-dns.conf"
+# Managed by vps-init-suite init.sh v${SCRIPT_VERSION}
+[Network]
+DNS=
+DNS=8.8.8.8
+DNS=1.1.1.1
+
+[DHCPv4]
+UseDNS=false
+
+[DHCPv6]
+UseDNS=false
+
+[IPv6AcceptRA]
+UseDNS=false
+EOF
+                        networkctl reload 2>/dev/null || true
+                        dhcp_intercepted=1
+                    fi
+                fi
+            fi
+
+            if systemctl is-active --quiet NetworkManager 2>/dev/null || command -v nmcli >/dev/null 2>&1; then
+                local nm_uuid=""
+                nm_uuid=$(nmcli -t -f DEVICE,UUID connection show --active 2>/dev/null | awk -F: -v dev="$def_dev" '$1 == dev {print $2; exit}')
+                if [[ -n "$nm_uuid" ]]; then
+                    nmcli connection modify "$nm_uuid" ipv4.ignore-auto-dns yes ipv4.dns "8.8.8.8 1.1.1.1" ipv6.ignore-auto-dns yes 2>/dev/null || true
+                    nmcli device reapply "$def_dev" 2>/dev/null || true
+                    dhcp_intercepted=1
+                fi
+            fi
+        fi
+
         systemctl restart systemd-resolved 2>/dev/null || true
-        DNS_MODE="systemd-resolved"
-        log_ok "已通过 systemd-resolved 配置就近 ECS DNS (8.8.8.8 / 1.1.1.1 / 9.9.9.11) 并开启本地缓存。"
+        sleep 1
+        if [[ -n "$def_dev" ]] && command -v resolvectl >/dev/null 2>&1; then
+            resolvectl dns "$def_dev" 8.8.8.8 1.1.1.1 2>/dev/null || true
+            resolvectl flush-caches 2>/dev/null || true
+        fi
+
+        if [[ "$dhcp_intercepted" -eq 1 ]]; then
+            DNS_MODE="systemd-resolved-locked"
+            log_ok "已通过 systemd-resolved 配置就近 ECS DNS (8.8.8.8 主用 / 1.1.1.1 备用)，开启 0ms 本地缓存并拦截接口级 DHCP 抢占。"
+        else
+            DNS_MODE="systemd-resolved"
+            log_ok "已通过 systemd-resolved 配置就近 ECS DNS (8.8.8.8 主用 / 1.1.1.1 备用) 并开启本地缓存。"
+        fi
     else
         if command -v chattr >/dev/null 2>&1; then
             chattr -i /etc/resolv.conf 2>/dev/null || true
@@ -176,14 +234,13 @@ EOF
 options timeout:1 attempts:2 single-request-reopen
 nameserver 8.8.8.8
 nameserver 1.1.1.1
-nameserver 9.9.9.11
 EOF
         if command -v chattr >/dev/null 2>&1 && chattr +i /etc/resolv.conf 2>/dev/null; then
             DNS_MODE="resolv.conf-locked"
-            log_ok "已写入纯净 ECS DNS (8.8.8.8 / 1.1.1.1 / 9.9.9.11) 并锁定防 DHCP/重启覆盖。"
+            log_ok "已写入纯净 ECS DNS (8.8.8.8 主用 / 1.1.1.1 备用) 并加锁免疫 DHCP/重启覆写。"
         else
             DNS_MODE="resolv.conf"
-            log_ok "已写入纯净 ECS DNS (8.8.8.8 / 1.1.1.1 / 9.9.9.11)。"
+            log_ok "已写入纯净 ECS DNS (8.8.8.8 主用 / 1.1.1.1 备用)。"
         fi
     fi
 }
@@ -229,6 +286,18 @@ if [[ -x "$IP_BIN" ]]; then
     if [[ -n "$DEF_ROUTE" ]]; then
         # shellcheck disable=SC2086
         "$IP_BIN" -4 route change $DEF_ROUTE initcwnd 32 initrwnd 32 2>/dev/null || true
+    fi
+fi
+
+# 4. 开机/网卡重载 DNS 纠偏（防止 DHCP 续租后回弹）
+if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl >/dev/null 2>&1; then
+    DEF_DEV=$("$IP_BIN" -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    if [[ -n "$DEF_DEV" ]]; then
+        CUR_DNS=$(SYSTEMD_COLORS=0 resolvectl status "$DEF_DEV" 2>/dev/null | awk -F': ' '/Current DNS Server/ {print $2; exit}' | tr -d '[:space:]')
+        if [[ "$CUR_DNS" != "8.8.8.8" ]]; then
+            resolvectl dns "$DEF_DEV" 8.8.8.8 1.1.1.1 2>/dev/null || true
+            resolvectl flush-caches 2>/dev/null || true
+        fi
     fi
 fi
 
@@ -666,26 +735,80 @@ verify_optimization() {
         echo -e "   • 预期值: rmem=$((TCP_MAX_BUF/1048576))MB, 初始=$((TCP_DEF_BUF/1024))KB, tcp_mem=[${TCP_MEM_PAGES}]"
     fi
 
-    # 4. 首屏 initcwnd 32 + DNS 持久化 + 出站连通性
-    local dns_ok=0 dns_desc="${DNS_MODE}"
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        if [[ -f "$RESOLVED_DROPIN_FILE" ]] && grep -q "8.8.8.8" "$RESOLVED_DROPIN_FILE" 2>/dev/null; then
+    # 4. 首屏 initcwnd 32 + 真实 DNS 生效校验 + 出站连通性
+    local net_ok=0
+    # 先触发出站解析以激活 systemd-resolved 选路并校验 204 连通性
+    curl -s -I -m 3 https://www.gstatic.com/generate_204 2>/dev/null | grep -q "204" && net_ok=1
+
+    local dns_ok=0 dns_desc=""
+    local def_dev=""
+    def_dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl >/dev/null 2>&1; then
+        local r_out="" cur_dns="" all_dns=""
+        if [[ -n "$def_dev" ]]; then
+            r_out=$(SYSTEMD_COLORS=0 resolvectl status "$def_dev" --no-pager 2>/dev/null || true)
+        fi
+        if [[ -z "$r_out" ]]; then
+            r_out=$(SYSTEMD_COLORS=0 resolvectl status --no-pager 2>/dev/null || true)
+        fi
+        cur_dns=$(awk -F': ' '/Current DNS Server/ {print $2; exit}' <<<"$r_out" | tr -d '[:space:]')
+        all_dns=$(awk -F': ' '/DNS Servers/ {print $2; exit}' <<<"$r_out")
+
+        if [[ -z "$cur_dns" ]]; then
+            cur_dns=$(SYSTEMD_COLORS=0 resolvectl status --no-pager 2>/dev/null | awk -F': ' '/Current DNS Server/ {print $2; exit}' | tr -d '[:space:]')
+        fi
+        local first_dns
+        first_dns=$(awk '{print $1}' <<<"$all_dns")
+        if [[ -z "$cur_dns" && "$first_dns" == "8.8.8.8" ]]; then
+            cur_dns="8.8.8.8"
+        fi
+
+        local anti_dhcp=0
+        if [[ -d /etc/systemd/network ]] && ls /etc/systemd/network/*.d/99-vps-init-dns.conf >/dev/null 2>&1; then
+            anti_dhcp=1
+        elif command -v nmcli >/dev/null 2>&1 && [[ -n "$def_dev" ]]; then
+            local nm_uuid
+            nm_uuid=$(nmcli -t -f DEVICE,UUID connection show --active 2>/dev/null | awk -F: -v dev="$def_dev" '$1 == dev {print $2; exit}')
+            if [[ -n "$nm_uuid" ]] && nmcli connection show "$nm_uuid" 2>/dev/null | grep -q 'ipv4.ignore-auto-dns:[[:space:]]*yes'; then
+                anti_dhcp=1
+            fi
+        fi
+
+        local lock_tag=""
+        [[ "$anti_dhcp" -eq 1 ]] && lock_tag="+防DHCP"
+
+        if [[ "$cur_dns" == "8.8.8.8" ]] && grep -q "1.1.1.1" <<<"$all_dns"; then
             dns_ok=1
-            dns_desc="systemd-resolved (0ms缓存)"
+            dns_desc="resolved (主用8.8.8.8/备用1.1.1.1${lock_tag})"
+        elif [[ "$cur_dns" == "8.8.8.8" ]]; then
+            dns_ok=1
+            dns_desc="resolved (主用8.8.8.8${lock_tag})"
+        else
+            dns_ok=0
+            dns_desc="resolved (实际首选=${cur_dns:-未知}, 需8.8.8.8)"
         fi
     else
-        if grep -q "nameserver 8.8.8.8" /etc/resolv.conf 2>/dev/null; then
+        local ns1="" ns2="" is_locked=0
+        ns1=$(awk '/^[[:space:]]*nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null || echo "")
+        ns2=$(awk '/^[[:space:]]*nameserver/ {nr++; if (nr==2) {print $2; exit}}' /etc/resolv.conf 2>/dev/null || echo "")
+        if command -v lsattr >/dev/null 2>&1 && lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+            is_locked=1
+        fi
+
+        if [[ "$ns1" == "8.8.8.8" && "$ns2" == "1.1.1.1" ]]; then
             dns_ok=1
-            if command -v lsattr >/dev/null 2>&1 && lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
-                dns_desc="resolv.conf (已锁防覆写)"
+            if [[ "$is_locked" -eq 1 ]]; then
+                dns_desc="resolv.conf (8.8.8.8+1.1.1.1 已加锁防覆写)"
             else
-                dns_desc="resolv.conf (ECS就近)"
+                dns_desc="resolv.conf (8.8.8.8+1.1.1.1)"
             fi
+        else
+            dns_ok=0
+            dns_desc="resolv.conf (实际首选=${ns1:-无}/备用=${ns2:-无})"
         fi
     fi
 
-    local net_ok=0
-    curl -s -I -m 3 https://www.gstatic.com/generate_204 2>/dev/null | grep -q "204" && net_ok=1
     if [[ "$cur_cwnd" == "32" && "$dns_ok" -eq 1 && "$net_ok" -eq 1 ]]; then
         echo -e "4. 首屏加速 + 智能DNS连通 : ${GREEN}[PASS] initcwnd=${cur_cwnd}, DNS=${dns_desc}, 204秒返${NC}"
     else

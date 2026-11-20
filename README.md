@@ -1,34 +1,37 @@
 # vps-init-suite
 
-专为 **3x-ui / Xray 代理与多级中转服务器** 打造的一键稳定性与速度深度调优套件。**全程不开启系统防火墙**，不拦截任何业务或转发端口，开箱即用。
+## 项目简介
+
+`vps-init-suite (init.sh)` 是一套面向代理节点的**纯净无防火墙 Linux 网络与稳定性深度优化脚本**，不接管或拦截任何端口，专注解决跨境直连场景下的晚高峰丢包降速、多图网页首屏慢、高并发爆内存及 DNS 解析绕路问题。
+
+- **适用系统**：Debian 12/13、Ubuntu 22.04/24.04、RHEL / AlmaLinux / Rocky 8/9
+- **当前版本**：`v1.19.3`
 
 ---
 
-## 🚀 一键执行命令（复制粘贴即可）
+## 核心特性
 
-### 方式一：交互式自适应调优（推荐）
-登录 VPS 终端（`root` 权限）后直接粘贴执行，自动探测硬件规格，并引导输入带宽、延迟与并发档位：
+- **四维自适应内核调优**：自动检测 CPU 与内存，结合手动输入的带宽、典型 RTT 与并发档位（低中并发极速 / 多人高并发稳态），按 1.5 倍 BDP 动态计算 TCP 缓冲与 `tcp_mem` 硬顶，1GB 小内存与大内存机型精准分档防爆。
+- **BBR 抗晚高峰丢包与首屏加速**：启用 BBR + FQ（严格保留多核网卡原生 `mq + 独立 fq` 多队列调度，不降级覆盖）；开启 `tcp_slow_start_after_idle=0`、`tcp_no_metrics_save=1`、`tcp_frto=2`、`tcp_reordering=6` 及默认路由 `initcwnd/initrwnd 32`，避免晚高峰偶发丢包后持续降速并加快多图首屏加载。
+- **Google DNS 优选与防 DHCP 抢占**：统一配置 **Google DNS (`8.8.8.8`) 主用 + Cloudflare (`1.1.1.1`) 备用**，兼顾 ECS 就近 CDN 解析与高速兜底：
+  - `systemd-resolved` 环境：开启本地 0ms 缓存，通过 `.network.d` drop-in 或 `nmcli` 禁用网卡 DHCP DNS 覆盖（不修改原始 Netplan YAML），并配合开机纠偏守护防止续租回弹。
+  - 纯 `resolv.conf` 环境：自动解除软链接并加 `chattr +i` 锁，免疫重启与 DHCP 覆写。
+- **防分片与残废 IPv6 处理**：自动探测 IPv6 公网连通性，无有效出口时自动禁用防假死黑洞；双栈可用时同步启用 IPv4 MSS 1380 与 IPv6 MSS 1340 幂等钳制。
+- **防爆内存与 `x-ui` 守护增强**：写入内核参数前自动备份清理旧版冲突 `sysctl` 碎片并收敛至单文件 `99-zzz-vps-init.conf`；按磁盘余量自适应创建 Swap；为 `x-ui.service` 注入分档 `GOMEMLIMIT`、`GOGC`、`OOMScoreAdjust` 与高文件句柄；启用 Chrony 毫秒级授时保障 REALITY/TLS 握手。
+- **真实运行态严格自检**：直接读取内核实时参数、`systemctl` 服务属性与 `resolvectl` 实际生效 DNS，与目标预期逐项比对，杜绝配置被覆盖却误报 `[PASS]`。
+
+---
+
+## 🚀 快速使用
+
 ```bash
+# 1. 交互式菜单（推荐：一键调优 / 状态自检 / 安装 3x-ui）
 bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh)
-```
 
-### 方式二：直接传参极速执行（适合特定节点）
-* **美西 500M/1G 低中并发（解除 4MB 限制，单线程拉满 500M，视频秒开）：**
-  ```bash
-  bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) 500 160 1
-  ```
-* **美国/日本国际落地千兆机（海外互联 RTT 30ms，拉满千兆）：**
-  ```bash
-  bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) 1000 30 1
-  ```
-* **亚太/日本直连多人高并发（1000-3000+ 连接，严控 2M/4M 防爆 CPU 与内存）：**
-  ```bash
-  bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) 200 40 2
-  ```
+# 2. 命令行直接传参：<带宽Mbps> <典型延迟ms> <并发档位 1=极速/2=高并发>
+bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) 500 160 1
 
-### 方式三：全自动静默执行（批量装机）
-无需按键确认，按默认美西 500M 极速档完成全部调优并打印自检报告：
-```bash
+# 3. 无人值守默认模式（500Mbps / 160ms / 档位 1）
 bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) --auto
 ```
 
@@ -36,33 +39,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/m
 > ```bash
 > bash <(wget -qO- https://raw.githubusercontent.com/jaycen-0502/vps-init-suite/main/init.sh) --auto
 > ```
-
----
-
-## 📋 新手使用三步走
-
-1. **切换 root 权限：** SSH 登录 VPS 后执行 `sudo -i`，确认命令行前缀变为 `root@...`（已是 `root@` 开头可跳过）。
-2. **运行一键命令：** 复制上方任意一条命令粘贴到终端按回车，等待约 20–40 秒自动完成。
-3. **核对自检结果：** 屏幕末尾输出 5 项绿色 **`[PASS]`** 状态即代表全部优化生效。
-
----
-
-## ✨ 自动完成的 6 项深度优化（无防火墙干扰）
-
-* **自动屏蔽残废 IPv6：** 实测 IPv6 公网出口，若不通则自动禁用内核 IPv6，消除刷图与测速时白等 3.6 秒超时的卡顿与重置。
-* **BBR + 32MB 大缓冲 + 零空闲重置：** 启用 `fq + bbr`，关闭 `tcp_slow_start_after_idle` 防止停顿后网速掉回慢启动，拉满跨洋高延迟首屏速度。
-* **TCP MSS 1380 持久化钳制：** 仅在 `mangle` 表优化封包尺寸防止多层代理隧道大包丢弃，不开启防火墙、不拦截任何端口。
-* **百万级文件句柄与连接追踪扩容：** 将 `nofile` 拉高至 `1048576`、加速 `TIME_WAIT` 端口复用，防止高并发与 XHTTP 分片断流。
-* **2GB Swap + `x-ui` 防崩溃守护：** 自动创建 2GB 虚拟内存（`swappiness=10`），并为 `x-ui` 注入 `OOMScoreAdjust=-900` 与秒级自启保护。
-* **Chrony 毫秒级校时 + 日志封顶：** 自动同步 NTP 时间（防止 REALITY / TLS 1.3 时间偏差握手失败），系统日志封顶 100MB 并每日凌晨自动清理。
-
----
-
-## 💻 支持系统
-
-* Debian 12 / Debian 13（推荐）
-* Ubuntu 22.04 / Ubuntu 24.04
-* RHEL / Rocky / AlmaLinux 8 / 9
 
 ---
 
@@ -83,7 +59,7 @@ VPS 跑完调优后，按以下 4 项收尾即可把整条链路的稳定性与�
 
 ---
 
-## ⚙️ 进阶命令（Suite 专业管理版 `setup.sh` / `init.sh` v1.19.2）
+## ⚙️ 进阶命令（Suite 专业管理版 `setup.sh` / `init.sh` v1.19.3）
 
 仓库同时提供完整的模块化管理套件 `setup.sh`（支持 `vps-init` 全局快捷命令、精确 BDP 计算、时区与连接策略调优）：
 
