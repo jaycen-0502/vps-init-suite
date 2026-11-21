@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 项目名称: vps-init-suite (init.sh) - 纯净无防火墙稳定满速版 (v1.19.4)
+# 项目名称: vps-init-suite (init.sh) - 纯净无防火墙稳定满速版 (v1.19.5)
 # 适用系统: Debian 12/13, Ubuntu 22.04/24.04, RHEL/AlmaLinux/Rocky 8/9
 # 项目地址: https://github.com/jaycen-0502/vps-init-suite
 # ==============================================================================
 
 set -u
 
-readonly SCRIPT_VERSION="1.19.4"
+readonly SCRIPT_VERSION="1.19.5"
 readonly SYSCTL_TARGET="/etc/sysctl.d/99-zzz-vps-init.conf"
 readonly STATE_FILE="/etc/default/vps-init-opt"
 readonly RUNTIME_SCRIPT="/usr/local/sbin/vps-init-runtime.sh"
@@ -301,24 +301,28 @@ if [[ -x "$IP_BIN" ]]; then
     fi
 fi
 
-# 4. 可选 fq maxrate 单流防撞墙软封顶（自动兼容单队列与 mq 多队列，且支持 off 干净回退）
+# 4. 可选 fq maxrate 单流防撞墙软封顶（兼容单队列、mq 默认 0: 句柄与已命名 mq 多队列）
 TC_BIN=$(command -v tc 2>/dev/null || echo "/sbin/tc")
 if [[ -x "$TC_BIN" && -n "$DEF_DEV" ]]; then
     QDISC_OUT=$("$TC_BIN" qdisc show dev "$DEF_DEV" 2>/dev/null || true)
     if [[ "${FQ_MAXRATE_MBIT:-0}" =~ ^[0-9]+$ ]] && (( FQ_MAXRATE_MBIT > 0 )); then
         if grep -qE '^qdisc mq ' <<<"$QDISC_OUT"; then
-            while read -r parent_id; do
-                [[ -n "$parent_id" ]] && "$TC_BIN" qdisc replace dev "$DEF_DEV" parent "$parent_id" fq maxrate "${FQ_MAXRATE_MBIT}mbit" 2>/dev/null || true
-            done < <(awk '{for(i=1;i<=NF;i++) if($i=="parent" && $(i+1) ~ /^[0-9a-fA-F]*:[0-9a-fA-F]+$/) print $(i+1)}' <<<"$QDISC_OUT")
+            # 若 root mq 为内核默认 0: 句柄，先赋予显式句柄 1: 否则无法修改子队列
+            if grep -qE '^qdisc mq 0:' <<<"$QDISC_OUT"; then
+                "$TC_BIN" qdisc replace dev "$DEF_DEV" root handle 1: mq 2>/dev/null || true
+            fi
+            while read -r cid; do
+                [[ -n "$cid" ]] && "$TC_BIN" qdisc replace dev "$DEF_DEV" parent "$cid" fq maxrate "${FQ_MAXRATE_MBIT}mbit" 2>/dev/null || true
+            done < <("$TC_BIN" class show dev "$DEF_DEV" 2>/dev/null | awk '$1=="class" && $2=="mq" && $3 ~ /^[0-9a-fA-F]+:[0-9a-fA-F]+$/ {print $3}')
         else
             "$TC_BIN" qdisc replace dev "$DEF_DEV" root fq maxrate "${FQ_MAXRATE_MBIT}mbit" 2>/dev/null || true
         fi
     elif grep -qi 'maxrate' <<<"$QDISC_OUT"; then
         # 切换为关闭限速时，清除此前挂载的 maxrate 封顶并保留 fq / mq 结构
         if grep -qE '^qdisc mq ' <<<"$QDISC_OUT"; then
-            while read -r parent_id; do
-                [[ -n "$parent_id" ]] && "$TC_BIN" qdisc replace dev "$DEF_DEV" parent "$parent_id" fq 2>/dev/null || true
-            done < <(awk '{for(i=1;i<=NF;i++) if($i=="parent" && $(i+1) ~ /^[0-9a-fA-F]*:[0-9a-fA-F]+$/) print $(i+1)}' <<<"$QDISC_OUT")
+            while read -r cid; do
+                [[ -n "$cid" ]] && "$TC_BIN" qdisc replace dev "$DEF_DEV" parent "$cid" fq 2>/dev/null || true
+            done < <("$TC_BIN" class show dev "$DEF_DEV" 2>/dev/null | awk '$1=="class" && $2=="mq" && $3 ~ /^[0-9a-fA-F]+:[0-9a-fA-F]+$/ {print $3}')
         else
             "$TC_BIN" qdisc replace dev "$DEF_DEV" root fq 2>/dev/null || true
         fi

@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.19.5] - 2026-11-21
+
+### 修复
+- **多队列网卡 `mq 0:` 兼容性修复**：修复多核 VPS 网卡默认无显式句柄 `qdisc mq 0: root` 导致子队列（`:1`, `:2`）无法挂载 `fq maxrate` 的问题。自动为 `root` 赋予显式句柄 `handle 1: mq` 并通过 `tc class show` 精准匹配子队列 class id，彻底解决多队列网卡上 `maxrate` 挂载被静默跳过的报错。
+
 ## [v1.19.4] - 2026-11-21
 
 ### 新增与优化
