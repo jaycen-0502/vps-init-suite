@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 项目名称: vps-init-suite (init.sh) - 纯净无防火墙稳定满速版 (v1.19.3)
+# 项目名称: vps-init-suite (init.sh) - 纯净无防火墙稳定满速版 (v1.19.4)
 # 适用系统: Debian 12/13, Ubuntu 22.04/24.04, RHEL/AlmaLinux/Rocky 8/9
 # 项目地址: https://github.com/jaycen-0502/vps-init-suite
 # ==============================================================================
 
 set -u
 
-readonly SCRIPT_VERSION="1.19.3"
+readonly SCRIPT_VERSION="1.19.4"
 readonly SYSCTL_TARGET="/etc/sysctl.d/99-zzz-vps-init.conf"
 readonly STATE_FILE="/etc/default/vps-init-opt"
 readonly RUNTIME_SCRIPT="/usr/local/sbin/vps-init-runtime.sh"
@@ -60,10 +60,13 @@ prompt_read() {
 BW_MBPS=500
 RTT_MS=160
 CONN_TIER=1
-TCP_MAX_BUF=16777216
-TCP_DEF_BUF=16384
+FQ_MAXRATE_ARG="smart"
+FQ_MAXRATE_MBIT=0
+INIT_CWND=20
+TCP_MAX_BUF=12582912
+TCP_DEF_BUF=32768
 TCP_MEM_PAGES="20480 40960 71680"
-TCP_NOTSENT_LOWAT=16384
+TCP_NOTSENT_LOWAT=32768
 BACKLOG_LIMIT=4096
 CONNTRACK_MAX=65536
 NOFILE_LIMIT=65535
@@ -72,7 +75,7 @@ XUI_GOGC="75"
 XUI_OOM_SCORE="-300"
 JOURNAL_DISK_MAX="30M"
 JOURNAL_MEM_MAX="15M"
-PROFILE_DESC="1G-单线程极速档"
+PROFILE_DESC="1G-均衡极速档"
 IPV6_ENABLED=0
 DNS_MODE="resolv.conf"
 
@@ -83,6 +86,9 @@ save_state() {
 BW_MBPS=${BW_MBPS}
 RTT_MS=${RTT_MS}
 CONN_TIER=${CONN_TIER}
+FQ_MAXRATE_ARG="${FQ_MAXRATE_ARG}"
+FQ_MAXRATE_MBIT=${FQ_MAXRATE_MBIT}
+INIT_CWND=${INIT_CWND}
 TCP_MAX_BUF=${TCP_MAX_BUF}
 TCP_DEF_BUF=${TCP_DEF_BUF}
 TCP_MEM_PAGES="${TCP_MEM_PAGES}"
@@ -246,7 +252,7 @@ EOF
 }
 
 # ==============================================================================
-# 运行时网络规则持久化（IPv4 MSS 1380 + 双栈 IPv6 MSS 1340 + initcwnd 32）
+# 运行时网络规则持久化（IPv4/v6 MSS + 自适应 initcwnd + 可选 fq maxrate 软封顶）
 # ==============================================================================
 configure_runtime_net_rules() {
     mkdir -p "$(dirname "$RUNTIME_SCRIPT")"
@@ -256,6 +262,8 @@ configure_runtime_net_rules() {
 set -u
 
 IPV6_ENABLED=0
+INIT_CWND=20
+FQ_MAXRATE_MBIT=0
 if [[ -r /etc/default/vps-init-opt ]]; then
     # shellcheck disable=SC1091
     source /etc/default/vps-init-opt
@@ -279,19 +287,46 @@ elif [[ -x "$IPT6" ]]; then
     done
 fi
 
-# 3. 设置默认 IPv4 路由 initcwnd 32 / initrwnd 32（首屏多图秒开且跨洋丢包稳健）
+# 3. 设置默认 IPv4 路由自适应 initcwnd / initrwnd（近程 32 / 跨洋 20 / 高并发 16）
 IP_BIN=$(command -v ip 2>/dev/null || echo "/sbin/ip")
+DEF_DEV=""
 if [[ -x "$IP_BIN" ]]; then
-    DEF_ROUTE=$("$IP_BIN" -4 route show default 2>/dev/null | head -n1 | sed -E 's/[[:space:]]+initcwnd[[:space:]]+[0-9]+//g; s/[[:space:]]+initrwnd[[:space:]]+[0-9]+//g; s/[[:space:]]+$//')
-    if [[ -n "$DEF_ROUTE" ]]; then
-        # shellcheck disable=SC2086
-        "$IP_BIN" -4 route change $DEF_ROUTE initcwnd 32 initrwnd 32 2>/dev/null || true
+    DEF_DEV=$("$IP_BIN" -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    if [[ "${INIT_CWND:-20}" =~ ^[0-9]+$ ]] && (( INIT_CWND > 0 )); then
+        DEF_ROUTE=$("$IP_BIN" -4 route show default 2>/dev/null | head -n1 | sed -E 's/[[:space:]]+initcwnd[[:space:]]+[0-9]+//g; s/[[:space:]]+initrwnd[[:space:]]+[0-9]+//g; s/[[:space:]]+$//')
+        if [[ -n "$DEF_ROUTE" ]]; then
+            # shellcheck disable=SC2086
+            "$IP_BIN" -4 route change $DEF_ROUTE initcwnd "$INIT_CWND" initrwnd "$INIT_CWND" 2>/dev/null || true
+        fi
     fi
 fi
 
-# 4. 开机/网卡重载 DNS 纠偏（防止 DHCP 续租后回弹）
+# 4. 可选 fq maxrate 单流防撞墙软封顶（自动兼容单队列与 mq 多队列，且支持 off 干净回退）
+TC_BIN=$(command -v tc 2>/dev/null || echo "/sbin/tc")
+if [[ -x "$TC_BIN" && -n "$DEF_DEV" ]]; then
+    QDISC_OUT=$("$TC_BIN" qdisc show dev "$DEF_DEV" 2>/dev/null || true)
+    if [[ "${FQ_MAXRATE_MBIT:-0}" =~ ^[0-9]+$ ]] && (( FQ_MAXRATE_MBIT > 0 )); then
+        if grep -qE '^qdisc mq ' <<<"$QDISC_OUT"; then
+            while read -r parent_id; do
+                [[ -n "$parent_id" ]] && "$TC_BIN" qdisc replace dev "$DEF_DEV" parent "$parent_id" fq maxrate "${FQ_MAXRATE_MBIT}mbit" 2>/dev/null || true
+            done < <(awk '{for(i=1;i<=NF;i++) if($i=="parent" && $(i+1) ~ /^[0-9a-fA-F]*:[0-9a-fA-F]+$/) print $(i+1)}' <<<"$QDISC_OUT")
+        else
+            "$TC_BIN" qdisc replace dev "$DEF_DEV" root fq maxrate "${FQ_MAXRATE_MBIT}mbit" 2>/dev/null || true
+        fi
+    elif grep -qi 'maxrate' <<<"$QDISC_OUT"; then
+        # 切换为关闭限速时，清除此前挂载的 maxrate 封顶并保留 fq / mq 结构
+        if grep -qE '^qdisc mq ' <<<"$QDISC_OUT"; then
+            while read -r parent_id; do
+                [[ -n "$parent_id" ]] && "$TC_BIN" qdisc replace dev "$DEF_DEV" parent "$parent_id" fq 2>/dev/null || true
+            done < <(awk '{for(i=1;i<=NF;i++) if($i=="parent" && $(i+1) ~ /^[0-9a-fA-F]*:[0-9a-fA-F]+$/) print $(i+1)}' <<<"$QDISC_OUT")
+        else
+            "$TC_BIN" qdisc replace dev "$DEF_DEV" root fq 2>/dev/null || true
+        fi
+    fi
+fi
+
+# 5. 开机/网卡重载 DNS 纠偏（防止 DHCP 续租后回弹）
 if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl >/dev/null 2>&1; then
-    DEF_DEV=$("$IP_BIN" -4 route show default 2>/dev/null | awk '{print $5; exit}')
     if [[ -n "$DEF_DEV" ]]; then
         CUR_DNS=$(SYSTEMD_COLORS=0 resolvectl status "$DEF_DEV" 2>/dev/null | awk -F': ' '/Current DNS Server/ {print $2; exit}' | tr -d '[:space:]')
         if [[ "$CUR_DNS" != "8.8.8.8" ]]; then
@@ -317,7 +352,7 @@ EOF
 
     cat << EOF > "$RUNTIME_SERVICE"
 [Unit]
-Description=Persist vps-init-suite TCP MSS Clamping and initcwnd Tuning
+Description=Persist vps-init-suite TCP MSS Clamping, initcwnd and fq maxrate Tuning
 After=network-online.target
 Wants=network-online.target
 
@@ -335,18 +370,19 @@ EOF
 }
 
 # ==============================================================================
-# 自适应网络计算模块（按“带宽 + 延迟 + 并发档位 + 物理内存”四维动态计算）
+# 自适应网络计算模块（按“带宽 + 延迟 + 并发档位 + 物理内存 + 软封顶”动态计算）
 # ==============================================================================
 configure_adaptive_network() {
     local IN_BW="${1:-}"
     local IN_RTT="${2:-}"
     local IN_TIER="${3:-}"
+    local IN_FQ="${4:-}"
 
     local MEM_TOTAL_MB CPU_CORES
     MEM_TOTAL_MB=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 1024)
     CPU_CORES=$(nproc 2>/dev/null || echo 1)
 
-    # 1. 仅在缺少命令行参数且存在可用终端时进行无超时手动引导
+    # 1. 仅在缺少前 3 个核心参数且存在可用终端时进行无超时手动引导（完全兼容 3 参静默调用）
     if [[ -z "$IN_BW" || -z "$IN_RTT" || -z "$IN_TIER" ]]; then
         if ( : < /dev/tty ) 2>/dev/null || [[ -t 0 ]]; then
             echo ""
@@ -362,7 +398,7 @@ configure_adaptive_network() {
                         IN_BW=$((10#$IN_BW))
                         break
                     fi
-                    log_warn "请输入 1 到 100000 之间的纯数字（例如 200、500、1000）。"
+                    log_warn "请输入 1 到 100000 之间的纯数字（例如 200、250、500、1000）。"
                 done
             fi
             if [[ -z "$IN_RTT" ]]; then
@@ -378,8 +414,8 @@ configure_adaptive_network() {
             fi
             if [[ -z "$IN_TIER" ]]; then
                 echo " 3. 请选择并发使用规模:"
-                echo "    [1] 常规/低中并发 (500连接以内，单线程速度与视频极速优先，1G机按带宽放开至16M/32M)"
-                echo "    [2] 多人高并发    (1000-3000+连接，防爆内存与极致稳定优先，1G机严格封顶)"
+                echo "    [1] 常规/低中并发 (500连接以内，单线程速度与4K/8K视频优先，1G机安全封顶12M)"
+                echo "    [2] 多人高并发    (1000-3000+连接，防爆内存与极致稳定优先，严格封顶)"
                 while true; do
                     prompt_read " 请选择 [1/2，回车默认 1]: " IN_TIER
                     [[ -z "$IN_TIER" ]] && IN_TIER=1
@@ -387,6 +423,22 @@ configure_adaptive_network() {
                         break
                     fi
                     log_warn "无效选择，请输入 1 或 2。"
+                done
+            fi
+            if [[ -z "$IN_FQ" ]]; then
+                echo " 4. fq maxrate 单流防撞墙软封顶 (将 BBR 探速压在机房硬限速墙下方，压低重传):"
+                echo "    [smart] 智能自动 (<=500M 且延迟>=100ms 按90%封顶，1G+/近程不限速) [推荐]"
+                echo "    [auto]  强制按当前带宽 90% 封顶"
+                echo "    [off]   关闭单流软封顶"
+                echo "    或直接输入具体 Mbps 数字 (例如 225)"
+                while true; do
+                    prompt_read " 请输入 [smart/auto/off/数字，回车默认 smart]: " IN_FQ
+                    [[ -z "$IN_FQ" ]] && IN_FQ="smart"
+                    IN_FQ=$(printf '%s' "$IN_FQ" | tr '[:upper:]' '[:lower:]')
+                    if [[ "$IN_FQ" == "smart" || "$IN_FQ" == "auto" || "$IN_FQ" == "off" || ( "$IN_FQ" =~ ^[0-9]+$ && 10#$IN_FQ -le 100000 ) ]]; then
+                        break
+                    fi
+                    log_warn "无效输入，请输入 smart、auto、off 或正整数 Mbps。"
                 done
             fi
             echo "============================================================"
@@ -397,25 +449,30 @@ configure_adaptive_network() {
     BW_MBPS="${IN_BW:-500}"
     RTT_MS="${IN_RTT:-160}"
     CONN_TIER="${IN_TIER:-1}"
+    FQ_MAXRATE_ARG=$(printf '%s' "${IN_FQ:-smart}" | tr '[:upper:]' '[:lower:]')
     [[ "$BW_MBPS" =~ ^[0-9]+$ ]] && (( 10#$BW_MBPS > 0 )) && BW_MBPS=$((10#$BW_MBPS)) || BW_MBPS=500
     [[ "$RTT_MS" =~ ^[0-9]+$ ]] && (( 10#$RTT_MS > 0 )) && RTT_MS=$((10#$RTT_MS)) || RTT_MS=160
     [[ "$CONN_TIER" == "2" ]] || CONN_TIER=1
 
-    # 2. 按 1.5 倍 BDP 计算目标窗口，并向上对齐至 2M/4M/8M/16M/32M
-    local TARGET_BYTES=$(( BW_MBPS * RTT_MS * 125 * 3 / 2 ))
+    # 2. 按 2.5 倍 BDP 计算目标窗口（抵消 Linux tcp_adv_win_scale=1 ~50% 元数据开销），对齐至精细阶梯
+    local TARGET_BYTES=$(( BW_MBPS * RTT_MS * 125 * 5 / 2 ))
     if (( TARGET_BYTES <= 2097152 )); then
-        TCP_MAX_BUF=2097152
+        TCP_MAX_BUF=2097152       # 2MB
     elif (( TARGET_BYTES <= 4194304 )); then
-        TCP_MAX_BUF=4194304
+        TCP_MAX_BUF=4194304       # 4MB
     elif (( TARGET_BYTES <= 8388608 )); then
-        TCP_MAX_BUF=8388608
+        TCP_MAX_BUF=8388608       # 8MB
+    elif (( TARGET_BYTES <= 12582912 )); then
+        TCP_MAX_BUF=12582912      # 12MB (200~250M @ 160ms 精准命中)
     elif (( TARGET_BYTES <= 16777216 )); then
-        TCP_MAX_BUF=16777216
+        TCP_MAX_BUF=16777216      # 16MB
+    elif (( TARGET_BYTES <= 25165824 )); then
+        TCP_MAX_BUF=25165824      # 24MB (500M @ 160ms 精准命中)
     else
-        TCP_MAX_BUF=33554432
+        TCP_MAX_BUF=33554432      # 32MB
     fi
 
-    # 3. 结合物理内存与并发档位计算安全护栏
+    # 3. 结合物理内存与并发档位计算安全护栏与 tcp_notsent_lowat
     if (( MEM_TOTAL_MB <= 600 )); then
         TCP_DEF_BUF=16384
         BACKLOG_LIMIT=2048
@@ -428,10 +485,9 @@ configure_adaptive_network() {
         JOURNAL_MEM_MAX="10M"
         (( TCP_MAX_BUF > 4194304 )) && TCP_MAX_BUF=4194304
         TCP_MEM_PAGES="8192 16384 32768"
-        TCP_NOTSENT_LOWAT=32768
+        TCP_NOTSENT_LOWAT=16384
         PROFILE_DESC="512M-微型防爆档"
     elif (( MEM_TOTAL_MB <= 1500 )); then
-        TCP_DEF_BUF=16384
         BACKLOG_LIMIT=4096
         CONNTRACK_MAX=65536
         NOFILE_LIMIT=65535
@@ -441,6 +497,7 @@ configure_adaptive_network() {
         JOURNAL_MEM_MAX="15M"
         if (( CONN_TIER == 2 )); then
             # 1G 高并发防爆：严控单连接上限与内核总内存
+            TCP_DEF_BUF=16384
             if (( RTT_MS >= 100 && TCP_MAX_BUF > 4194304 )); then
                 TCP_MAX_BUF=4194304
             elif (( RTT_MS < 100 && TCP_MAX_BUF > 2097152 )); then
@@ -448,15 +505,16 @@ configure_adaptive_network() {
             fi
             XUI_GOMEMLIMIT="350MiB"
             TCP_MEM_PAGES="16384 32768 65536"   # 硬顶 256MB
-            TCP_NOTSENT_LOWAT=32768
+            TCP_NOTSENT_LOWAT=16384
             PROFILE_DESC="1G-高并发稳态档"
         else
-            # 1G 低中并发极速：放开单连接至 16MB/32MB，同时微调 GOMEM=320MiB / 硬顶 280MB 留足物理余量
-            (( TCP_MAX_BUF > 33554432 )) && TCP_MAX_BUF=33554432
+            # 1G 低中并发极速：安全封顶 12MB（兼顾 1G 日本/美国高吞吐与防 OOM）
+            TCP_DEF_BUF=32768
+            (( TCP_MAX_BUF > 12582912 )) && TCP_MAX_BUF=12582912
             XUI_GOMEMLIMIT="320MiB"
             TCP_MEM_PAGES="20480 40960 71680"   # 硬顶 280MB
-            TCP_NOTSENT_LOWAT=16384
-            PROFILE_DESC="1G-单线程极速档"
+            TCP_NOTSENT_LOWAT=32768
+            PROFILE_DESC="1G-均衡极速档"
         fi
     else
         BACKLOG_LIMIT=16384
@@ -476,18 +534,45 @@ configure_adaptive_network() {
 
         if (( CONN_TIER == 2 )); then
             TCP_DEF_BUF=32768
-            (( TCP_MAX_BUF > 16777216 )) && TCP_MAX_BUF=16777216
+            (( TCP_MAX_BUF > 12582912 )) && TCP_MAX_BUF=12582912
             TCP_NOTSENT_LOWAT=32768
             PROFILE_DESC="大内存-高并发稳态档"
         else
             TCP_DEF_BUF=65536
-            TCP_NOTSENT_LOWAT=16384
+            TCP_NOTSENT_LOWAT=65536
             PROFILE_DESC="大内存-跨洋极速档"
         fi
     fi
 
+    # 4. 跨洋自适应 initcwnd / initrwnd
+    if (( CONN_TIER == 2 )); then
+        INIT_CWND=16
+    elif (( RTT_MS >= 100 )); then
+        INIT_CWND=20
+    else
+        INIT_CWND=32
+    fi
+
+    # 5. 智能解析 fq maxrate 防撞墙单流软封顶
+    FQ_MAXRATE_MBIT=0
+    if [[ "$FQ_MAXRATE_ARG" == "smart" ]]; then
+        if (( BW_MBPS <= 500 && RTT_MS >= 100 )); then
+            FQ_MAXRATE_MBIT=$(( BW_MBPS * 90 / 100 ))
+        fi
+    elif [[ "$FQ_MAXRATE_ARG" == "auto" ]]; then
+        FQ_MAXRATE_MBIT=$(( BW_MBPS * 90 / 100 ))
+    elif [[ "$FQ_MAXRATE_ARG" =~ ^[0-9]+$ ]] && (( 10#$FQ_MAXRATE_ARG > 0 )); then
+        FQ_MAXRATE_MBIT=$((10#$FQ_MAXRATE_ARG))
+    else
+        FQ_MAXRATE_ARG="off"
+    fi
+    (( FQ_MAXRATE_MBIT > 0 && FQ_MAXRATE_MBIT < 10 )) && FQ_MAXRATE_MBIT=0
+
+    local fq_desc="关闭"
+    (( FQ_MAXRATE_MBIT > 0 )) && fq_desc="${FQ_MAXRATE_MBIT}Mbit (${FQ_MAXRATE_ARG})"
+
     log_ok "匹配方案: ${PROFILE_DESC} | 带宽: ${BW_MBPS}Mbps | 延迟: ${RTT_MS}ms (并发档位: ${CONN_TIER})"
-    log_ok "缓冲参数: TCP初始=$((TCP_DEF_BUF/1024))KB, TCP上限=$((TCP_MAX_BUF/1048576))MB, UDP默认=256KB, x-ui内存限制=${XUI_GOMEMLIMIT}"
+    log_ok "缓冲参数: TCP初始=$((TCP_DEF_BUF/1024))KB, TCP上限=$((TCP_MAX_BUF/1048576))MB, notsent=$((TCP_NOTSENT_LOWAT/1024))KB, initcwnd=${INIT_CWND}, fq封顶=${fq_desc}, x-ui内存限制=${XUI_GOMEMLIMIT}"
 }
 
 # ==============================================================================
@@ -504,7 +589,7 @@ optimize_proxy_stability_and_speed() {
         dnf install -y -q curl iptables iproute chrony cronie kmod procps-ng e2fsprogs >/dev/null 2>&1
     fi
 
-    # 1. 四维自适应网络计算 (带宽 + 延迟 + 并发档位 + 物理内存)
+    # 1. 多维自适应网络计算 (带宽 + 延迟 + 并发档位 + 物理内存 + fq软封顶)
     configure_adaptive_network "$@"
 
     # 2. 自动探测残废 IPv6 (消除双栈域名 3.6s 超时与 Go Happy Eyeballs 300ms 回退)
@@ -548,7 +633,7 @@ net.netfilter.nf_conntrack_tcp_timeout_established = 3600"
 
     cat << EOF > "$SYSCTL_TARGET"
 # Managed by vps-init-suite init.sh v${SCRIPT_VERSION}
-# Profile: ${PROFILE_DESC} (${BW_MBPS}Mbps / ${RTT_MS}ms / tier=${CONN_TIER})
+# Profile: ${PROFILE_DESC} (${BW_MBPS}Mbps / ${RTT_MS}ms / tier=${CONN_TIER} / initcwnd=${INIT_CWND} / fq_maxrate=${FQ_MAXRATE_MBIT}mbit)
 vm.swappiness = 10
 fs.file-max = ${NOFILE_LIMIT}
 net.core.default_qdisc = fq
@@ -565,7 +650,7 @@ net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 
-# 自适应 TCP 缓冲 + 256KB UDP/QUIC 默认缓冲 (多图/HTTP3/IM加速)
+# 自适应 TCP 缓冲 + 256KB UDP/QUIC 默认缓冲 (多图/HTTP3/4K视频加速)
 net.core.rmem_max = ${TCP_MAX_BUF}
 net.core.wmem_max = ${TCP_MAX_BUF}
 net.core.rmem_default = 262144
@@ -577,11 +662,11 @@ net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 net.ipv4.tcp_notsent_lowat = ${TCP_NOTSENT_LOWAT}
 
-# 高并发连接复用与快速故障回收
+# 高并发连接复用与弱网握手容错 (SYN重试放宽至3降低多图网页裂图)
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_syn_retries = 2
-net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
 net.ipv4.tcp_orphan_retries = 1
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 15
@@ -596,7 +681,7 @@ ${disable_ipv6_block}
 ${conntrack_block}
 EOF
 
-    # 4. 文件描述符 (FD) 上限
+    # 4. 文件描述符 (FD) 上限（修正通配符为 *）
     mkdir -p /etc/security/limits.d /etc/systemd/system.conf.d
     cat << EOF > /etc/security/limits.d/99-nofile.conf
 * soft nofile ${NOFILE_LIMIT}
@@ -668,14 +753,14 @@ EOF
     # 7. 智能防覆写 DNS 配置
     configure_smart_dns
 
-    # 8. 持久化最终完整状态（含 IPV6_ENABLED 与 DNS_MODE）
+    # 8. 持久化最终完整状态（含 INIT_CWND、FQ_MAXRATE_MBIT、IPV6_ENABLED 与 DNS_MODE）
     save_state
 
     # 9. 统一加载 sysctl 并显式再灌入本文件确保无覆盖
     sysctl --system >/dev/null 2>&1 || true
     sysctl -p "$SYSCTL_TARGET" >/dev/null 2>&1 || true
 
-    # 10. 应用并持久化 TCP MSS 1380/1340 与 initcwnd 32
+    # 10. 应用并持久化 TCP MSS 1380/1340、自适应 initcwnd 与可选 fq maxrate
     configure_runtime_net_rules
 
     # 11. Chrony 毫秒级网络授时 (保障 REALITY 与 TLS 严格握手时间窗口)
@@ -700,7 +785,7 @@ verify_optimization() {
     echo ""
     echo -e "${BOLD}${CYAN}==================== VPS 调优状态自检报告 (v${SCRIPT_VERSION}) ====================${NC}"
 
-    local cc idle no_metrics frto rmem def_buf tcp_mem_raw tcp_mem_norm udp_def cur_cwnd
+    local cc idle no_metrics frto rmem def_buf tcp_mem_raw tcp_mem_norm udp_def cur_cwnd cur_lowat cur_syn
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     idle=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "unknown")
     no_metrics=$(sysctl -n net.ipv4.tcp_no_metrics_save 2>/dev/null || echo "unknown")
@@ -710,40 +795,57 @@ verify_optimization() {
     tcp_mem_raw=$(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo "unknown")
     tcp_mem_norm=$(printf '%s' "$tcp_mem_raw" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')
     udp_def=$(sysctl -n net.core.rmem_default 2>/dev/null || echo "0")
+    cur_lowat=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "0")
+    cur_syn=$(sysctl -n net.ipv4.tcp_syn_retries 2>/dev/null || echo "0")
     cur_cwnd=$(ip -4 route show default 2>/dev/null | grep -oE 'initcwnd[[:space:]]+[0-9]+' | awk '{print $2}' | head -n1 || true)
 
-    local rmem_mb="?" def_kb="?" udp_kb="?"
+    local def_dev="" qdisc_out="" fq_active=0 fq_rate_str="无单流限速"
+    def_dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    if [[ -n "$def_dev" ]] && command -v tc >/dev/null 2>&1; then
+        qdisc_out=$(tc qdisc show dev "$def_dev" 2>/dev/null || true)
+        if grep -qw "fq" <<<"$qdisc_out"; then
+            fq_active=1
+            local cur_maxrate
+            cur_maxrate=$(grep -oiE 'maxrate[[:space:]]+[^[:space:]]+' <<<"$qdisc_out" | head -n1 | awk '{print $2}')
+            [[ -n "$cur_maxrate" ]] && fq_rate_str="软封顶=${cur_maxrate}"
+        fi
+    fi
+
+    local rmem_mb="?" def_kb="?" udp_kb="?" lowat_kb="?"
     [[ "$rmem" =~ ^[0-9]+$ ]] && rmem_mb=$((rmem / 1048576))
     [[ "$def_buf" =~ ^[0-9]+$ ]] && def_kb=$((def_buf / 1024))
     [[ "$udp_def" =~ ^[0-9]+$ ]] && udp_kb=$((udp_def / 1024))
+    [[ "$cur_lowat" =~ ^[0-9]+$ ]] && lowat_kb=$((cur_lowat / 1024))
 
     echo -e "1. 调优策略与并发模式     : ${GREEN}[INFO] ${PROFILE_DESC}${NC}"
-    echo -e "   • 带宽与 RTT 设置        : ${BW_MBPS} Mbps / ${RTT_MS} ms (并发档位: ${CONN_TIER})"
+    echo -e "   • 带宽与 RTT 设置        : ${BW_MBPS} Mbps / ${RTT_MS} ms (并发档位: ${CONN_TIER} | fq策略: ${FQ_MAXRATE_ARG:-off})"
 
-    if [[ "$cc" == "bbr" && "$idle" == "0" && "$no_metrics" == "1" ]]; then
-        echo -e "2. BBR + 防晚高峰丢包降速 : ${GREEN}[PASS] cc=${cc}, idle=${idle}, no_metrics=${no_metrics}, frto=${frto}${NC}"
+    if [[ "$cc" == "bbr" && "$idle" == "0" && "$no_metrics" == "1" && "$fq_active" -eq 1 ]]; then
+        if (( ${FQ_MAXRATE_MBIT:-0} > 0 )) && ! grep -qi "maxrate" <<<"$qdisc_out"; then
+            echo -e "2. BBR + 主网卡 fq 队列   : ${YELLOW}[WARN] cc=${cc}, fq已生效但 maxrate(${FQ_MAXRATE_MBIT}Mbit) 未挂载，请检查 tc${NC}"
+        else
+            echo -e "2. BBR + 主网卡 fq 队列   : ${GREEN}[PASS] cc=${cc}, dev=${def_dev}(fq/${fq_rate_str}), idle=${idle}, frto=${frto}${NC}"
+        fi
+    elif [[ "$cc" == "bbr" && "$idle" == "0" && "$no_metrics" == "1" && "$fq_active" -eq 0 ]]; then
+        echo -e "2. BBR + 主网卡 fq 队列   : ${YELLOW}[WARN] BBR已开，但主网卡(${def_dev:-未知})尚未切为 fq 队列，请执行一次 reboot 使 pacing 彻底生效！${NC}"
     else
-        echo -e "2. BBR + 防晚高峰丢包降速 : ${RED}[FAIL] cc=${cc}, idle=${idle}, no_metrics=${no_metrics}${NC}"
+        echo -e "2. BBR + 主网卡 fq 队列   : ${RED}[FAIL] cc=${cc}, idle=${idle}, no_metrics=${no_metrics}, fq=${fq_active}${NC}"
     fi
 
-    if [[ "$rmem" == "$TCP_MAX_BUF" && "$def_buf" == "$TCP_DEF_BUF" && "$tcp_mem_norm" == "$TCP_MEM_PAGES" ]]; then
-        echo -e "3. TCP 窗口与 UDP/QUIC 缓冲: ${GREEN}[PASS] TCP上限=${rmem_mb}MB, 初始=${def_kb}KB, UDP默认=${udp_kb}KB${NC}"
+    if [[ "$rmem" == "$TCP_MAX_BUF" && "$def_buf" == "$TCP_DEF_BUF" && "$tcp_mem_norm" == "$TCP_MEM_PAGES" && "$cur_lowat" == "$TCP_NOTSENT_LOWAT" && "$cur_syn" == "3" ]]; then
+        echo -e "3. TCP 窗口与弱网容错     : ${GREEN}[PASS] TCP上限=${rmem_mb}MB, 初始=${def_kb}KB, notsent=${lowat_kb}KB, SYN重试=${cur_syn}, UDP=${udp_kb}KB${NC}"
         echo -e "   • 内核 tcp_mem 全局硬顶  : ${tcp_mem_norm} 页"
     else
-        echo -e "3. TCP 窗口与 UDP/QUIC 缓冲: ${RED}[FAIL] 参数不匹配（可能被其他 /etc/sysctl.d/*.conf 覆盖）${NC}"
-        echo -e "   • 实际值: rmem=${rmem_mb}MB, 初始=${def_kb}KB, tcp_mem=[${tcp_mem_norm}]"
-        echo -e "   • 预期值: rmem=$((TCP_MAX_BUF/1048576))MB, 初始=$((TCP_DEF_BUF/1024))KB, tcp_mem=[${TCP_MEM_PAGES}]"
+        echo -e "3. TCP 窗口与弱网容错     : ${RED}[FAIL] 参数不匹配（可能被其他 /etc/sysctl.d/*.conf 覆盖）${NC}"
+        echo -e "   • 实际值: rmem=${rmem_mb}MB, 初始=${def_kb}KB, notsent=${lowat_kb}KB, SYN重试=${cur_syn}, tcp_mem=[${tcp_mem_norm}]"
+        echo -e "   • 预期值: rmem=$((TCP_MAX_BUF/1048576))MB, 初始=$((TCP_DEF_BUF/1024))KB, notsent=$((TCP_NOTSENT_LOWAT/1024))KB, SYN重试=3, tcp_mem=[${TCP_MEM_PAGES}]"
     fi
 
-    # 4. 首屏 initcwnd 32 + 真实 DNS 生效校验 + 出站连通性
+    # 4. 自适应 initcwnd + 真实 DNS 生效校验 + 出站连通性
     local net_ok=0
-    # 先触发出站解析以激活 systemd-resolved 选路并校验 204 连通性
     curl -s -I -m 3 https://www.gstatic.com/generate_204 2>/dev/null | grep -q "204" && net_ok=1
 
     local dns_ok=0 dns_desc=""
-    local def_dev=""
-    def_dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
-
     if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl >/dev/null 2>&1; then
         local r_out="" cur_dns="" all_dns=""
         if [[ -n "$def_dev" ]]; then
@@ -809,10 +911,10 @@ verify_optimization() {
         fi
     fi
 
-    if [[ "$cur_cwnd" == "32" && "$dns_ok" -eq 1 && "$net_ok" -eq 1 ]]; then
+    if [[ "$cur_cwnd" == "${INIT_CWND:-20}" && "$dns_ok" -eq 1 && "$net_ok" -eq 1 ]]; then
         echo -e "4. 首屏加速 + 智能DNS连通 : ${GREEN}[PASS] initcwnd=${cur_cwnd}, DNS=${dns_desc}, 204秒返${NC}"
     else
-        echo -e "4. 首屏加速 + 智能DNS连通 : ${YELLOW}[WARN] initcwnd=${cur_cwnd:-默认}, DNS=${dns_desc}(ok=${dns_ok}), 204连通=${net_ok}${NC}"
+        echo -e "4. 首屏加速 + 智能DNS连通 : ${YELLOW}[WARN] initcwnd=${cur_cwnd:-默认}(预期${INIT_CWND:-20}), DNS=${dns_desc}(ok=${dns_ok}), 204连通=${net_ok}${NC}"
     fi
 
     # 5. TCP MSS 1380 (IPv4) / 1340 (双栈 IPv6) 钳制
@@ -882,7 +984,7 @@ show_menu() {
         echo "  vps-init-suite | 纯净无防火墙网络优化套件 (v${SCRIPT_VERSION} 自适应版)"
         echo "=============================================================="
         echo -e "${NC}"
-        echo -e "  ${GREEN}1.${NC} 一键全套深度调优 ${BOLD}(带宽/RTT/并发四维自适应计算 + 严格自检)${NC} ${YELLOW}[推荐]${NC}"
+        echo -e "  ${GREEN}1.${NC} 一键全套深度调优 ${BOLD}(带宽/RTT/并发/fq封顶自适应 + 严格自检)${NC} ${YELLOW}[推荐]${NC}"
         echo -e "  ${GREEN}2.${NC} 运行系统调优状态一键自检"
         echo -e "  ${GREEN}3.${NC} 一键安装 / 更新 3x-ui 面板"
         echo -e "  ${RED}0.${NC} 退出脚本"
@@ -924,7 +1026,7 @@ show_menu() {
 # ==============================================================================
 check_root
 if [[ "${1:-}" == "--auto" ]] || [[ "${1:-}" == "-y" ]]; then
-    optimize_proxy_stability_and_speed 500 160 1
+    optimize_proxy_stability_and_speed 500 160 1 smart
     verify_optimization
     exit 0
 elif [[ "${1:-}" =~ ^[0-9]+$ ]]; then

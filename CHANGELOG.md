@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.19.4] - 2026-11-21
+
+### 新增与优化
+- **算法升级**：BDP 计算系数从 `1.5×` 提升至 `2.5×` 以抵消 Linux `tcp_adv_win_scale=1` 约 50% 元数据开销，新增 `12MB` / `24MB` 精细窗口阶梯；1G 小内存极速档上限优化为 `12MB` 兼顾速度与防爆。
+- **防撞墙软封顶**：新增第 4 参数 `FQ_MAXRATE`（默认 `smart`），对 `≤500M` 跨洋线路自动按 90% 施加 `fq maxrate`，兼容 `mq` 多队列网卡，支持 `off` 干净回退。
+- **多图网页与大带宽视频优化**：`initcwnd` 改为按延迟与并发档位自适应（`32 / 20 / 16`）；`tcp_syn_retries` / `tcp_synack_retries` 放宽至 `3`；大内存极速档 `tcp_notsent_lowat` 放宽至 `64KB`。
+- **自检与修复**：自检第 2 项新增主网卡 `tc qdisc` 实时 `fq` 与 `maxrate` 校验及未生效重启提醒；修复 `/etc/security/limits.d/99-nofile.conf` 通配符格式问题（修正为 `*`）。
+
 ## [v1.19.3] - 2026-11-20
 
 ### 新增与优化
